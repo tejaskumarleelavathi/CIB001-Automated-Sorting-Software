@@ -82,14 +82,29 @@ MIN_CONTOUR_AREA: int = 50          # px² — ignore dust specks below this
 CLOSE_KERNEL_SIZE: int = 15         # px — morphological close to bridge body↔wing gaps
 CLOSE_ITER: int = 2
 
-# Hair / filament thresholds
-HAIR_ASPECT_THRESH: float = 4.5  # Filaments have very elongated bounding rects
-HAIR_SOLIDITY_MAX: float = 0.40  # Filaments are thin → low area/hull ratio
+# Hair / filament / detached-leg thresholds
+# Lowered aspect threshold to 1.6 so detached legs and angular fragments are caught.
+# Solidity < 0.45 ensures the blob is thin relative to its convex hull.
+HAIR_ASPECT_THRESH: float = 1.6  # Elongated thin shape (legs, hairs, filaments)
+HAIR_SOLIDITY_MAX: float = 0.45  # Thin shape → low area/hull ratio
 
 # Bug thresholds
 BUG_MIN_DIAM: float = 25.0       # px — equivalent circle diameter, rejects tiny specks
 BUG_SOLIDITY_MIN: float = 0.18   # Bugs have appendages → some concavity in convex hull
 BUG_SOLIDITY_MAX: float = 0.92   # Front-light-off images produce compact silhouettes (0.85+)
+
+# Convexity-defect appendage check
+# For blobs with solidity > BUG_HISOL_THRESH the solidity alone no longer implies
+# appendages, so we require at least BUG_MIN_DEFECTS deep notches (≥ MIN_DEFECT_DEPTH_PX)
+# as evidence of legs/antennae/wings.  Smooth compact debris (no appendages) has zero
+# significant defects and is rejected as DEBRIS.
+BUG_HISOL_THRESH: float = 0.75   # Above this, solidity alone is not enough evidence
+BUG_MIN_DEFECTS: int = 2          # Minimum significant convexity defects required
+MIN_DEFECT_DEPTH_PX: float = 5.0  # Minimum notch depth (px) to count as appendage
+
+# Center-first search: expanding annular rings as fractions of the frame half-diagonal.
+# The EoA arm holds the specimen roughly below the camera centre.
+CENTER_SEARCH_FRACS: tuple = (0.15, 0.30, 0.50, 1.0)
 
 # Display
 DISPLAY_HEIGHT: int = 900
@@ -119,6 +134,11 @@ class BlobFeatures:
     extent: float = 0.0
     centroid_x: float = 0.0
     centroid_y: float = 0.0
+    # Convexity defects — points where the contour dips inward relative to the
+    # convex hull.  A real bug body has deep defects at leg/antenna/wing roots;
+    # smooth debris or filaments have zero or very shallow defects.
+    significant_defects: int = 0        # count of defects deeper than MIN_DEFECT_DEPTH_PX
+    max_defect_depth_px: float = 0.0    # depth of the deepest defect in pixels
     contour: Optional[np.ndarray] = field(default=None, repr=False)
     convex_hull: Optional[np.ndarray] = field(default=None, repr=False)
 
@@ -217,6 +237,26 @@ def _extract_features(contour: np.ndarray) -> BlobFeatures:
     cx_f = M["m10"] / M["m00"] if M["m00"] > 0 else float(x + w / 2)
     cy_f = M["m01"] / M["m00"] if M["m00"] > 0 else float(y + h / 2)
 
+    # Convexity defects: measure depth of inward notches relative to convex hull.
+    # cv2.convexHull(returnPoints=False) gives indices; convexityDefects uses these.
+    # Depth is stored as fixed-point ×256 so divide by 256.0 to get pixels.
+    sig_defects = 0
+    max_depth = 0.0
+    if len(contour) >= 4:
+        try:
+            hull_idx = cv2.convexHull(contour, returnPoints=False)
+            if hull_idx is not None and len(hull_idx) >= 3:
+                defects = cv2.convexityDefects(contour, hull_idx)
+                if defects is not None:
+                    for row in defects:
+                        depth_px = row[0][3] / 256.0
+                        if depth_px > max_depth:
+                            max_depth = depth_px
+                        if depth_px >= MIN_DEFECT_DEPTH_PX:
+                            sig_defects += 1
+        except cv2.error:
+            pass  # Degenerate contours (e.g. collinear points) raise here
+
     return BlobFeatures(
         area=area,
         perimeter=perimeter,
@@ -227,6 +267,8 @@ def _extract_features(contour: np.ndarray) -> BlobFeatures:
         extent=extent,
         centroid_x=cx_f,
         centroid_y=cy_f,
+        significant_defects=sig_defects,
+        max_defect_depth_px=max_depth,
         contour=contour,
         convex_hull=hull,
     )
@@ -252,38 +294,82 @@ def _find_blobs(binary: np.ndarray) -> list[BlobFeatures]:
 
 
 def _select_dominant(blobs: list[BlobFeatures], frame_shape: tuple) -> Optional[BlobFeatures]:
-    """Choose the dominant specimen blob — largest blob above MIN_CONTOUR_AREA.
+    """Choose the dominant specimen blob using center-first expanding radius search.
 
-    In EoA images the arm presents one specimen; the largest dark blob is the specimen.
-    If multiple blobs are within 50% area of the largest, pick the one closest to centre.
+    The EoA arm holds the specimen roughly below the camera centre.  We search
+    in concentric rings (defined by CENTER_SEARCH_FRACS as fractions of the frame
+    half-diagonal) and return the largest blob found in the innermost ring that
+    contains at least one blob.  This ensures a small bug near the centre beats
+    a larger debris blob at the image edge.
+
+    Search order:
+        1. Within 15% of half-diagonal from centre
+        2. 15–30%
+        3. 30–50%
+        4. 50–100% (full frame fallback)
+
+    Within each ring, the largest blob wins (by area).
 
     Args:
-        blobs: All detected blobs, sorted by area descending.
+        blobs: All detected blobs (any order).
         frame_shape: (H, W[, C]) of the original frame.
 
     Returns:
-        The dominant BlobFeatures, or None if no blobs found.
+        The dominant BlobFeatures, or None if blobs is empty.
     """
     if not blobs:
         return None
 
-    largest_area = blobs[0].area
-    candidates = [b for b in blobs if b.area >= 0.50 * largest_area]
+    h, w = frame_shape[:2]
+    cx_frame = w / 2.0
+    cy_frame = h / 2.0
+    half_diag = math.sqrt(cx_frame ** 2 + cy_frame ** 2)
 
-    if len(candidates) == 1:
-        return candidates[0]
+    # Pre-compute distance to frame centre for every blob
+    distances = {
+        id(b): math.sqrt(
+            (b.centroid_x - cx_frame) ** 2 + (b.centroid_y - cy_frame) ** 2
+        )
+        for b in blobs
+    }
 
-    # Break ties by proximity to frame centre
-    cy_frame = frame_shape[0] / 2.0
-    cx_frame = frame_shape[1] / 2.0
-    candidates.sort(
-        key=lambda b: (b.centroid_x - cx_frame) ** 2 + (b.centroid_y - cy_frame) ** 2
-    )
-    return candidates[0]
+    prev_radius = 0.0
+    for frac in CENTER_SEARCH_FRACS:
+        radius = half_diag * frac
+        ring_blobs = [
+            b for b in blobs
+            if prev_radius <= distances[id(b)] < radius
+        ]
+        if ring_blobs:
+            # Largest within this ring
+            return max(ring_blobs, key=lambda b: b.area)
+        prev_radius = radius
+
+    # Should never reach here (last frac = 1.0 covers everything), but just in case
+    return max(blobs, key=lambda b: b.area)
 
 
 def _classify_blob(blob: BlobFeatures) -> tuple[str, str]:
     """Apply rule-based classification to a blob's shape features.
+
+    Classification pipeline (in priority order):
+
+    1. HAIR / FILAMENT / DETACHED LEG
+       Elongated thin shapes: aspect_ratio > HAIR_ASPECT_THRESH (1.6) AND
+       solidity < HAIR_SOLIDITY_MAX (0.45).  Catches long hairs, detached legs,
+       and angular filament fragments.
+
+    2. Size gate — too small → DEBRIS
+
+    3. Hard solidity ceiling — too smooth (> BUG_SOLIDITY_MAX) → DEBRIS
+
+    4. Low-to-mid solidity [BUG_SOLIDITY_MIN, BUG_HISOL_THRESH]
+       Appendage concavity already implied by the low-solidity value → BUG
+
+    5. High solidity (BUG_HISOL_THRESH, BUG_SOLIDITY_MAX]
+       Solidity alone is ambiguous (compact bug body vs. smooth debris blob).
+       Require ≥ BUG_MIN_DEFECTS significant convexity defects (≥ MIN_DEFECT_DEPTH_PX
+       each) as appendage evidence.  Smooth debris has 0–1 shallow defects → DEBRIS.
 
     Args:
         blob: Extracted features for the dominant specimen.
@@ -294,25 +380,52 @@ def _classify_blob(blob: BlobFeatures) -> tuple[str, str]:
     d = blob.equiv_diameter
     ar = blob.aspect_ratio
     sol = blob.solidity
+    defects = blob.significant_defects
+    max_d = blob.max_defect_depth_px
 
-    # Hair / filament: very elongated bounding rect AND low solidity
+    # ── 1. Hair / filament / detached leg ─────────────────────────────────────
     if ar > HAIR_ASPECT_THRESH and sol < HAIR_SOLIDITY_MAX:
         return "HAIR", (
-            f"aspect_ratio={ar:.1f}>{HAIR_ASPECT_THRESH} "
-            f"and solidity={sol:.2f}<{HAIR_SOLIDITY_MAX}"
+            f"aspect={ar:.2f}>{HAIR_ASPECT_THRESH} "
+            f"and solidity={sol:.2f}<{HAIR_SOLIDITY_MAX} "
+            f"(filament/leg/hair)"
         )
 
-    # Bug: sufficient size, solidity in the 'has-appendages' window
-    if d >= BUG_MIN_DIAM and BUG_SOLIDITY_MIN <= sol <= BUG_SOLIDITY_MAX:
+    # ── 2. Size gate ───────────────────────────────────────────────────────────
+    if d < BUG_MIN_DIAM:
+        return "DEBRIS", f"too small: diam={d:.0f} < {BUG_MIN_DIAM:.0f}px"
+
+    # ── 3. Hard solidity ceiling ───────────────────────────────────────────────
+    if sol > BUG_SOLIDITY_MAX:
+        return "DEBRIS", (
+            f"solidity={sol:.2f} > {BUG_SOLIDITY_MAX} "
+            f"(perfectly smooth blob, no appendages possible)"
+        )
+
+    # ── 4. Below minimum solidity ──────────────────────────────────────────────
+    if sol < BUG_SOLIDITY_MIN:
+        return "DEBRIS", f"solidity={sol:.2f} < {BUG_SOLIDITY_MIN} (too fragmented)"
+
+    # ── 5a. Mid solidity: appendages implied ───────────────────────────────────
+    if sol <= BUG_HISOL_THRESH:
         return "BUG", (
-            f"equiv_diam={d:.0f}>={BUG_MIN_DIAM:.0f} "
-            f"and solidity={sol:.2f} in [{BUG_SOLIDITY_MIN},{BUG_SOLIDITY_MAX}]"
+            f"diam={d:.0f} solid={sol:.2f} in appendage range "
+            f"[{BUG_SOLIDITY_MIN},{BUG_HISOL_THRESH}] "
+            f"(defects={defects} max_depth={max_d:.1f}px)"
         )
 
-    # Everything else — small fragment, smooth compact debris, or ambiguous
+    # ── 5b. High solidity: require appendage evidence from defects ─────────────
+    # sol is in (BUG_HISOL_THRESH, BUG_SOLIDITY_MAX]
+    if defects >= BUG_MIN_DEFECTS:
+        return "BUG", (
+            f"compact body: solid={sol:.2f} with "
+            f"{defects} appendage notches (max {max_d:.1f}px deep)"
+        )
+
     return "DEBRIS", (
-        f"equiv_diam={d:.0f} solidity={sol:.2f} aspect_ratio={ar:.1f} "
-        f"(no rule matched)"
+        f"smooth compact blob: solid={sol:.2f} > {BUG_HISOL_THRESH} "
+        f"but only {defects} defect(s) < {BUG_MIN_DEFECTS} required "
+        f"(max_depth={max_d:.1f}px) — no appendage signature"
     )
 
 
@@ -365,7 +478,7 @@ def _annotate(
         f"Label: {result.label}",
         f"area={dominant.area:.0f}px2  diam={dominant.equiv_diameter:.0f}px",
         f"aspect={dominant.aspect_ratio:.2f}  solid={dominant.solidity:.2f}",
-        f"circ={dominant.circularity:.2f}  extent={dominant.extent:.2f}",
+        f"defects={dominant.significant_defects}  maxD={dominant.max_defect_depth_px:.1f}px",
     ]
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = max(0.5, img.shape[1] / 1800)
@@ -597,9 +710,9 @@ def main() -> None:
     print(f"{'=' * 72}")
     print(
         f"{'Image':<35} {'Label':<8} {'Otsu':>5} {'FGcov':>6} {'Area':>8} "
-        f"{'Diam':>6} {'AspRt':>6} {'Solid':>6} {'Circ':>6}"
+        f"{'Diam':>6} {'AspRt':>6} {'Solid':>6} {'Circ':>6} {'Defs':>5} {'MaxD':>6}"
     )
-    print("-" * 85)
+    print("-" * 95)
 
     results: list[ClassificationResult] = []
     for p in paths:
@@ -622,7 +735,8 @@ def main() -> None:
         print(
             f"{p.name:<35} {r.label:<8} {otsu_str} {cov_str} "
             f"{d.area:>8.0f} {d.equiv_diameter:>6.1f} "
-            f"{d.aspect_ratio:>6.2f} {d.solidity:>6.2f} {d.circularity:>6.2f}{warn}"
+            f"{d.aspect_ratio:>6.2f} {d.solidity:>6.2f} {d.circularity:>6.2f} "
+            f"{d.significant_defects:>5} {d.max_defect_depth_px:>6.1f}{warn}"
         )
 
         if not headless and r.annotated_image is not None:
