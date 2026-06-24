@@ -106,6 +106,28 @@ MIN_DEFECT_DEPTH_PX: float = 5.0  # Minimum notch depth (px) to count as appenda
 # The EoA arm holds the specimen roughly below the camera centre.
 CENTER_SEARCH_FRACS: tuple = (0.15, 0.30, 0.50, 1.0)
 
+# ── Dark-pixel intensity gate (primary discriminator) ──────────────────────────
+# Insects are melanized: dark brown/black bodies have grayscale values 20–80.
+# Colored debris (reddish biological material: ~110–160) and amber hair follicles
+# (~100–160) are NOT genuinely dark — they only appear dark relative to the
+# bright background.
+#
+# Method: within the ORIGINAL binary mask (pixels segmented before morph-close),
+# count the fraction with gray value < DARK_PIXEL_THRESH.
+#   Bug body only:          dark_ratio ~0.8–1.0   → ACCEPT
+#   Bug body + large wings: dark_ratio ~0.3–0.6   → ACCEPT
+#   Reddish debris:         dark_ratio ~0.0–0.15  → REJECT
+#   Amber hair follicle:    dark_ratio ~0.0–0.10  → REJECT
+#
+# Sampling uses the ORIGINAL binary (pre-close) so morph-close background pixels
+# do not dilute the ratio for thin objects like hairs.
+DARK_PIXEL_THRESH: int = 90         # Gray value below which a pixel counts as "dark"
+BLOB_DARK_RATIO_MIN: float = 0.25   # Minimum dark-pixel fraction for a valid bug candidate
+
+# BGR chroma variance: max(R,G,B) - min(R,G,B) within original-binary-masked pixels.
+# Dark neutral insects: chroma ~5–20.  Colored debris / hair: chroma ~50–100.
+BLOB_CHROMA_MAX: float = 45.0       # Blobs above this are colored objects, not dark insects
+
 # Display
 DISPLAY_HEIGHT: int = 900
 
@@ -139,6 +161,12 @@ class BlobFeatures:
     # smooth debris or filaments have zero or very shallow defects.
     significant_defects: int = 0        # count of defects deeper than MIN_DEFECT_DEPTH_PX
     max_defect_depth_px: float = 0.0    # depth of the deepest defect in pixels
+    # Intensity features — sampled from ORIGINAL grayscale image within the
+    # ORIGINAL binary mask (pre-morph-close).  This avoids diluting the signal
+    # with bright background pixels added by the close operation.
+    dark_pixel_ratio: float = 0.0       # fraction of pixels with gray < DARK_PIXEL_THRESH
+    mean_blob_brightness: float = 255.0 # mean gray value (low = dark specimen)
+    mean_chroma_variance: float = 0.0   # mean BGR chroma per pixel (high = colored debris)
     contour: Optional[np.ndarray] = field(default=None, repr=False)
     convex_hull: Optional[np.ndarray] = field(default=None, repr=False)
 
@@ -293,6 +321,69 @@ def _find_blobs(binary: np.ndarray) -> list[BlobFeatures]:
     return blobs
 
 
+def _compute_intensity_features(
+    blob: BlobFeatures,
+    gray: np.ndarray,
+    img: np.ndarray,
+    original_binary: np.ndarray,
+) -> None:
+    """Populate intensity/colour features on a BlobFeatures in-place.
+
+    Samples the ORIGINAL (pre-morph-close) binary mask intersected with the
+    blob's closed contour.  Using the original mask avoids diluting the signal
+    with bright background pixels that the morphological close adds around thin
+    objects (e.g. hair follicles).
+
+    Features set:
+        dark_pixel_ratio      — fraction of sampled pixels with gray < DARK_PIXEL_THRESH.
+                                Bugs: 0.3–1.0.  Reddish debris / amber hair: 0.0–0.15.
+        mean_blob_brightness  — mean grayscale value of sampled pixels.
+        mean_chroma_variance  — mean per-pixel BGR chroma (max–min channel) of sampled
+                                pixels.  Dark neutral insects: 5–20.
+                                Colored debris / hair: 50–100.
+
+    Args:
+        blob:            BlobFeatures with a valid contour.
+        gray:            Grayscale version of the original frame.
+        img:             Original BGR (or grayscale) frame.
+        original_binary: Binary mask from _segment() BEFORE morphological close.
+    """
+    if blob.contour is None:
+        return
+
+    h, w = gray.shape[:2]
+
+    # Closed-blob mask from the contour (filled)
+    closed_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.drawContours(closed_mask, [blob.contour], -1, 255, -1)
+
+    # Intersect with ORIGINAL binary so we only sample genuinely segmented pixels.
+    # This removes the halo of background pixels added by morphological close.
+    sample_mask = cv2.bitwise_and(original_binary, closed_mask)
+    pixels_gray = gray[sample_mask > 0]
+
+    # If original binary had no pixels inside this blob (can happen for very small
+    # blobs whose morphological expansion has no original-binary overlap), fall back
+    # to the full closed-blob mask.
+    if len(pixels_gray) < 5:
+        pixels_gray = gray[closed_mask > 0]
+
+    if len(pixels_gray) == 0:
+        return
+
+    blob.dark_pixel_ratio = float(np.sum(pixels_gray < DARK_PIXEL_THRESH)) / len(pixels_gray)
+    blob.mean_blob_brightness = float(np.mean(pixels_gray))
+
+    # BGR chroma (per-pixel max–min channel) — only meaningful for colour images
+    if img.ndim == 3:
+        pixels_bgr = img[sample_mask > 0] if np.any(sample_mask) else img[closed_mask > 0]
+        if len(pixels_bgr) > 0:
+            chroma_per_pixel = (
+                pixels_bgr.max(axis=1).astype(float) - pixels_bgr.min(axis=1).astype(float)
+            )
+            blob.mean_chroma_variance = float(np.mean(chroma_per_pixel))
+
+
 def _select_dominant(blobs: list[BlobFeatures], frame_shape: tuple) -> Optional[BlobFeatures]:
     """Choose the dominant specimen blob using center-first expanding radius search.
 
@@ -389,6 +480,30 @@ def _classify_blob(blob: BlobFeatures) -> tuple[str, str]:
             f"aspect={ar:.2f}>{HAIR_ASPECT_THRESH} "
             f"and solidity={sol:.2f}<{HAIR_SOLIDITY_MAX} "
             f"(filament/leg/hair)"
+        )
+
+    # ── 1b. Dark-pixel intensity gate (primary physical discriminator) ─────────
+    # Insects are melanized: their bodies are dark brown/black (gray 20–80).
+    # Colored debris (reddish biological material) and amber hair follicles are
+    # NOT genuinely dark — they segment at Otsu threshold but their original-image
+    # pixels are gray 100–160.  Any blob with fewer than BLOB_DARK_RATIO_MIN truly
+    # dark pixels cannot be a melanized insect.
+    # Chroma check: colored objects (reddish, amber, golden) have high per-pixel
+    # BGR chroma; dark neutral insects have near-zero chroma.
+    if blob.dark_pixel_ratio < BLOB_DARK_RATIO_MIN:
+        return "DEBRIS", (
+            f"not a dark insect: dark_ratio={blob.dark_pixel_ratio:.2f} "
+            f"< {BLOB_DARK_RATIO_MIN} "
+            f"(brightness={blob.mean_blob_brightness:.0f}, "
+            f"chroma={blob.mean_chroma_variance:.0f}) "
+            f"— reddish/amber/transparent debris"
+        )
+    if blob.mean_chroma_variance > BLOB_CHROMA_MAX:
+        return "DEBRIS", (
+            f"colored object: chroma={blob.mean_chroma_variance:.0f} "
+            f"> {BLOB_CHROMA_MAX} "
+            f"(dark_ratio={blob.dark_pixel_ratio:.2f}) "
+            f"— insect bodies are chromatically neutral"
         )
 
     # ── 2. Size gate ───────────────────────────────────────────────────────────
@@ -570,6 +685,11 @@ def classify_eoa_image(
             return result
 
         dominant = _select_dominant(blobs, gray.shape)
+
+        # Compute intensity/colour features from original image pixels
+        # within the original binary mask (before morphological close).
+        _compute_intensity_features(dominant, gray, img, binary)
+
         label, reason = _classify_blob(dominant)
 
         log.info(
@@ -710,9 +830,9 @@ def main() -> None:
     print(f"{'=' * 72}")
     print(
         f"{'Image':<35} {'Label':<8} {'Otsu':>5} {'FGcov':>6} {'Area':>8} "
-        f"{'Diam':>6} {'AspRt':>6} {'Solid':>6} {'Circ':>6} {'Defs':>5} {'MaxD':>6}"
+        f"{'Diam':>6} {'AspRt':>6} {'Solid':>6} {'DrkRt':>6} {'Brt':>5} {'Chr':>5}"
     )
-    print("-" * 95)
+    print("-" * 97)
 
     results: list[ClassificationResult] = []
     for p in paths:
@@ -735,8 +855,9 @@ def main() -> None:
         print(
             f"{p.name:<35} {r.label:<8} {otsu_str} {cov_str} "
             f"{d.area:>8.0f} {d.equiv_diameter:>6.1f} "
-            f"{d.aspect_ratio:>6.2f} {d.solidity:>6.2f} {d.circularity:>6.2f} "
-            f"{d.significant_defects:>5} {d.max_defect_depth_px:>6.1f}{warn}"
+            f"{d.aspect_ratio:>6.2f} {d.solidity:>6.2f} "
+            f"{d.dark_pixel_ratio:>6.2f} {d.mean_blob_brightness:>5.0f} "
+            f"{d.mean_chroma_variance:>5.0f}{warn}"
         )
 
         if not headless and r.annotated_image is not None:
