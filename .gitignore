@@ -27,6 +27,7 @@ htmlcov/
 output/overhead_images/
 output/bugs_detected/
 software_tests/overhead_detection/results/
+software_tests/eoa_classification/results/
 # Root-level test captures from hardware bring-up
 capture_*.png
 capture_*.tiff
