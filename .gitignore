@@ -1,0 +1,72 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+
+# ── Virtual environments ───────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Test / coverage cache ─────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ── Images — too large for git, backed up separately ──────────────────────────
+output/overhead_images/
+output/bugs_detected/
+software_tests/overhead_detection/results/
+# Root-level test captures from hardware bring-up
+capture_*.png
+capture_*.tiff
+
+# ── Runtime state ─────────────────────────────────────────────────────────────
+persist.json
+
+# ── Calibration data — machine-specific, stored on HMI at C:\LabAutomation ───
+*.npy
+
+# ── Database & CSV run data — runtime artefacts, not source ───────────────────
+*.db
+*.sqlite
+*.sqlite3
+output/runs/
+output/csv/
+
+# ── Claude Code local settings ────────────────────────────────────────────────
+.claude/
+
+# ── IDE / editor ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# ── OS artefacts ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Secrets / environment ─────────────────────────────────────────────────────
+.env
+.env.*
+secrets.yaml
+secrets.yml
+
+# ── Compiled Epson robot programs (binaries) ──────────────────────────────────
+*.prg.bak

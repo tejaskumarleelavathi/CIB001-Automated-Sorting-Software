@@ -1,0 +1,24 @@
+{
+  "overhead": {
+    "label": "OVERHEAD",
+    "serial": "253102168",
+    "model": "TRI245S-C",
+    "ip": "172.16.9.22",
+    "image": "overhead_test.png",
+    "shape": [
+      4600,
+      5320
+    ]
+  },
+  "eoa": {
+    "label": "EoA",
+    "serial": "253102169",
+    "model": "TRI245S-C",
+    "ip": "172.16.9.21",
+    "image": "eoa_test.png",
+    "shape": [
+      4600,
+      5320
+    ]
+  }
+}

@@ -1,0 +1,104 @@
+# CIB Automated Sorting Cell — Machine Configuration
+# Edit this file when hardware changes (IPs, ports, timing, camera settings).
+# Do NOT modify during a run.
+# Deploy to: C:\LabAutomation\config\machine_config.yaml
+
+robot:
+  ip: "172.16.9.15"
+  port: 2000
+  connect_timeout_s: 5.0
+  command_timeout_s: 10.0
+
+plc:
+  ip: "172.16.9.11"
+  port: 502
+  poll_interval_ms: 100
+  unit_id: 1
+  registers:
+    status_light_mode: 0
+    status_light_pattern: 1
+    status_light_direction: 2
+    status_light_speed: 3
+    status_light_primary_color: 5
+    status_light_primary_intensity: 6
+    status_light_secondary_color: 7
+    status_light_secondary_intensity: 8
+  coils:
+    status_light_demo: 0
+
+flexi:
+  ip: "172.16.9.12"
+  port: 502
+  poll_interval_ms: 100
+  unit_id: 1
+  registers:
+    # Address 256 = live process I/O (25 registers). Address 2000 = static device status.
+    process_io: 256
+    process_io_count: 25
+    status_base: 2000
+    # Confirmed bit map (2026-06-19, verified via rawwatch):
+    #   reg256 bit 15 = heartbeat (1Hz toggle — ignore for safety checks)
+    #   reg256 bit 11 = system enabled (LOW when any fault active)
+    #   Remaining bits TBD — ask David for full output map (OQ-23)
+    safe_value: 0x0917    # r256 masked value when system is safe (heartbeat stripped)
+
+overhead_camera:
+  # Lucid TRI245S-CC — identified by serial, not IP.
+  # Run force_camera_ip.py at the start of each session to assign a stable IP.
+  serial: "253102168"
+  ip: "172.16.9.21"       # target IP that force_camera_ip.py assigns to this serial
+  exposure_us: 3000        # with backlight on. Use auto if backlight is off.
+  gain_db: 0.0
+  pixel_format: "Mono8"   # grayscale — sufficient for blob detection
+
+eoa_camera:
+  # Lucid TRI245S-CC — identified by serial, not IP.
+  serial: "253102169"
+  ip: "172.16.9.22"       # target IP that force_camera_ip.py assigns to this serial
+  ip_original: "172.16.9.41"
+  exposure_us: 120000      # longer exposure for close-up EoA images
+  gain_db: 0.0
+  pixel_format: "BGR8"    # color for EoA archival images
+
+backlight:
+  # Advanced Illumination DCS-100E
+  ip: "172.16.9.20"
+  port: 777
+  current_ma: 250
+  connect_timeout_s: 2.0
+
+ring_light:
+  robot_output_pin: 12    # robot digital output 4 = pipette pneumatic, 12 = ring light
+
+pipette:
+  # Novanta LMDAE572C (Liberty MDrive) — raw MCode ASCII over TCP
+  interface: "tcp"
+  ip: "172.16.9.16"
+  port: 503
+  aspirate_volume_ul: 5.0
+  aspirate_speed_ul_per_s: 2.0
+  dispense_volume_ul: 5.0
+  dispense_speed_ul_per_s: 2.0
+
+paths:
+  db: 'C:\LabAutomation\data\picks.db'
+  plate_configs: 'C:\LabAutomation\config\plate_configs'
+  runs_output: 'C:\LabAutomation\data\runs'
+  logs: 'C:\LabAutomation\data\logs'
+  # Overhead images are saved here (debug use — not required by Austin).
+  # In dev mode (USE_MOCKS=True), main.py uses output/overhead_images/ instead.
+  overhead_images: 'C:\LabAutomation\data\overhead_images'
+
+vision:
+  detection_min_area_px: 50
+  detection_max_area_px: 2000
+  backlight_lead_time_ms: 50
+  # Overhead image save settings
+  overhead_save_images: true          # set false to skip saving overhead frames
+  overhead_save_format: 'png'         # png (debug) or tiff (archival)
+  # EoA image settings (save one TIFF per specimen — Austin requires these)
+  eoa_save_format: 'tiff'
+
+logging:
+  level: "INFO"
+  retention_days: 30

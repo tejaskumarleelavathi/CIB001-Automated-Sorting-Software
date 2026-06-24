@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cib-software"
+version = "0.1.0"
+description = "CIB Automated Sample Sorting Cell — HMI Software"
+requires-python = ">=3.11"
+
+dependencies = [
+    # UI
+    "PyQt6>=6.6",
+
+    # State machine
+    "transitions>=0.9",
+
+    # Hardware comms
+    "pymodbus>=3.6",          # Logic PLC + Flexi Compact (ModbusTCP)
+    "pyserial>=3.5",          # M-Drive fallback if RS-232 (OQ-14)
+
+    # Camera
+    "harvesters>=1.4",        # GigE Vision GenTL
+    "genicam>=1.1",
+
+    # Vision
+    "opencv-python>=4.9",
+    "numpy>=1.26",
+
+    # Data
+    "structlog>=24.0",        # structured logging
+
+    # Config
+    "tomli-w>=1.0",           # TOML write (read is stdlib tomllib in Python 3.11+)
+    "openpyxl>=3.1",          # Excel config files
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-qt>=4.4",
+    "mypy>=1.9",
+    "ruff>=0.4",              # linter + formatter
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
