@@ -6,7 +6,7 @@ Click any point in the overhead image → see predicted robot XY.
 Jog robot to that XY → check if pipette lands where you clicked.
 
 Usage:
-    & "C:\Users\TejasKumarLeelavathi\miniconda3\envs\cib_env\python.exe" camera_calibration\step3_verify.py
+    & "C:/Users/TejasKumarLeelavathi/miniconda3/envs/cib_env/python.exe" camera_calibration/step3_verify.py
 
 Controls (image window):
     Left-click  → shows predicted robot XY for that pixel

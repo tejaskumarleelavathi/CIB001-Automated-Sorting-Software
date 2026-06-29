@@ -26,13 +26,17 @@ from cib.logging_setup import configure as configure_logging
 USE_MOCKS = True       # True = laptop dev | False = HMI prod
 
 # Selective real-hardware flags (only apply when USE_MOCKS = True)
-USE_REAL_CAMERA   = True    # real Lucid GigE overhead camera
+# Set the device you physically have connected to True; leave others False.
+USE_REAL_ROBOT    = True    # real Epson T3-B (sort_server.prg must be running in RC+)
+USE_REAL_CAMERA_OVERHEAD = True    # real Lucid overhead camera (serial 253102168)
+USE_REAL_CAMERA_EOA      = True    # real Lucid EoA camera (serial 253102169)
 USE_REAL_LIGHTING = True    # real DCS-100E backlight
 
 # Dev testing flag — inject a fake centroid if vision finds no bugs in the dish.
 # Keeps the cycle running so you can test pick-place flow without a full dish.
 # Set False when real bug detection is implemented and tested.
-FORCE_SAMPLE_DETECTION = True
+FORCE_SAMPLE_DETECTION = False
+VIEW = True    # True = show image popups for 3s during testing | False = silent (production)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _DEV_CONFIG  = Path(__file__).parent / "config" / "machine_config.yaml"
@@ -50,21 +54,37 @@ def _load_config():
     )
 
 
-def build_drivers(use_mocks: bool, cfg, use_real_camera: bool, use_real_lighting: bool):
+def build_drivers(
+    use_mocks: bool,
+    cfg,
+    use_real_robot: bool,
+    use_real_camera_overhead: bool,
+    use_real_camera_eoa: bool,
+    use_real_lighting: bool,
+):
     from cib.core.orchestrator import DriverSet
 
     if use_mocks:
-        from cib.drivers.robot.mock    import MockRobotDriver
         from cib.drivers.safety.mock   import MockSafetyDriver
         from cib.drivers.plc.mock      import MockPLCDriver
         from cib.drivers.pump.mock     import MockPumpDriver
         from cib.drivers.camera.mock   import MockCameraDriver
         from cib.drivers.lighting.mock import MockLightingDriver
 
+        robot = (
+            _make_real_robot(cfg)
+            if use_real_robot
+            else __import__("cib.drivers.robot.mock", fromlist=["MockRobotDriver"]).MockRobotDriver()
+        )
         camera_overhead = (
             _make_real_camera(cfg, "overhead")
-            if use_real_camera
+            if use_real_camera_overhead
             else MockCameraDriver(name="overhead", num_fake_samples=5)
+        )
+        camera_eoa = (
+            _make_real_camera(cfg, "eoa")
+            if use_real_camera_eoa
+            else MockCameraDriver(name="eoa", num_fake_samples=1)
         )
         lighting = (
             _make_real_lighting(cfg)
@@ -72,12 +92,12 @@ def build_drivers(use_mocks: bool, cfg, use_real_camera: bool, use_real_lighting
             else MockLightingDriver()
         )
         return DriverSet(
-            robot           = MockRobotDriver(),
+            robot           = robot,
             safety          = MockSafetyDriver(),
             plc             = MockPLCDriver(),
             pump            = MockPumpDriver(),
             camera_overhead = camera_overhead,
-            camera_eoa      = MockCameraDriver(name="eoa", num_fake_samples=1),
+            camera_eoa      = camera_eoa,
             lighting        = lighting,
         )
 
@@ -87,7 +107,7 @@ def build_drivers(use_mocks: bool, cfg, use_real_camera: bool, use_real_lighting
         from cib.drivers.plc.driver      import LogicPLCDriver
         from cib.drivers.pump.driver     import MDriveDriver
         return DriverSet(
-            robot           = EpsonT3BDriver(),
+            robot           = _make_real_robot(cfg),
             safety          = FlexiCompactDriver(),
             plc             = LogicPLCDriver(),
             pump            = MDriveDriver(),
@@ -95,6 +115,17 @@ def build_drivers(use_mocks: bool, cfg, use_real_camera: bool, use_real_lighting
             camera_eoa      = _make_real_camera(cfg, "eoa"),
             lighting        = _make_real_lighting(cfg),
         )
+
+
+def _make_real_robot(cfg):
+    from cib.drivers.robot.driver import EpsonT3BDriver
+    r = cfg.robot
+    return EpsonT3BDriver(
+        ip=r.ip,
+        port=r.port,
+        connect_timeout_s=r.connect_timeout_s,
+        motion_timeout_s=getattr(r, "motion_timeout_s", 120.0),
+    )
 
 
 def _make_real_camera(cfg, which: str):
@@ -106,6 +137,7 @@ def _make_real_camera(cfg, which: str):
         exposure_us=cam_cfg.exposure_us,
         gain_db=cam_cfg.gain_db,
         pixel_format=cam_cfg.pixel_format,
+        max_fps=getattr(cam_cfg, "max_fps", None),
         name=which,
     )
 
@@ -124,15 +156,28 @@ def main() -> None:
     configure_logging()
 
     cfg = _load_config()
-    drivers = build_drivers(USE_MOCKS, cfg, USE_REAL_CAMERA, USE_REAL_LIGHTING)
+    drivers = build_drivers(
+        USE_MOCKS, cfg,
+        use_real_robot=USE_REAL_ROBOT,
+        use_real_camera_overhead=USE_REAL_CAMERA_OVERHEAD,
+        use_real_camera_eoa=USE_REAL_CAMERA_EOA,
+        use_real_lighting=USE_REAL_LIGHTING,
+    )
 
-    # Image save directory
+    # Image save directories
     overhead_save_dir = (
-        Path(__file__).parent / "output" / "overhead_images"
+        Path(__file__).parent / "cib" / "output" / "overhead_images"
         if USE_MOCKS
         else Path(cfg.paths.overhead_images)
     )
     overhead_save_dir.mkdir(parents=True, exist_ok=True)
+
+    eoa_save_dir = (
+        Path(__file__).parent / "cib" / "output" / "eoa_images"
+        if USE_MOCKS
+        else Path(cfg.paths.runs_output)
+    )
+    eoa_save_dir.mkdir(parents=True, exist_ok=True)
 
     from cib.core.orchestrator import Orchestrator
     orchestrator = Orchestrator(
@@ -140,7 +185,9 @@ def main() -> None:
         overhead_save_dir=overhead_save_dir if cfg.vision.overhead_save_images else None,
         overhead_save_format=cfg.vision.overhead_save_format,
         overhead_save_images=cfg.vision.overhead_save_images,
+        eoa_save_dir=eoa_save_dir,
         force_sample_detection=FORCE_SAMPLE_DETECTION,
+        view=VIEW,
     )
 
     # ── Start asyncio in a background daemon thread ───────────────────────────

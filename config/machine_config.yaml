@@ -7,7 +7,11 @@ robot:
   ip: "172.16.9.15"
   port: 2000
   connect_timeout_s: 5.0
-  command_timeout_s: 10.0
+  motion_timeout_s: 120.0   # 2 min — robot moves at 5% speed, long travel ~60s
+  command_timeout_s: 120.0  # alias required by validator — same as motion_timeout_s
+  # Z heights (mm) — documented here for reference; hardcoded in sort_server.prg
+  z_safe_mm: -47.700        # safe travel Z when moving between XY positions
+  z_imaging_mm: -58.660     # EoA imaging Z (robot stops here, camera captures)
 
 plc:
   ip: "172.16.9.11"
@@ -44,21 +48,21 @@ flexi:
 
 overhead_camera:
   # Lucid TRI245S-CC — identified by serial, not IP.
-  # Run force_camera_ip.py at the start of each session to assign a stable IP.
   serial: "253102168"
-  ip: "172.16.9.21"       # target IP that force_camera_ip.py assigns to this serial
-  exposure_us: 3000        # with backlight on. Use auto if backlight is off.
+  ip: ""                   # empty — cameras use LLA (169.254.x.x), discovered by serial
+  exposure_us: 3000        # with backlight on.
   gain_db: 0.0
   pixel_format: "Mono8"   # grayscale — sufficient for blob detection
+  max_fps: 2.0             # cap TX rate — both cameras share one USB-C Ethernet adapter
 
 eoa_camera:
   # Lucid TRI245S-CC — identified by serial, not IP.
   serial: "253102169"
-  ip: "172.16.9.22"       # target IP that force_camera_ip.py assigns to this serial
-  ip_original: "172.16.9.41"
-  exposure_us: 120000      # longer exposure for close-up EoA images
+  ip: ""                   # empty — cameras use LLA (169.254.x.x), discovered by serial
+  exposure_us: 33333       # 2 × (1/60Hz) = exactly 2 mains cycles — eliminates LED flicker banding
   gain_db: 0.0
   pixel_format: "BGR8"    # color for EoA archival images
+  max_fps: 1.0             # EoA frame is 70MB (BGR8 full-res) — limit to 1fps to spare bandwidth
 
 backlight:
   # Advanced Illumination DCS-100E

@@ -53,6 +53,7 @@ import argparse
 import logging
 import math
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -128,6 +129,15 @@ BLOB_DARK_RATIO_MIN: float = 0.25   # Minimum dark-pixel fraction for a valid bu
 # Dark neutral insects: chroma ~5–20.  Colored debris / hair: chroma ~50–100.
 BLOB_CHROMA_MAX: float = 45.0       # Blobs above this are colored objects, not dark insects
 
+# ── Body-center / pipette-target constants ─────────────────────────────────────
+# After EoA classification confirms BUG, we need the BODY center — not the
+# geometric centroid of the whole blob (which may fall on a wing).
+# Strategy: threshold the dark body pixels (gray < BODY_DARK_THRESH) inside the
+# blob, find the largest connected component, then use an intensity-weighted
+# centroid (weight = 255 - pixel_value) so the result is pulled toward the
+# densest/darkest region (thorax/abdomen), not toward semi-transparent wings.
+BODY_DARK_THRESH: int = 70   # Gray value for body-only pixels (wings: ~150-210)
+
 # Display
 DISPLAY_HEIGHT: int = 900
 
@@ -183,6 +193,10 @@ class ClassificationResult:
     notes: str = ""
     otsu_threshold: float = 0.0
     fg_coverage: float = 0.0              # fraction of frame that is foreground
+    elapsed_ms: float = 0.0              # wall-clock time for the full pipeline
+    # Pipette target: intensity-weighted centroid of dark body pixels only.
+    # None when label != "BUG".  Excludes wings so the pipette hits the thorax.
+    body_center_px: Optional[tuple[float, float]] = None
     error: Optional[str] = None
 
 
@@ -384,39 +398,37 @@ def _compute_intensity_features(
             blob.mean_chroma_variance = float(np.mean(chroma_per_pixel))
 
 
-def _select_dominant(blobs: list[BlobFeatures], frame_shape: tuple) -> Optional[BlobFeatures]:
-    """Choose the dominant specimen blob using center-first expanding radius search.
+def _rank_candidates(blobs: list[BlobFeatures], frame_shape: tuple) -> list[BlobFeatures]:
+    """Return all blobs ordered by center-first priority for sequential classification.
 
-    The EoA arm holds the specimen roughly below the camera centre.  We search
-    in concentric rings (defined by CENTER_SEARCH_FRACS as fractions of the frame
-    half-diagonal) and return the largest blob found in the innermost ring that
-    contains at least one blob.  This ensures a small bug near the centre beats
-    a larger debris blob at the image edge.
+    The EoA arm holds the specimen roughly below the camera centre.  Blobs are
+    sorted into concentric rings (defined by CENTER_SEARCH_FRACS as fractions of
+    the frame half-diagonal).  Within each ring, larger blobs rank first.
 
-    Search order:
+    The caller iterates this list and returns the FIRST blob that classifies as BUG,
+    skipping any debris or hair blobs closer to centre before finding the real specimen.
+
+    Search rings:
         1. Within 15% of half-diagonal from centre
         2. 15–30%
         3. 30–50%
         4. 50–100% (full frame fallback)
-
-    Within each ring, the largest blob wins (by area).
 
     Args:
         blobs: All detected blobs (any order).
         frame_shape: (H, W[, C]) of the original frame.
 
     Returns:
-        The dominant BlobFeatures, or None if blobs is empty.
+        All blobs in center-first, largest-first-per-ring order.  Empty if blobs is empty.
     """
     if not blobs:
-        return None
+        return []
 
     h, w = frame_shape[:2]
     cx_frame = w / 2.0
     cy_frame = h / 2.0
     half_diag = math.sqrt(cx_frame ** 2 + cy_frame ** 2)
 
-    # Pre-compute distance to frame centre for every blob
     distances = {
         id(b): math.sqrt(
             (b.centroid_x - cx_frame) ** 2 + (b.centroid_y - cy_frame) ** 2
@@ -424,20 +436,19 @@ def _select_dominant(blobs: list[BlobFeatures], frame_shape: tuple) -> Optional[
         for b in blobs
     }
 
+    ranked: list[BlobFeatures] = []
     prev_radius = 0.0
     for frac in CENTER_SEARCH_FRACS:
         radius = half_diag * frac
-        ring_blobs = [
-            b for b in blobs
-            if prev_radius <= distances[id(b)] < radius
-        ]
-        if ring_blobs:
-            # Largest within this ring
-            return max(ring_blobs, key=lambda b: b.area)
+        ring_blobs = sorted(
+            [b for b in blobs if prev_radius <= distances[id(b)] < radius],
+            key=lambda b: b.area,
+            reverse=True,
+        )
+        ranked.extend(ring_blobs)
         prev_radius = radius
 
-    # Should never reach here (last frac = 1.0 covers everything), but just in case
-    return max(blobs, key=lambda b: b.area)
+    return ranked
 
 
 def _classify_blob(blob: BlobFeatures) -> tuple[str, str]:
@@ -544,23 +555,112 @@ def _classify_blob(blob: BlobFeatures) -> tuple[str, str]:
     )
 
 
+def find_body_center(
+    blob: BlobFeatures,
+    gray: np.ndarray,
+    original_binary: np.ndarray,
+) -> tuple[float, float, np.ndarray]:
+    """Find the intensity-weighted center of mass of the bug body, excluding wings.
+
+    Wings are semi-transparent (gray ~150–210) and must NOT be the pipette target —
+    picking from a wing risks breaking it.  This function isolates only the dark
+    body pixels (gray < BODY_DARK_THRESH) within the blob and computes their
+    intensity-weighted centroid.
+
+    Weighting: weight = (255 - pixel_gray) — darker pixels are heavier, so the
+    result is pulled toward the densest part of the body (thorax/abdomen) rather
+    than the geometric centre of the whole blob.
+
+    If body pixels cannot be isolated (e.g. all-dark blob with no wing contrast),
+    falls back to the full dark-pixel centroid of the blob.
+
+    Args:
+        blob:            BlobFeatures with a valid contour.
+        gray:            Grayscale version of the original frame.
+        original_binary: Binary mask from _segment() BEFORE morphological close.
+
+    Returns:
+        (cx, cy, body_mask) where (cx, cy) are pixel coordinates of the pipette
+        target and body_mask is a uint8 binary image of the isolated body region.
+    """
+    if blob.contour is None:
+        return blob.centroid_x, blob.centroid_y, np.zeros(gray.shape[:2], dtype=np.uint8)
+
+    h, w = gray.shape[:2]
+
+    # Full closed-blob mask from the classified contour
+    closed_mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.drawContours(closed_mask, [blob.contour], -1, 255, -1)
+
+    # Use ORIGINAL binary pixels inside the blob to avoid morph-close halo
+    sample_mask = cv2.bitwise_and(original_binary, closed_mask)
+    if np.count_nonzero(sample_mask) < 5:
+        sample_mask = closed_mask  # fallback: use full closed mask
+
+    # Isolate body pixels with tighter threshold than DARK_PIXEL_THRESH
+    _, body_binary = cv2.threshold(gray, BODY_DARK_THRESH, 255, cv2.THRESH_BINARY_INV)
+    body_mask = cv2.bitwise_and(body_binary, sample_mask)
+
+    # If body threshold is too tight (e.g. pale specimen), relax to sample mask
+    if np.count_nonzero(body_mask) < 10:
+        log.debug("  find_body_center: body threshold too tight, using full sample mask")
+        body_mask = sample_mask.copy()
+
+    # Find the largest connected body component to avoid detached legs or antennae
+    # pulling the centroid away from the thorax
+    n_labels, labels, stats, centroids_cc = cv2.connectedComponentsWithStats(
+        body_mask, connectivity=8
+    )
+
+    if n_labels <= 1:
+        # No connected component found — fall back to blob centroid
+        return blob.centroid_x, blob.centroid_y, body_mask
+
+    # Skip label 0 (background), pick the largest component by pixel area
+    largest_label = int(1 + np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    body_component = ((labels == largest_label).astype(np.uint8)) * 255
+
+    # Intensity-weighted centroid: weight = 255 - gray → darker = heavier
+    ys, xs = np.where(body_component > 0)
+    if len(xs) == 0:
+        return blob.centroid_x, blob.centroid_y, body_mask
+
+    weights = 255.0 - gray[ys, xs].astype(float)
+    total_w = float(weights.sum())
+    if total_w > 0:
+        cx = float(np.dot(xs.astype(float), weights) / total_w)
+        cy = float(np.dot(ys.astype(float), weights) / total_w)
+    else:
+        # All pixels equally dark — use geometric centroid of component
+        cx = float(centroids_cc[largest_label][0])
+        cy = float(centroids_cc[largest_label][1])
+
+    return cx, cy, body_component
+
+
 def _annotate(
     img: np.ndarray,
     result: ClassificationResult,
     dominant: BlobFeatures,
+    body_center: Optional[tuple[float, float]] = None,
+    body_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Draw classification result onto the image.
 
     Draws:
         - Orange convex hull of dominant blob
-        - Green filled contour of dominant blob
-        - Red centroid dot
-        - Top-left banner: label + key features
+        - Coloured contour of dominant blob
+        - Red dot: blob geometric centroid
+        - Cyan overlay: isolated body pixels (when body_mask provided)
+        - Cyan crosshair + circle: pipette target (body center, when provided)
+        - Top-left banner: label + key features + pipette target coords
 
     Args:
-        img: Original BGR or grayscale image.
-        result: Classification result.
-        dominant: Features of the dominant blob.
+        img:         Original BGR or grayscale image.
+        result:      Classification result.
+        dominant:    Features of the dominant blob.
+        body_center: (cx, cy) pipette target pixel coords, or None.
+        body_mask:   Binary mask of body pixels for overlay, or None.
 
     Returns:
         Annotated BGR image.
@@ -575,6 +675,12 @@ def _annotate(
         if blob.contour is not None:
             cv2.drawContours(out, [blob.contour], -1, (180, 180, 180), 1)
 
+    # Body pixel overlay in semi-transparent cyan (BUG only)
+    if body_mask is not None and np.any(body_mask):
+        overlay = out.copy()
+        overlay[body_mask > 0] = (255, 220, 0)   # cyan-ish (BGR: yellow-cyan)
+        cv2.addWeighted(overlay, 0.35, out, 0.65, 0, out)
+
     # Draw dominant contour
     if dominant.contour is not None:
         cv2.drawContours(out, [dominant.contour], -1, colour, 2)
@@ -583,10 +689,24 @@ def _annotate(
     if dominant.convex_hull is not None:
         cv2.polylines(out, [dominant.convex_hull], True, (0, 165, 255), 2)
 
-    # Centroid dot
+    # Blob geometric centroid (red dot)
     cx_i = int(round(dominant.centroid_x))
     cy_i = int(round(dominant.centroid_y))
     cv2.circle(out, (cx_i, cy_i), 6, (0, 0, 255), -1)
+
+    # Pipette target: body center crosshair (cyan) — distinct from centroid
+    if body_center is not None:
+        bcx = int(round(body_center[0]))
+        bcy = int(round(body_center[1]))
+        arm = max(18, int(dominant.equiv_diameter * 0.25))
+        lw  = max(2, int(dominant.equiv_diameter * 0.03))
+        # Crosshair lines
+        cv2.line(out, (bcx - arm, bcy), (bcx + arm, bcy), (255, 255, 0), lw)
+        cv2.line(out, (bcx, bcy - arm), (bcx, bcy + arm), (255, 255, 0), lw)
+        # Targeting circle
+        cv2.circle(out, (bcx, bcy), arm // 2, (255, 255, 0), lw)
+        # Small filled dot at exact target
+        cv2.circle(out, (bcx, bcy), 4, (0, 255, 255), -1)
 
     # Banner text
     lines = [
@@ -595,6 +715,9 @@ def _annotate(
         f"aspect={dominant.aspect_ratio:.2f}  solid={dominant.solidity:.2f}",
         f"defects={dominant.significant_defects}  maxD={dominant.max_defect_depth_px:.1f}px",
     ]
+    if body_center is not None:
+        lines.append(f"pipette target: ({body_center[0]:.1f}, {body_center[1]:.1f}) px")
+
     font = cv2.FONT_HERSHEY_SIMPLEX
     scale = max(0.5, img.shape[1] / 1800)
     thick = max(1, int(scale * 2))
@@ -602,7 +725,7 @@ def _annotate(
     pad = 10
 
     panel_h = pad * 2 + line_h * len(lines)
-    panel_w = int(img.shape[1] * 0.52)
+    panel_w = int(img.shape[1] * 0.58)
     cv2.rectangle(out, (0, 0), (panel_w, panel_h), (20, 20, 20), -1)
 
     for i, text in enumerate(lines):
@@ -634,6 +757,8 @@ def classify_eoa_image(
     image_path = Path(image_path)
     log.info("EoA classify | %s", image_path.name)
 
+    t_start = time.perf_counter()
+
     try:
         img = cv2.imread(str(image_path))
         if img is None:
@@ -663,14 +788,16 @@ def classify_eoa_image(
                 notes="Bad lighting: foreground coverage too high — ensure backlight is ON",
                 otsu_threshold=otsu_thresh,
                 fg_coverage=fg_coverage,
+                elapsed_ms=(time.perf_counter() - t_start) * 1000,
             )
 
         closed = _morphological_close(binary)
         blobs = _find_blobs(closed)
 
-        log.info("  Blobs found: %d (above %d px²)", len(blobs), MIN_CONTOUR_AREA)
+        log.info("  Blobs found: %d (above %d px^2)", len(blobs), MIN_CONTOUR_AREA)
 
         if not blobs:
+            elapsed = (time.perf_counter() - t_start) * 1000
             result = ClassificationResult(
                 image_path=str(image_path),
                 label="NONE",
@@ -680,29 +807,70 @@ def classify_eoa_image(
                 notes="No foreground blobs detected",
                 otsu_threshold=otsu_thresh,
                 fg_coverage=fg_coverage,
+                elapsed_ms=elapsed,
             )
             log.info("  -> NONE (no blobs)")
             return result
 
-        dominant = _select_dominant(blobs, gray.shape)
+        # Rank all blobs in center-first priority order (innermost ring first,
+        # largest-first within each ring), then iterate until we find a BUG.
+        # This means a tiny debris speck near center doesn't block a real bug
+        # at a slightly larger radius from being found.
+        candidates = _rank_candidates(blobs, gray.shape)
 
-        # Compute intensity/colour features from original image pixels
-        # within the original binary mask (before morphological close).
-        _compute_intensity_features(dominant, gray, img, binary)
+        dominant = candidates[0]   # default: closest-to-center blob (for NONE display)
+        label = "NONE"
+        reason = "no blob in image passed bug criteria"
 
-        label, reason = _classify_blob(dominant)
+        for candidate in candidates:
+            _compute_intensity_features(candidate, gray, img, binary)
+            cand_label, cand_reason = _classify_blob(candidate)
+            log.info(
+                "  Candidate: area=%.0f diam=%.0f aspect=%.2f solid=%.2f "
+                "dark_ratio=%.2f chroma=%.0f -> %s",
+                candidate.area, candidate.equiv_diameter,
+                candidate.aspect_ratio, candidate.solidity,
+                candidate.dark_pixel_ratio, candidate.mean_chroma_variance,
+                cand_label,
+            )
+            if cand_label == "BUG":
+                dominant = candidate
+                label = "BUG"
+                reason = cand_reason
+                break
+            # Keep looking — this candidate is HAIR/DEBRIS, try the next one.
+            # Record the first candidate's reason as fallback note.
+            if candidate is candidates[0]:
+                reason = f"center blob rejected ({cand_reason}); searching further"
 
-        log.info(
-            "  Dominant: area=%.0f diam=%.0f aspect=%.2f solid=%.2f -> %s",
-            dominant.area, dominant.equiv_diameter,
-            dominant.aspect_ratio, dominant.solidity, label,
+        log.info("  -> %s | %s", label, reason)
+
+        # ── Body center / pipette target ───────────────────────────────────────
+        # Only computed when a real bug is confirmed.  Uses a tighter threshold
+        # (BODY_DARK_THRESH < DARK_PIXEL_THRESH) so that semi-transparent wings
+        # are excluded and the pipette targets the dense thorax/abdomen region.
+        body_center: Optional[tuple[float, float]] = None
+        body_mask_out: Optional[np.ndarray] = None
+        if label == "BUG":
+            bc_x, bc_y, body_mask_out = find_body_center(dominant, gray, binary)
+            body_center = (bc_x, bc_y)
+            log.info(
+                "  Body center (pipette target): (%.1f, %.1f) px", bc_x, bc_y
+            )
+
+        elapsed = (time.perf_counter() - t_start) * 1000
+        log.info("  Elapsed: %.1f ms", elapsed)
+
+        annotated = _annotate(
+            img,
+            ClassificationResult(
+                image_path=str(image_path), label=label, is_bug=(label == "BUG"),
+                dominant_blob=dominant,
+            ),
+            dominant,
+            body_center=body_center,
+            body_mask=body_mask_out,
         )
-        log.info("  Reason: %s", reason)
-
-        annotated = _annotate(img, ClassificationResult(
-            image_path=str(image_path), label=label, is_bug=(label == "BUG"),
-            dominant_blob=dominant,
-        ), dominant)
 
         result = ClassificationResult(
             image_path=str(image_path),
@@ -714,6 +882,8 @@ def classify_eoa_image(
             notes=reason,
             otsu_threshold=otsu_thresh,
             fg_coverage=fg_coverage,
+            elapsed_ms=elapsed,
+            body_center_px=body_center,
         )
 
         if save_dir is not None:
@@ -730,18 +900,21 @@ def classify_eoa_image(
         return ClassificationResult(
             image_path=str(image_path), label="NONE", is_bug=False,
             dominant_blob=None, error=str(exc),
+            elapsed_ms=(time.perf_counter() - t_start) * 1000,
         )
     except cv2.error as exc:
         log.error("OpenCV error on %s: %s", image_path.name, exc)
         return ClassificationResult(
             image_path=str(image_path), label="NONE", is_bug=False,
             dominant_blob=None, error=f"OpenCV: {exc}",
+            elapsed_ms=(time.perf_counter() - t_start) * 1000,
         )
     except Exception as exc:  # noqa: BLE001
         log.exception("Unexpected error on %s", image_path.name)
         return ClassificationResult(
             image_path=str(image_path), label="NONE", is_bug=False,
             dominant_blob=None, error=str(exc),
+            elapsed_ms=(time.perf_counter() - t_start) * 1000,
         )
 
 
@@ -823,16 +996,16 @@ def main() -> None:
     save_dir = Path(args.save) if args.save else _SCRIPT_DIR / "results"
     headless = args.no_show or args.features_only
 
-    print(f"\n{'=' * 72}")
+    print(f"\n{'=' * 80}")
     print(f"  EoA Specimen Classifier  |  {len(paths)} image(s)")
     print(f"  Thresholds: Otsu auto-threshold  hair_ar>{HAIR_ASPECT_THRESH}"
           f"  hair_sol<{HAIR_SOLIDITY_MAX}  bug_diam>={BUG_MIN_DIAM:.0f}")
-    print(f"{'=' * 72}")
+    print(f"{'=' * 80}")
     print(
         f"{'Image':<35} {'Label':<8} {'Otsu':>5} {'FGcov':>6} {'Area':>8} "
-        f"{'Diam':>6} {'AspRt':>6} {'Solid':>6} {'DrkRt':>6} {'Brt':>5} {'Chr':>5}"
+        f"{'Diam':>6} {'AspRt':>6} {'Solid':>6} {'DrkRt':>6} {'Brt':>5} {'Chr':>5} {'ms':>6}"
     )
-    print("-" * 97)
+    print("-" * 105)
 
     results: list[ClassificationResult] = []
     for p in paths:
@@ -842,13 +1015,15 @@ def main() -> None:
         otsu_str = f"{r.otsu_threshold:>5.0f}"
         cov_str  = f"{r.fg_coverage * 100:>5.1f}%"
 
+        ms_str = f"{r.elapsed_ms:>6.1f}"
+
         if r.error:
-            print(f"{p.name:<35} {'ERROR':<8} {otsu_str} {cov_str}  {r.error}")
+            print(f"{p.name:<35} {'ERROR':<8} {otsu_str} {cov_str}  {r.error}  {ms_str}ms")
             continue
 
         d = r.dominant_blob
         if d is None:
-            print(f"{p.name:<35} {'NONE':<8} {otsu_str} {cov_str}")
+            print(f"{p.name:<35} {'NONE':<8} {otsu_str} {cov_str}  {ms_str}ms")
             continue
 
         warn = " !" if r.fg_coverage > MAX_FG_COVERAGE else ""
@@ -857,7 +1032,7 @@ def main() -> None:
             f"{d.area:>8.0f} {d.equiv_diameter:>6.1f} "
             f"{d.aspect_ratio:>6.2f} {d.solidity:>6.2f} "
             f"{d.dark_pixel_ratio:>6.2f} {d.mean_blob_brightness:>5.0f} "
-            f"{d.mean_chroma_variance:>5.0f}{warn}"
+            f"{d.mean_chroma_variance:>5.0f} {ms_str}{warn}"
         )
 
         if not headless and r.annotated_image is not None:
@@ -877,16 +1052,20 @@ def main() -> None:
     none_c  = sum(1 for r in results if r.label == "NONE")
     errors  = sum(1 for r in results if r.error)
 
-    print(f"\n{'=' * 72}")
+    total_ms = sum(r.elapsed_ms for r in results)
+    avg_ms = total_ms / len(results) if results else 0.0
+
+    print(f"\n{'=' * 80}")
     print(f"  Images : {len(paths)}")
     print(f"  BUG    : {bugs}")
     print(f"  HAIR   : {hairs}")
     print(f"  DEBRIS : {debris}")
     print(f"  NONE   : {none_c}")
     print(f"  ERRORS : {errors}")
+    print(f"  Time   : {avg_ms:.1f} ms/image avg  ({total_ms:.0f} ms total)")
     if not args.features_only:
         print(f"  Saved  : {save_dir}")
-    print(f"{'=' * 72}\n")
+    print(f"{'=' * 80}\n")
 
 
 if __name__ == "__main__":

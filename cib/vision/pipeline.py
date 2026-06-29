@@ -47,10 +47,10 @@ log = structlog.get_logger(__name__)
 # Bug detection
 THRESHOLD_VALUE: int = 120    # Grayscale value below which a pixel is a bug (0–255)
 MAX_BUG_AREA: int = 25_000    # Upper contour area limit in px² — rejects merged clusters
-MIN_BUG_AREA: int = 1         # No lower limit — retains tiny specimens
+MIN_BUG_AREA: int = 20        # Reject noise — lowered to catch tiny specimens
 
 # Morphological cleanup
-MORPH_KERNEL_SIZE: int = 5    # Elliptical kernel diameter for morphological open (px)
+MORPH_KERNEL_SIZE: int = 3    # Elliptical kernel diameter for morphological open (px)
 MORPH_OPEN_ITER: int = 1      # Opening iterations — removes isolated single-pixel noise
 
 # Petri dish detection
@@ -417,7 +417,7 @@ def run_overhead_detection(
         centroids_robot_xy: list[tuple[float, float]]
         try:
             from cib.vision.calibration import load_calibration
-            calib = load_calibration()
+            calib = load_calibration(r"camera_calibration\output\calibration_overhead.npy")
             centroids_robot_xy = calib.pixel_list_to_robot(centroids_px)
         except Exception as calib_exc:  # noqa: BLE001
             log.warning(
@@ -427,18 +427,20 @@ def run_overhead_detection(
             )
             centroids_robot_xy = centroids_px
 
-        # ── Stage 5: Annotate + save ──────────────────────────────────────────
+        # ── Stage 5: Annotate (always) + save (if save_dir set) ──────────────
+        annotated = _annotate_frame(
+            frame, contours, cx, cy, radius, len(centroids_px), timestamp
+        )
         saved_path = ""
         if save_dir is not None:
-            annotated = _annotate_frame(
-                frame, contours, cx, cy, radius, len(centroids_px), timestamp
-            )
             saved_path = _save_annotated_image(
                 annotated, Path(save_dir), save_format, timestamp
             )
 
         return VisionOverheadResultEvent(
             centroids_robot_xy=centroids_robot_xy,
+            centroids_px=centroids_px,
+            annotated_frame=annotated,
             annotated_frame_path=saved_path,
             sample_count=len(centroids_robot_xy),
         )
@@ -447,6 +449,8 @@ def run_overhead_detection(
         log.error("overhead_pipeline.opencv_error", error=str(exc))
         return VisionOverheadResultEvent(
             centroids_robot_xy=[],
+            centroids_px=[],
+            annotated_frame=None,
             annotated_frame_path="",
             sample_count=0,
         )
@@ -454,6 +458,43 @@ def run_overhead_detection(
         log.exception("overhead_pipeline.unexpected_error", error=str(exc))
         return VisionOverheadResultEvent(
             centroids_robot_xy=[],
+            centroids_px=[],
+            annotated_frame=None,
             annotated_frame_path="",
             sample_count=0,
         )
+
+
+def draw_target_highlight(
+    annotated: np.ndarray,
+    target_px: tuple[float, float],
+) -> np.ndarray:
+    """Draw a cyan target marker on the selected bug for VIEW display.
+
+    Args:
+        annotated:  Already-annotated BGR frame from _annotate_frame().
+        target_px:  (x, y) pixel centroid of the selected target bug.
+
+    Returns:
+        New BGR image with the target highlighted in cyan.
+    """
+    out = annotated.copy()
+    x, y = int(target_px[0]), int(target_px[1])
+
+    # Scale marker size to image dimensions (images can be 5000+ px wide)
+    r = max(20, annotated.shape[0] // 80)
+    thick = max(2, r // 8)
+    arm = r * 2
+
+    # Cyan circle + crosshair
+    cv2.circle(out, (x, y), r, (255, 255, 0), thick)
+    cv2.line(out, (x - arm, y), (x + arm, y), (255, 255, 0), thick)
+    cv2.line(out, (x, y - arm), (x, y + arm), (255, 255, 0), thick)
+
+    # Label
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = max(0.8, annotated.shape[1] / 2000)
+    cv2.putText(out, "TARGET", (x + r + 4, y - r),
+                font, scale, (255, 255, 0), max(1, thick))
+
+    return out

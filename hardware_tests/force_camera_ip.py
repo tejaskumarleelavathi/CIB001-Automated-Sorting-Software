@@ -34,13 +34,13 @@ import numpy as np
 TARGET_SUBNET   = "255.255.255.0"
 TARGET_GATEWAY  = "172.16.9.1"
 
-# If you know the MAC → IP mapping, fill this in.
-# Leave empty dict to auto-assign 172.16.9.21, .22, ... to cameras in discovery order.
-MAC_TO_IP: dict[str, str] = {
-    # "1c:0f:af:c2:3e:a0": "172.16.9.21",   # Camera 0 (fill in after first run)
-    # "xx:xx:xx:xx:xx:xx": "172.16.9.22",   # Camera 1
+# Serial → target IP mapping (matches machine_config.yaml).
+# This is the correct way to assign — by serial, not discovery order.
+SERIAL_TO_IP: dict[str, str] = {
+    "253102168": "172.16.9.21",   # Overhead camera (Lucid TRI245S-CC)
+    "253102169": "172.16.9.22",   # EoA camera on robot arm (Lucid TRI245S-CC)
 }
-AUTO_START_IP_SUFFIX = 21   # if MAC_TO_IP is empty, start assigning at .21
+AUTO_START_IP_SUFFIX = 21   # fallback if serial not in SERIAL_TO_IP
 
 
 def _wait_for_cameras(timeout_s: float = 5.0) -> list:
@@ -69,14 +69,16 @@ def force_all_cameras() -> None:
         sn  = info.get("serial", "?")
         print(f"  [{i}] serial={sn}  ip={ip}  mac={mac}")
 
-    # Determine target IPs
+    # Determine target IPs — by serial number, not discovery order
     assignments = []
-    for i, info in enumerate(infos):
-        mac = info.get("mac", "")
-        if mac in MAC_TO_IP:
-            target_ip = MAC_TO_IP[mac]
+    fallback_idx = 0
+    for info in infos:
+        serial = info.get("serial", "")
+        if serial in SERIAL_TO_IP:
+            target_ip = SERIAL_TO_IP[serial]
         else:
-            target_ip = f"172.16.9.{AUTO_START_IP_SUFFIX + i}"
+            target_ip = f"172.16.9.{AUTO_START_IP_SUFFIX + fallback_idx}"
+            fallback_idx += 1
 
         assignments.append((info, target_ip))
 

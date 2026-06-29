@@ -3,7 +3,7 @@
     "label": "OVERHEAD",
     "serial": "253102168",
     "model": "TRI245S-C",
-    "ip": "172.16.9.22",
+    "ip": "169.254.161.62",
     "image": "overhead_test.png",
     "shape": [
       4600,
@@ -14,7 +14,7 @@
     "label": "EoA",
     "serial": "253102169",
     "model": "TRI245S-C",
-    "ip": "172.16.9.21",
+    "ip": "169.254.158.63",
     "image": "eoa_test.png",
     "shape": [
       4600,

@@ -34,7 +34,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QFrame, QApplication,
 )
 from PyQt6.QtCore import QTimer, Qt
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QCloseEvent, QFont
 
 from cib.core.state_machine import State
 
@@ -210,6 +210,23 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(3000, QApplication.quit)
 
     # ------------------------------------------------------------------
+    # Window close — ensure clean shutdown even if user clicks X
+    # ------------------------------------------------------------------
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        """Trigger hardware shutdown when the window is closed via X button.
+
+        Without this, closing the window while a cycle is running skips
+        camera disconnect — arena_api keeps the GVCP control channel open
+        and the next startup fails with GC_ERR_TIMEOUT.
+        """
+        self._poll_timer.stop()
+        self._orchestrator.operator_shutdown()
+        # Accept immediately — main.py's finally block will join the asyncio
+        # thread and wait for shutdown to complete (up to 4+3+2 = 9s).
+        event.accept()
+
+    # ------------------------------------------------------------------
     # State polling
     # ------------------------------------------------------------------
 
@@ -225,8 +242,9 @@ class MainWindow(QMainWindow):
         # Button enable logic
         self._start_btn.setEnabled(state == State.IDLE)
         self._stop_btn.setEnabled(state in {State.RUNNING, State.CYCLE_STOPPING})
-        # SHUTDOWN: available when idle or faulted — not while a cycle is running
-        self._shutdown_btn.setEnabled(state in {State.IDLE, State.FAULT})
+        # SHUTDOWN: available in all states except INITIALIZING — operator must
+        # always be able to shut down cleanly (e.g. when stuck in CYCLE_STOPPING).
+        self._shutdown_btn.setEnabled(state != State.INITIALIZING)
 
         # Hint text
         _HINTS = {

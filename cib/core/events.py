@@ -144,8 +144,10 @@ class FrameReadyEvent:
 class VisionOverheadResultEvent:
     """Result of overhead image analysis."""
     centroids_robot_xy: list[tuple[float, float]]   # in robot coordinate space
-    annotated_frame_path: str
-    sample_count: int
+    centroids_px: list[tuple[float, float]]          # pixel coords, paired 1:1 with centroids_robot_xy
+    annotated_frame: Any = None                      # numpy array — always populated by pipeline
+    annotated_frame_path: str = ""
+    sample_count: int = 0
 
 @dataclass(frozen=True)
 class VisionEoAResultEvent:

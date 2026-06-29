@@ -49,6 +49,10 @@ class RobotDriver(Protocol):
         """Immediate stop — called on safety fault."""
         ...
 
+    async def keepalive(self) -> None:
+        """Send a no-motion ping to prevent the controller dropping an idle connection."""
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Safety controller (Pilz Flexi Compact) — READ ONLY
@@ -113,8 +117,14 @@ class PumpDriver(Protocol):
 class CameraDriver(Protocol):
     async def connect(self) -> None: ...
     async def disconnect(self) -> None: ...
+    async def start_streaming(self) -> None:
+        """Begin frame acquisition. No-op if already streaming."""
+        ...
+    async def stop_streaming(self) -> None:
+        """Halt frame acquisition. No-op if already stopped."""
+        ...
     async def capture(self) -> Any:
-        """Returns numpy ndarray (raw frame)."""
+        """Returns numpy ndarray (raw frame). Stream must be running."""
         ...
 
 

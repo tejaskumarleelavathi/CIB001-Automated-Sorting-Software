@@ -82,12 +82,11 @@ class LightingControllerDriver:
                 # TCP handshake succeeded — RST from here on is during data exchange
                 reset_stage = "init_commands"
                 self._sock = sock
-                # Set current on all channels, then ensure they start OFF
-                cmds = []
+                # Set current and turn OFF each channel individually,
+                # draining each response so the buffer stays clean.
                 for ch in CHANNELS:
-                    cmds.append(f"SET:LEVEL:CHANNEL{ch},{self._current_ma}")
-                    cmds.append(f"SET:MODE:CHANNEL{ch},0")
-                self._send_batch(cmds)
+                    self._send_command(f"SET:LEVEL:CHANNEL{ch},{self._current_ma}")
+                    self._send_command(f"SET:MODE:CHANNEL{ch},0")
                 self._backlight_on = False
                 break   # success
             except ConnectionResetError as exc:
@@ -128,10 +127,10 @@ class LightingControllerDriver:
     def _disconnect_sync(self) -> None:
         if self._sock:
             try:
-                # Turn all channels off, then disconnect cleanly
-                cmds = [f"SET:MODE:CHANNEL{ch},0" for ch in CHANNELS]
-                cmds.append("DISCONNECT")
-                self._send_batch(cmds)
+                # Turn all channels off individually, then disconnect cleanly
+                for ch in CHANNELS:
+                    self._send_command(f"SET:MODE:CHANNEL{ch},0")
+                self._send_command("DISCONNECT")
             except Exception:
                 pass
             try:
@@ -155,15 +154,17 @@ class LightingControllerDriver:
             return  # already in the right state — no send, no wait
 
         mode = 1 if on else 0
-        cmds = [f"SET:MODE:CHANNEL{ch},{mode}" for ch in CHANNELS]
-        self._send_batch(cmds)
+        # Send one command per channel and drain each response individually.
+        # Batching all 3 in one send leaves 2 unread responses in the TCP buffer
+        # which can be misread as the response to the next command.
+        for ch in CHANNELS:
+            self._send_command(f"SET:MODE:CHANNEL{ch},{mode}")
 
         if on:
             # Block until all LEDs reach full brightness before returning.
-            # Runs in the thread-pool executor — does NOT block the asyncio event loop.
-            # The device processes per-channel commands sequentially; 500ms covers all
-            # three channels plus LED warm-up.  No wait on OFF — that's instant.
-            time.sleep(0.5)
+            time.sleep(0.2)
+        else:
+            time.sleep(0.05)
 
         self._backlight_on = on
         log.debug("lighting.backlight", on=on)
@@ -176,6 +177,10 @@ class LightingControllerDriver:
     # ------------------------------------------------------------------
     # internal
     # ------------------------------------------------------------------
+
+    def _send_command(self, command: str) -> None:
+        """Send a single command and drain its response."""
+        self._send_batch([command])
 
     def _send_batch(self, commands: list[str]) -> None:
         """
