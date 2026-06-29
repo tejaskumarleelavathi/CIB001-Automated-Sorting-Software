@@ -37,6 +37,12 @@ class MockCameraDriver:
     async def disconnect(self) -> None:
         self._connected = False
 
+    async def start_streaming(self) -> None:
+        pass  # mock is always "streaming"
+
+    async def stop_streaming(self) -> None:
+        pass  # no-op
+
     async def capture(self) -> Any:
         """Returns a 1280x1024 grayscale numpy array with synthetic sample spots."""
         await asyncio.sleep(0.05)   # simulate exposure time

@@ -59,9 +59,10 @@ from cib.drivers.base import (
 
 log = structlog.get_logger(__name__)
 
-SAFETY_POLL_INTERVAL  = 0.10   # 100ms
-PLC_POLL_INTERVAL     = 0.10   # 100ms
-ROBOT_POLL_INTERVAL   = 0.20   # 200ms
+SAFETY_POLL_INTERVAL       = 0.10   # 100ms
+PLC_POLL_INTERVAL          = 0.10   # 100ms
+ROBOT_POLL_INTERVAL        = 0.20   # 200ms
+ROBOT_KEEPALIVE_INTERVAL_S = 0.5    # seconds — Epson TCP idle timer fires at ~1 s; 0.5s keeps well under it
 
 
 @dataclass
@@ -84,6 +85,20 @@ class Orchestrator:
     The rest of the codebase never knows the difference.
     """
 
+    # Tolerance (mm) for "same centroid" comparison across frames.
+    # Visited centroid tracking — exact position match (no radius).
+    # Centroids are snapped to a 0.1mm grid (round to 1 decimal) before storing.
+    # Calibration RMSE = 0.043mm, so inter-frame noise << 0.1mm — same physical
+    # spot will always land in the same grid cell. No radius needed; bugs are
+    # too close together for any meaningful radius to be safe.
+    #
+    # Future: replace simple visited set with a per-centroid state machine:
+    #   PICKED     → picked successfully, remove from dish model
+    #   DEBRIS     → EoA confirmed not a bug, never revisit
+    #   RETRY      → EoA rejected but unsure, retry at end (max 3 attempts)
+    #   FAILED     → retried 3 times, no pick, alert operator
+    # See architecture/vision.md § Bug Tracking State Machine.
+
     def __init__(
         self,
         drivers: DriverSet,
@@ -92,7 +107,9 @@ class Orchestrator:
         overhead_save_dir: Path | None = None,
         overhead_save_format: str = "png",
         overhead_save_images: bool = True,
+        eoa_save_dir: Path | None = None,
         force_sample_detection: bool = False,
+        view: bool = False,
     ) -> None:
         self._drivers = drivers
         self._queue: asyncio.Queue[SystemEvent] = asyncio.Queue()
@@ -105,9 +122,21 @@ class Orchestrator:
         self._overhead_save_dir = overhead_save_dir
         self._overhead_save_format = overhead_save_format
         self._overhead_save_images = overhead_save_images
+        # EoA annotated frame save directory (None = don't save)
+        self._eoa_save_dir = eoa_save_dir
         # Dev flag: inject a fake centroid when vision finds nothing (empty dish).
-        # Lets the pick-place cycle run for testing before bug detection is ready.
         self._force_sample_detection = force_sample_detection
+        # VIEW flag: show image popups for 3s during testing.
+        self._view = view
+        # Visited centroids — cleared at start of each run.
+        # Prevents re-trying positions EoA already rejected in this run.
+        self._visited_centroids: set[tuple[float, float]] = set()
+        # Set to True only after _startup() posts AllDevicesReadyEvent.
+        # Prevents the keepalive loop from firing while sort_server.prg is
+        # still executing HOME (it can take >5 s to re-enter Line Input after
+        # motion completes, which would cause a keepalive STATUS timeout and
+        # leave a stale "OK READY" in the TCP buffer for the next real command).
+        self._startup_complete = False
 
     # ------------------------------------------------------------------
     # Public API — called by UI via bridge (thread-safe)
@@ -162,6 +191,7 @@ class Orchestrator:
             tg.create_task(self._startup())
             tg.create_task(self._safety_poll_loop())
             tg.create_task(self._plc_poll_loop())
+            tg.create_task(self._robot_keepalive_loop())
             tg.create_task(self._event_loop())
 
     async def stop(self) -> None:
@@ -175,8 +205,11 @@ class Orchestrator:
         log.info("orchestrator.connecting_devices")
         d = self._drivers
         try:
+            # Connect cameras, lighting, safety and PLC first — GigE camera
+            # discovery takes ~6 seconds. Robot is connected AFTER so it is
+            # never left idle on the TCP socket while we wait for cameras.
+            # The Epson controller resets idle connections after a few seconds.
             await asyncio.gather(
-                d.robot.connect(),
                 d.safety.connect(),
                 d.plc.connect(),
                 d.pump.connect(),
@@ -184,16 +217,64 @@ class Orchestrator:
                 d.camera_eoa.connect(),
                 d.lighting.connect(),
             )
+            # Connect robot now — cameras are ready so we immediately follow
+            # up with motion commands and keep the connection active.
+            await d.robot.connect()
+            # Send robot to safe park position immediately after connecting.
+            # This lifts Z if the arm was left at imaging height by a previous
+            # run, then moves to P0 (taught in RC+ Jog & Teach).
+            await d.robot.move_to_safe_park()
+            log.info("orchestrator.robot_homed")
             # Turn backlight on immediately.
             # set_backlight(True) blocks until all LEDs are at full brightness (0.5s
             # stabilisation built into the driver) — no extra sleep needed here.
             await d.lighting.set_backlight(True)
             log.info("orchestrator.backlight_on")
+            # Ring light — skipped until digital output 12 is confirmed wired
+            # in RC+ 7.0. Sending RING_ON when output 12 is not configured
+            # causes sort_server.prg's On 12 to block ~5s then throw a SPEL+
+            # error, triggering OnErr → CloseNet → TCP RST → reconnect loop.
+            # Re-enable once output 12 is configured in the RC+ I/O settings.
+            # await d.robot.ring_light_on()
+            log.info("orchestrator.ring_light_skipped",
+                     note="Re-enable once RC+ digital output 12 is configured")
 
+            # Stop camera streams BEFORE enabling keepalive.
+            # Both cameras stream at ~980 Mbps on the shared USB-Ethernet adapter.
+            # If streams are still running when the keepalive first fires, the
+            # STATUS packet is drowned in camera traffic, the robot's ~1s TCP idle
+            # timer fires before the packet arrives, and the robot sends RST
+            # (WinError 10054). Stopping streams here — before startup_complete is
+            # set — guarantees the adapter is clear when the keepalive starts.
+            await asyncio.gather(
+                d.camera_overhead.stop_streaming(),
+                d.camera_eoa.stop_streaming(),
+            )
+            log.info("orchestrator.camera_streams_stopped_idle")
+
+            # Mark startup complete AFTER streams are stopped so the keepalive
+            # loop only fires into a clear network (no camera bandwidth contention).
+            self._startup_complete = True
             await self._queue.put(AllDevicesReadyEvent())
             log.info("orchestrator.all_devices_connected")
         except Exception as exc:
             log.error("orchestrator.startup_failed", error=str(exc))
+            # Best-effort cleanup: stop streams then disconnect cameras so
+            # arena_api releases devices. Without this, camera threads leave
+            # devices open and the next startup fails to create_device.
+            for cam in (d.camera_overhead, d.camera_eoa):
+                try:
+                    await cam.stop_streaming()
+                except Exception:
+                    pass
+                try:
+                    await cam.disconnect()
+                except Exception:
+                    pass
+            try:
+                await d.lighting.disconnect()
+            except Exception:
+                pass
             await self._queue.put(ConnectionLostEvent(DeviceName.ROBOT, detail=str(exc)))
 
     # ------------------------------------------------------------------
@@ -237,6 +318,30 @@ class Orchestrator:
                 )
             await asyncio.sleep(PLC_POLL_INTERVAL)
 
+    async def _robot_keepalive_loop(self) -> None:
+        """
+        Send periodic STATUS to prevent sort_server.prg from closing the idle
+        TCP connection. sort_server.prg drops the connection after ~5 s of
+        inactivity (its Line Input loop times out). This fires every 2.5 s so
+        the connection stays alive while the system is in IDLE between cycles.
+
+        Only fires after _startup_complete is set — sort_server.prg can take
+        >5 s to re-enter Line Input after HOME motion, which would cause a
+        STATUS timeout and leave a stale response in the TCP buffer.
+
+        The driver's keepalive() skips silently if a motion command currently
+        holds _cmd_lock, so there is no risk of interleaving with motion.
+        """
+        await asyncio.sleep(5.0)  # brief delay so startup can begin
+        while self._running:
+            await asyncio.sleep(ROBOT_KEEPALIVE_INTERVAL_S)
+            if not self._startup_complete:
+                continue   # don't touch robot until HOME + ring_light_on are done
+            try:
+                await self._drivers.robot.keepalive()
+            except Exception as exc:
+                log.debug("robot_keepalive.error", error=str(exc))
+
     # ------------------------------------------------------------------
     # Main event loop — state machine + command dispatch
     # ------------------------------------------------------------------
@@ -273,9 +378,8 @@ class Orchestrator:
             case OperatorStartEvent():
                 if sm.is_safe_to_start():
                     sm.start()
+                    self._visited_centroids.clear()   # fresh run — reset visited set
                     await d.plc.set_status_light(StatusLight.GREEN)
-                    # Backlight may be off after a previous STOP — turn it on and wait
-                    # for full brightness before the first capture.
                     await d.lighting.set_backlight(True)
                     log.info("orchestrator.backlight_on")
                     if not self._cycle_active:
@@ -313,6 +417,17 @@ class Orchestrator:
             # ---- Shutdown ----
             case OperatorShutdownEvent():
                 log.info("orchestrator.shutdown_started")
+                try:
+                    await d.robot.ring_light_off()
+                except Exception as exc:
+                    log.warning("orchestrator.shutdown_ring_light_error", error=str(exc))
+                # Send BYE to robot — sort_server.prg does CloseNet + Exit Do cleanly.
+                # Without this, Python dropping the socket causes a SPEL+ runtime error
+                # which leaves the motor On and trips the Flexi safety system.
+                try:
+                    await d.robot.disconnect()
+                except Exception as exc:
+                    log.warning("orchestrator.shutdown_robot_error", error=str(exc))
                 # Turn backlight off and send DISCONNECT to lighting controller.
                 # This is the clean path — avoids WinError 10054 on next startup.
                 try:
@@ -320,6 +435,15 @@ class Orchestrator:
                     await d.lighting.disconnect()
                 except Exception as exc:
                     log.warning("orchestrator.shutdown_lighting_error", error=str(exc))
+                # Destroy camera devices — arena_api holds a GVCP control channel
+                # open per camera. Without explicit disconnect, the camera stays
+                # "in use" and the next startup fails with GC_ERR_TIMEOUT on
+                # create_device. Must always disconnect cameras on shutdown.
+                for cam in (d.camera_overhead, d.camera_eoa):
+                    try:
+                        await cam.disconnect()
+                    except Exception:
+                        pass
                 # Stop all loops — _event_loop exits after _handle_event returns,
                 # poll loops exit on next iteration (within 100ms).
                 self._running = False
@@ -379,7 +503,16 @@ class Orchestrator:
     async def _run_cycle(self) -> None:
         """
         Execute one pick-and-place cycle.
-        Matches the 9-step operating cycle from PRD Section 12.1.
+        Matches the operating cycle from PRD Section 12.1.
+
+        Bug selection order: bottom-left first in robot XY space.
+          Robot coords: x increases toward bottom of dish, y increases toward right.
+          Bottom-left = largest x (bottom), smallest y (left).
+          Sort: y ascending first, then x descending — gives bottom-left corner first.
+
+        Visited centroid tracking: centroids snapped to the same 0.1mm grid cell as a
+          previously attempted location are skipped. Cleared at run start (OperatorStartEvent).
+          Prevents infinite retry if EoA rejects the same debris each cycle.
         """
         if not self._sm.is_running():
             return
@@ -391,23 +524,55 @@ class Orchestrator:
         log.info("cycle.start")
 
         try:
-            # Step 1: Overhead image — backlight is already on (turned on at startup)
-            frame = await d.camera_overhead.capture()
+            # ── Start overhead stream only ────────────────────────────────
+            # EoA stream starts later, after the robot has moved to the image
+            # site. Running both cameras simultaneously consumes ~980 Mbps on
+            # the shared USB-Ethernet adapter, leaving almost no bandwidth for
+            # robot TCP traffic. By streaming cameras only when they are
+            # actively capturing, each phase has adequate bandwidth:
+            #   Overhead capture:  overhead only  (~392 Mbps, Mono8 @ 2 fps)
+            #   Robot motion:      no streams     (0 Mbps — robot has full 1G)
+            #   EoA capture:       EoA only       (~588 Mbps, BGR8 @ 1 fps)
+            await d.camera_overhead.start_streaming()
+            log.debug("cycle.overhead_stream_started")
 
-            # Step 2: Vision analysis (in thread pool — CPU bound)
+            # ── Step 1: Overhead image ────────────────────────────────────
+            # Backlight already on (turned on at startup / OperatorStartEvent).
+            # Drain stale frames before the keeper.
+            await d.camera_overhead.capture()  # drain stale frame 1
+            await d.camera_overhead.capture()  # drain stale frame 2
+            frame = await d.camera_overhead.capture()  # fresh stable frame
+
+            # Stop overhead stream now — done capturing.
+            # Frees ~392 Mbps on the adapter so robot TCP has full
+            # bandwidth during move_to_image_site.
+            await d.camera_overhead.stop_streaming()
+            log.debug("cycle.overhead_stream_stopped")
+
+            if not self._running:
+                return
+
+            # ── Step 2: Overhead vision analysis (thread pool — CPU bound) ─
             loop = asyncio.get_running_loop()
             overhead_result = await loop.run_in_executor(
                 None, self._run_vision_overhead, frame
             )
 
-            if not overhead_result.centroids_robot_xy:
-                log.warning("cycle.no_samples_detected")
+            # ── Filter: skip visited centroids ────────────────────────────
+            all_centroids = overhead_result.centroids_robot_xy
+            unvisited = [c for c in all_centroids if not self._is_visited(c)]
+
+            if not unvisited:
+                if all_centroids:
+                    log.info("cycle.all_centroids_visited",
+                             total=len(all_centroids),
+                             note="All detected bugs already attempted this run")
+                else:
+                    log.warning("cycle.no_samples_detected")
+
                 if self._sm.current == State.CYCLE_STOPPING:
                     await self._finish_stop(d)
                 elif self._sm.is_running():
-                    # No samples in dish — wait 2s then retry so STOP can interrupt.
-                    # Without the retry, the cycle exits and _cycle_active goes False,
-                    # leaving STOP with no active cycle to call _finish_stop().
                     await asyncio.sleep(2.0)
                     if self._sm.is_running():
                         asyncio.create_task(self._run_cycle())
@@ -415,52 +580,183 @@ class Orchestrator:
                         await self._finish_stop(d)
                 return
 
-            # Pick first unvisited centroid
-            target_x, target_y = overhead_result.centroids_robot_xy[0]
+            # ── Select target: bottom-left first ─────────────────────────
+            # Sort: y ascending (leftmost), then x descending (bottommost).
+            # First element = bottom-left corner bug.
+            unvisited_sorted = sorted(unvisited, key=lambda c: (c[1], -c[0]))
+            target_x, target_y = unvisited_sorted[0]
+            log.info("cycle.target_selected",
+                     target_x=target_x, target_y=target_y,
+                     unvisited=len(unvisited), total=len(all_centroids))
 
-            # Step 3-4: Robot moves to pick site, EoA image
-            await d.robot.move_to_image_site(target_x, target_y)
-            eoa_frame = await d.camera_eoa.capture()
+            # Mark visited immediately — even if EoA rejects it, we won't retry
+            # this exact spot in subsequent cycles (avoids infinite debris loop).
+            self._mark_visited(target_x, target_y)
 
-            # Step 5: EoA vision analysis
+            # ── VIEW: show overhead with target highlighted ────────────────
+            if self._view and overhead_result.annotated_frame is not None:
+                from cib.vision.pipeline import draw_target_highlight
+                # Find pixel centroid for selected target
+                try:
+                    idx = overhead_result.centroids_robot_xy.index((target_x, target_y))
+                    target_px = overhead_result.centroids_px[idx]
+                    highlighted = draw_target_highlight(overhead_result.annotated_frame, target_px)
+                except (ValueError, IndexError):
+                    highlighted = overhead_result.annotated_frame
+                await loop.run_in_executor(
+                    None, self._show_image, highlighted,
+                    f"Overhead — {overhead_result.sample_count} bug(s), targeting ({target_x:.1f}, {target_y:.1f})"
+                )
+
+            if not self._running:
+                return
+
+            # ── Steps 3–4: Robot moves to image site + backlight off ───────
+            # No camera is streaming during robot motion — the adapter is
+            # fully free for TCP so keepalive and the motion command itself
+            # have the full 1 Gbps link with zero contention.
+            # Start backlight OFF and robot motion simultaneously — backlight
+            # settles in <1s while robot travels (30–60s at 5% speed).
+            await asyncio.gather(
+                d.lighting.set_backlight(False),
+                d.robot.move_to_image_site(target_x, target_y),
+            )
+            log.info("orchestrator.backlight_off_for_eoa")
+
+            # Ring light ON — robot DO 12 illuminates specimen for EoA camera.
+            # Backlight is already off. Ring light must be on before capturing.
+            # Wrapped in try/except: if RC+ digital output 12 is not yet
+            # configured the command will fail but we log a warning instead of
+            # faulting the whole cycle (image will be dark but system continues).
+            try:
+                await d.robot.ring_light_on()
+                log.info("cycle.ring_light_on")
+            except Exception as exc:
+                log.warning("cycle.ring_light_on_failed", error=str(exc),
+                            note="EoA image will be dark — configure RC+ output 12 and re-run")
+
+            # Robot is now stationary at imaging height — start EoA stream.
+            # Wait for robot vibration to fully settle, then drain stale frames
+            # buffered during stream startup before capturing the keeper.
+            await d.camera_eoa.start_streaming()
+            log.debug("cycle.eoa_stream_started")
+            await asyncio.sleep(0.5)
+            await d.camera_eoa.capture()   # drain stale frame 1
+            await d.camera_eoa.capture()   # drain stale frame 2
+            eoa_frame = await d.camera_eoa.capture()  # fresh stable frame
+
+            # Stop EoA stream before running vision — frees ~588 Mbps on
+            # the adapter while CPU is busy with image analysis.
+            await d.camera_eoa.stop_streaming()
+            log.debug("cycle.eoa_stream_stopped")
+
+            # Ring light OFF — done capturing. Turn off before robot moves.
+            try:
+                await d.robot.ring_light_off()
+                log.info("cycle.ring_light_off")
+            except Exception as exc:
+                log.warning("cycle.ring_light_off_failed", error=str(exc))
+
+            # ── Step 5: EoA vision analysis ───────────────────────────────
             eoa_result = await loop.run_in_executor(
                 None, self._run_vision_eoa, eoa_frame
             )
 
-            # Step 6: Go / no-go
+            # ── VIEW: show EoA annotated image ────────────────────────────
+            if self._view and eoa_result.frame_path:
+                await loop.run_in_executor(
+                    None, self._show_image_path, eoa_result.frame_path, "EoA Analysis"
+                )
+
+            # ── Step 6: Go / no-go decision ───────────────────────────────
             if not eoa_result.proceed_with_pick:
-                log.info("cycle.no_pick_decision")
-                await d.robot.move_to_safe_park()
+                log.info("cycle.eoa_no_pick",
+                         note="EoA rejected specimen — going home, will try next bug")
+                await asyncio.gather(
+                    d.lighting.set_backlight(True),
+                    d.robot.move_to_safe_park(),
+                )
+                log.info("orchestrator.backlight_on_robot_returning")
                 if self._sm.current == State.CYCLE_STOPPING:
                     await self._finish_stop(d)
                 elif self._sm.is_running():
                     asyncio.create_task(self._run_cycle())
                 return
 
+            # ── Steps 7–8: Pick and place ─────────────────────────────────
             refined_x = eoa_result.refined_x or target_x
             refined_y = eoa_result.refined_y or target_y
 
-            # Step 7-8: Pick and place
-            well_x, well_y = self._get_next_well_coords()
-            await d.robot.execute_pick_place(refined_x, refined_y, well_x, well_y)
-            await d.pump.aspirate(volume_ul=5.0, speed=1.0)
-            await d.pump.dispense(volume_ul=5.0, speed=1.0)
+            # TODO: when full pick-place is implemented, execute here.
+            # For now: go home after EoA to test imaging pipeline end-to-end.
+            log.info("cycle.eoa_confirmed_bug",
+                     refined_x=refined_x, refined_y=refined_y,
+                     note="Pick-place not yet implemented — returning home")
+            await asyncio.gather(
+                d.lighting.set_backlight(True),
+                d.robot.move_to_safe_park(),
+            )
+            log.info("orchestrator.backlight_on_robot_returning")
 
-            log.info("cycle.pick_complete", pick_x=refined_x, pick_y=refined_y,
-                     well_x=well_x, well_y=well_y)
-
-            # Step 9: Queue next cycle or finish stop
+            # ── Step 9: Queue next cycle or finish stop ───────────────────
             if self._sm.current == State.CYCLE_STOPPING:
                 await self._finish_stop(d)
             elif self._sm.is_running():
                 asyncio.create_task(self._run_cycle())
 
         except Exception as exc:
-            log.error("cycle.error", error=str(exc))
-            self._sm.fault()
-            await d.plc.set_status_light(StatusLight.RED)
+            err_str = str(exc)
+            # Camera start_stream failures on USB-Ethernet adapters are
+            # transient — don't FAULT, just retry the cycle after a delay.
+            if "start_stream" in err_str or "GC_ERR_TIMEOUT" in err_str or "get_buffer" in err_str.lower():
+                log.warning("cycle.camera_error_retrying", error=err_str[:120])
+                if self._sm.current == State.CYCLE_STOPPING:
+                    await self._finish_stop(d)
+                elif self._sm.is_running():
+                    await asyncio.sleep(3.0)
+                    if self._sm.is_running():
+                        asyncio.create_task(self._run_cycle())
+            else:
+                log.error("cycle.error", error=str(exc))
+                self._sm.fault()
+                await d.plc.set_status_light(StatusLight.RED)
+                try:
+                    await d.lighting.set_backlight(False)
+                except Exception:
+                    pass
         finally:
             self._cycle_active = False
+            # Stop streams so the adapter is free for robot TCP keepalive.
+            for cam in (d.camera_overhead, d.camera_eoa):
+                try:
+                    await cam.stop_streaming()
+                except Exception:
+                    pass
+            # Best-effort ring light off — in case cycle aborted mid-EoA.
+            try:
+                await d.robot.ring_light_off()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Centroid selection helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _snap(v: float) -> float:
+        """Snap coordinate to 0.1mm grid — used for exact visited-set lookup."""
+        return round(v, 1)
+
+    def _is_visited(self, centroid: tuple[float, float]) -> bool:
+        """Return True if this centroid's snapped position has already been attempted."""
+        cx, cy = centroid
+        return (self._snap(cx), self._snap(cy)) in self._visited_centroids
+
+    def _mark_visited(self, x: float, y: float) -> None:
+        """Record a centroid as visited for this run."""
+        self._visited_centroids.add((self._snap(x), self._snap(y)))
+        log.debug("cycle.centroid_marked_visited", x=x, y=y,
+                  total_visited=len(self._visited_centroids))
 
     def _run_vision_overhead(self, frame: Any) -> VisionOverheadResultEvent:
         """Runs in thread pool — import here to keep vision isolated."""
@@ -487,8 +783,50 @@ class Orchestrator:
 
     def _run_vision_eoa(self, frame: Any) -> VisionEoAResultEvent:
         from cib.vision.eoa import run_eoa_analysis
-        return run_eoa_analysis(frame)
+        return run_eoa_analysis(frame, save_dir=self._eoa_save_dir)
 
     def _get_next_well_coords(self) -> tuple[float, float]:
         """TODO: implement from plate layout + load order config."""
         return (100.0, 100.0)
+
+    # ------------------------------------------------------------------
+    # VIEW helpers — image display for testing (VIEW=True in main.py)
+    # ------------------------------------------------------------------
+    # NOTE: cv2.imshow/waitKey deadlocks on Windows when PyQt owns the
+    # main thread message pump. Images are saved to disk instead; use
+    # the saved file paths for review.
+
+    def _show_image(self, img: Any, title: str) -> None:
+        """Save image to disk and open with Windows default viewer (VIEW mode).
+
+        Uses os.startfile() — launches a separate Photos/viewer process so
+        there is no conflict with the PyQt6 main thread message pump.
+        """
+        import os
+        import tempfile
+        from datetime import datetime
+        import cv2
+
+        h, w = img.shape[:2]
+        log.info("view.image", title=title, shape=f"{w}x{h}")
+
+        save_dir = self._overhead_save_dir or Path(tempfile.gettempdir())
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        out_path = save_dir / f"overhead_target_{ts}.png"
+        try:
+            cv2.imwrite(str(out_path), img, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+            log.info("view.target_image_saved", path=str(out_path))
+            os.startfile(str(out_path))
+        except Exception as exc:
+            log.warning("view.image_open_failed", error=str(exc))
+
+    def _show_image_path(self, path: str, title: str) -> None:
+        """Open a saved image with Windows default viewer (VIEW mode)."""
+        import os
+        if not path:
+            return
+        log.info("view.image_saved", title=title, path=path)
+        try:
+            os.startfile(path)
+        except Exception as exc:
+            log.warning("view.image_open_failed", path=path, error=str(exc))

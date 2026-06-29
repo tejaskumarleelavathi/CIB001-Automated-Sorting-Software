@@ -13,7 +13,8 @@ import structlog
 
 log = structlog.get_logger(__name__)
 
-DEFAULT_H_PATH = r"C:\LabAutomation\config\calibration_overhead.npy"
+DEFAULT_H_PATH      = r"C:\LabAutomation\config\calibration_overhead.npy"
+EOA_CALIBRATION_PATH = r"C:\LabAutomation\config\calibration_eoa.npy"
 
 
 class CalibrationNotFoundError(RuntimeError):

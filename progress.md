@@ -1,6 +1,6 @@
 # CIB Software — Progress Log
 
-Last updated: 2026-06-17 (session 4)
+Last updated: 2026-06-24 (session 5)
 
 ---
 
@@ -107,20 +107,18 @@ Last updated: 2026-06-17 (session 4)
 ## Software Architecture
 
 ### Architecture Docs (`architecture/`)
-- [x] `architecture/config.md` — full config layer decisions documented:
-  - Two config files: plate config (Excel, operators) + machine config (YAML, engineers)
-  - Plate config format: well, x, y columns; row order = fill order
-  - Machine config structure: all IPs, ports, Modbus registers, paths
-  - Validation rules: startup validation for machine config, pre-run for plate config
-  - Config access pattern: read-once at startup, injected into drivers via constructor
-- [x] `architecture/data-layer.md` — full data layer decisions documented:
-  - DB schema (runs, picks, safety_events tables)
-  - Pick status lifecycle (9 steps from IMAGING_OVERHEAD to DONE)
-  - Resume-after-crash logic (3 scenarios)
-  - E-stop vs power cut recovery distinction
-  - Mid-pick interruption handling
-  - SPEL+ restart options (HMI via PLC I/O preferred)
-  - CSV output format and file locations
+- [x] `architecture/config.md` — full config layer decisions documented
+- [x] `architecture/data-layer.md` — full data layer decisions documented
+- [x] `architecture/motor.md` — M-Drive rotary + linear actuator protocol and programs
+- [x] `architecture/overhead_camera.md` — overhead camera hardware, driver connect flow, vision pipeline, calibration
+- [x] `architecture/calibration.md` — homography calibration procedure and scripts
+- [x] `architecture/ui.md` — UI architecture decisions
+- [x] `architecture/vision.md` — **NEW (2026-06-24)** — full two-stage vision system:
+  - Overhead detection (pipeline.py): algorithm, constants, calibration
+  - EoA classification (eoa.py): full classifier, body centre computation, calibration
+  - Orchestrator wiring: how both stages feed into the 9-step cycle
+  - Software test suite: eoa_classifier.py, pipeline_demo.py
+  - Threading model, pixel intensity conventions, what still needs doing
 
 ---
 
@@ -164,11 +162,20 @@ Last updated: 2026-06-17 (session 4)
 - Tests: 27/27 passing (`tests/config/`)
 
 ### Vision (`cib/vision/`)
-- [x] `pipeline.py` — overhead detection: resize → blur → threshold → morphology → contour detection, returns pixel centroids
-  - **TODO**: apply calibration homography — call calib.pixel_to_robot(px, py) on each centroid to convert to robot XY
-  - **TODO**: save annotated image to disk
-- [x] `calibration.py` — pixel → robot XY homography — DONE (CalibrationData, load_calibration, pixel_to_robot, pixel_list_to_robot)
-- [ ] `eoa.py` — EoA go/no-go + refined centroid analysis — NOT YET STARTED
+- [x] `pipeline.py` — overhead detection (Method C): backlit panel locate → Hough dish detect → interior mask → Otsu inverse threshold → morph open → contour filter → centroid list. No minimum area filter — keeps tiny specimens. Calibration homography applied. Annotated frame saved to disk.
+- [x] `calibration.py` — pixel → robot XY homography (CalibrationData, load_calibration, pixel_to_robot, pixel_list_to_robot). Now also has `EOA_CALIBRATION_PATH` constant for EoA camera calibration file.
+- [x] `eoa.py` — **COMPLETE** (was stub, now full implementation). See `architecture/vision.md` for details.
+  - Otsu inverse threshold (auto-adapts to any backlight level)
+  - Coverage guard: >45% foreground = backlight off → no-go
+  - Morphological close to bridge body/wing gaps
+  - Center-first expanding-ring candidate search (EoA arm holds specimen near camera centre)
+  - Skip HAIR/DEBRIS candidates; take first BUG (so a debris speck near centre doesn't block a real bug)
+  - Body centre: intensity-weighted centroid of pixels < 70 gray (body only, excludes wings)
+  - EoA calibration transform: body centre pixel → robot XY mm (`calibration_eoa.npy`, not yet run at lab)
+  - If EoA calibration absent: refined_x/y = None → orchestrator falls back to overhead centroid (safe)
+  - Saves annotated JPEG to `eoa_save_dir` if configured
+  - 126/126 unit tests still passing after integration
+- [x] `architecture/vision.md` — full two-stage vision architecture documented
 
 ### UI (`cib/ui/`)
 - [ ] `app.py` — PyQt6 app entry — NOT YET STARTED
@@ -263,14 +270,17 @@ robot_x, robot_y = calib.pixel_to_robot(px, py)
 1. **UI (PyQt6)** — entire ui layer: app.py, bridge.py, main_window.py, all screens, all widgets
 2. **`cib/drivers/lighting/driver.py`** — DCS-100E, all info known (TCP port 777, ASCII SCPI)
 3. **`cib/drivers/camera/driver.py`** — arena_api, SDK installed, working test code exists in hardware_tests/
-4. **`cib/vision/calibration.py`** — homography (pixel → robot XY)
-5. **`cib/vision/eoa.py`** — EoA analysis (go/no-go + refined centroid)
+4. **Bug selection strategy** — implement corner-first traversal + visited-centroid tracking in orchestrator `_run_cycle()`
+5. **Wire `eoa_save_dir` in `main.py`** — pass `eoa_save_dir=Path(config.paths.eoa_images)` to `Orchestrator(...)`
+
+### Needs one lab session (not blocked on David):
+6. **EoA calibration** (`calibration_eoa.npy`) — run checkerboard calibration with EoA camera. Same procedure as overhead. Script TBD. Until done, orchestrator falls back to overhead centroid (safe).
 
 ### Blocked on hardware/David:
-6. **`cib/drivers/plc/driver.py`** — blocked on OQ-11 (register addresses)
-7. **`cib/drivers/safety/driver.py`** — blocked on OQ-23 (Flexi register map)
-8. **`cib/drivers/robot/driver.py`** — partially writable, blocked on E-stop wiring
-9. **`cib/drivers/pump/driver.py`** — blocked on OQ-14 (M-Drive protocol)
+7. **`cib/drivers/plc/driver.py`** — blocked on OQ-11 (register addresses)
+8. **`cib/drivers/safety/driver.py`** — blocked on OQ-23 (Flexi register map)
+9. **`cib/drivers/robot/driver.py`** — partially writable, blocked on E-stop wiring
+10. **`cib/drivers/pump/driver.py`** — blocked on OQ-14 (M-Drive protocol)
 
 ---
 

@@ -54,9 +54,18 @@ class MockRobotDriver:
         await asyncio.sleep(MOCK_MOVE_SECONDS)
         log.info("mock_robot.parked")
 
+    async def ring_light_on(self) -> None:
+        log.info("mock_robot.ring_light_on")
+
+    async def ring_light_off(self) -> None:
+        log.info("mock_robot.ring_light_off")
+
     async def halt(self) -> None:
         self._halted = True
         log.warning("mock_robot.halted")
+
+    async def keepalive(self) -> None:
+        pass  # no-op — mock has no TCP connection to keep alive
 
     def resume(self) -> None:
         """Call after safety reset to allow motion again."""
