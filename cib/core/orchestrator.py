@@ -140,6 +140,9 @@ class Orchestrator:
         # motion completes, which would cause a keepalive STATUS timeout and
         # leave a stale "OK READY" in the TCP buffer for the next real command).
         self._startup_complete = False
+        # Live light curtain state — updated every 100ms by safety poll loop.
+        # Used to gate the CONTINUE button: must be False before reset-ack is sent.
+        self._light_curtain_tripped = False
 
     # ------------------------------------------------------------------
     # Public API — called by UI via bridge (thread-safe)
@@ -290,6 +293,7 @@ class Orchestrator:
         while self._running:
             try:
                 status = await self._drivers.safety.read_status()
+                self._light_curtain_tripped = status["light_curtain_tripped"]
                 event = SafetyStatusEvent(
                     any_fault_active=status["any_fault_active"],
                     light_curtain_tripped=status["light_curtain_tripped"],
@@ -409,10 +413,19 @@ class Orchestrator:
 
             case OperatorAcknowledgeEvent():
                 if sm.current in {State.PROTECTIVE_STOP}:
-                    sm.start()
-                    await d.plc.set_status_light(StatusLight.GREEN)
-                    if not self._cycle_active:
-                        asyncio.create_task(self._run_cycle())
+                    if self._light_curtain_tripped:
+                        # Light curtain still obstructed — block resume, warn UI.
+                        log.warning(
+                            "orchestrator.continue_blocked",
+                            reason="light curtain still tripped — clear beam before pressing CONTINUE",
+                        )
+                    else:
+                        # Beam is clear — send reset-acknowledge to release latch.
+                        await d.safety.send_reset_acknowledge()
+                        sm.start()
+                        await d.plc.set_status_light(StatusLight.GREEN)
+                        if not self._cycle_active:
+                            asyncio.create_task(self._run_cycle())
                 elif sm.current == State.E_STOP:
                     sm.hardware_reset_complete()
                     await d.plc.set_status_light(StatusLight.AMBER)

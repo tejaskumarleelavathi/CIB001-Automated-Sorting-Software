@@ -1,34 +1,38 @@
 """
 Real Sick Flexi Compact safety driver — ModbusTCP, read-only with one write.
 
-WHAT IS CONFIRMED (2026-06-18 via test_flexi.py):
-  - Device IP: 172.16.9.12, port 502
-  - FC4 (Input Registers) at address 256: 25 words of live process I/O
-  - FC4 at address 2000: device metadata — word 0 = 0x0003 means "Run" (expected)
-  - Bit 15 of register 256 toggles at 1 Hz (heartbeat) — confirms device is live
+CONFIRMED BIT MAP (2026-07-02, rawwatch session):
+  Baseline (all safe): reg256 = 0x0517  (bits 0,1,2,4,8,10 = 1)
 
-WHAT IS PENDING (OQ-23 — David must answer before safety fault detection works):
-  ┌───────────────────────────────────────────────────────────────────────────┐
-  │ Run:  python hardware_tests/test_flexi.py rawwatch                        │
-  │ Then physically trigger each device ONE AT A TIME:                        │
-  │   1. Press e-stop button 0 → note which bits flip in reg 256              │
-  │   2. Press e-stop button 1 (if any) → note bits                           │
-  │   3. Break light curtain beam → note bits                                  │
-  │   4. Press blue reset button → note bits                                   │
-  │   5. Observe contactor state bit                                           │
-  │ Fill in SAFETY_BIT_MAP below with the confirmed bit positions.             │
-  │ Set BIT_MAP_CONFIRMED = True when done.                                   │
-  └───────────────────────────────────────────────────────────────────────────┘
+  Convention: normally-closed — bit = 1 means OK/safe, 0 means fault/open.
 
-  Also needed from David:
-  - Holding register address for writing protective-stop reset-acknowledge
-    (releases light curtain latch when operator presses CONTINUE on HMI)
+  bit 0  — E-stop button OK       (1=not pressed, 0=button is pressed)
+  bit 1  — Unknown input           (always 1 in tests — spare or door interlock)
+  bit 2  — Light curtain OK        (1=beam intact/safe, 0=beam broken/tripped)
+  bit 3  — Reset button active     (1=being pressed, 0=not pressed)
+  bit 4  — Unknown input           (always 1 in tests — spare or door interlock)
+  bit 8  — Safety contactor closed (1=closed/running, 0=open/tripped by e-stop)
+  bit 9  — Reset available         (1=e-stop released but reset not yet pressed)
+  bit 10 — Safety output OK        (1=all safe, 0=any active fault — latches until reset)
+  bit 11 — Transient reset state   (appears briefly during reset sequence)
+  bit 15 — Heartbeat               (toggles at 1Hz — suppressed by rawwatch, masked in read)
 
-Until BIT_MAP_CONFIRMED = True, read_status() returns:
-    any_fault_active = False  (optimistic — system assumed safe)
-This means the safety poll loop runs without triggering false faults, but
-actual light curtain / e-stop detection is disabled. Do the rawwatch session
-and fill in the map before going to production.
+  State transitions observed:
+    Normal:               0x0517  bits 0,1,2,4,8,10 = 1
+    E-stop pressed:       0x0016  bits 8,10 lost; bit 0 lost (button down)
+    E-stop released:      0x0217  bit 0 restored; bit 9 set (awaiting reset)
+    Reset button pressed: 0x001F  bit 3 set; bit 9 cleared
+    Contactor re-closes:  0x0917  bit 8 restored (reset sequence progressing)
+    Back to normal:       0x0517  bit 10 restored
+    Light curtain broken: 0x0113  bits 2 and 10 lost; bit 8 stays (protective stop)
+    Light curtain clear:  0x0917  bit 2 restored; bit 10 still 0 (latched until HMI CONTINUE)
+
+RESET ACKNOWLEDGE WRITE:
+  RESET_ACK_REG = None — address not yet confirmed.
+  The Flexi holds the light curtain latch even after the beam clears.
+  Releasing it requires writing to a Flexi output/holding register.
+  Ask David for the Modbus write address (OQ-23 remaining item).
+  Until confirmed, send_reset_acknowledge() is a no-op.
 
 Device:  172.16.9.12, port 502, ModbusTCP, FC4 for reads
 """
@@ -48,55 +52,33 @@ log = structlog.get_logger(__name__)
 FLEXI_IP   = "172.16.9.12"
 FLEXI_PORT = 502
 
-# Process I/O block — live signal state (FC4, Input Registers)
-PROC_ADDR  = 256
+PROC_ADDR  = 256    # Input registers — live process I/O (FC4)
 PROC_COUNT = 25
+META_ADDR  = 2000   # Static device metadata
 
-# Device metadata block (static — confirms Run mode)
-META_ADDR  = 2000
+HEARTBEAT_MASK = 0x8000   # bit 15 — toggling 1Hz, masked out before decode
 
-# Heartbeat: bit 15 of register 256 toggles at 1 Hz when device is alive.
-HEARTBEAT_BIT = 15
-HEARTBEAT_MASK = 1 << HEARTBEAT_BIT   # 0x8000
+# ── Confirmed bit positions (reg 256, 0-based bit index) ─────────────────────
+# All bits use normally-closed convention: 1=OK/safe, 0=fault/open
 
-# ── BIT MAP (OQ-23 — fill in after rawwatch session) ─────────────────────────
-#
-# Each entry: signal_name → (reg_index, bit_number)
-#   reg_index  = index into the 25-register process I/O block (0 = reg 256)
-#   bit_number = 0 (LSB) … 15 (MSB) within that 16-bit register
-#
-# Convention: bit = 1 means the signal is ACTIVE / TRIPPED / CLOSED.
-# Verify this convention during the rawwatch session — some Flexi outputs
-# are normally-open (0=OK, 1=fault) and some are normally-closed (1=OK, 0=fault).
-# Add a note in the comment if convention is inverted for a particular signal.
-#
-SAFETY_BIT_MAP: dict[str, tuple[int, int]] = {
-    # "light_curtain":  (0, 0),   # reg256 bit 0 — fill in from rawwatch
-    # "estop_button_0": (0, 1),   # reg256 bit 1
-    # "estop_button_1": (0, 2),   # reg256 bit 2 (if second e-stop button exists)
-    # "contactor":      (0, 3),   # reg256 bit 3
-    # "reset_button":   (0, 4),   # reg256 bit 4
-}
+_BIT_ESTOP_BUTTON   = 0    # e-stop button: 0 while pressed, 1 when released
+_BIT_LIGHT_CURTAIN  = 2    # light curtain: 0 when beam broken, 1 when clear
+_BIT_RESET_BUTTON   = 3    # reset button: 1 while being pressed
+_BIT_CONTACTOR      = 8    # safety contactor: 0 when open (e-stop fired)
+_BIT_RESET_AVAIL    = 9    # 1 when e-stop released but reset not yet pressed
+_BIT_SAFETY_OK      = 10   # overall safety output: 0 = any fault latched
 
-# Set True once every entry above is confirmed by the rawwatch session.
-# When False, read_status() returns safe defaults (no faults).
-BIT_MAP_CONFIRMED = False
+# ── Reset acknowledge write register (OQ-23 partially resolved) ───────────────
+# Set to the Modbus holding register address David confirms for the light
+# curtain latch release signal. None until confirmed.
+RESET_ACK_REG: int | None = None
 
-# Holding register address for writing the protective-stop reset-acknowledge.
-# Pulsing this releases the light curtain latch when operator presses CONTINUE.
-# OQ-23 PENDING — ask David for the confirmed address.
-RESET_ACK_REG: int | None = None   # e.g. 256 or whatever David confirms
-
-
-# ── Driver ────────────────────────────────────────────────────────────────────
 
 class FlexiCompactDriver:
     """
     Sick Flexi Compact safety driver.
-
-    Polls process I/O at address 256 every 100ms (called by orchestrator).
-    Decodes fault bits when BIT_MAP_CONFIRMED = True.
-    Until then, returns optimistic defaults so the orchestrator doesn't fault.
+    Reads process I/O at address 256 every 100ms (orchestrator safety poll loop).
+    Bit map confirmed 2026-07-02 via rawwatch session.
     """
 
     def __init__(
@@ -109,7 +91,7 @@ class FlexiCompactDriver:
         self._port    = port
         self._timeout = connect_timeout_s
         self._client: ModbusTcpClient | None = None
-        self._last_heartbeat_bit: int | None = None
+        self._last_hb: int | None = None
 
     # ------------------------------------------------------------------
     # connect / disconnect
@@ -126,7 +108,6 @@ class FlexiCompactDriver:
                 f"Sick Flexi at {self._ip}:{self._port} refused connection. "
                 "Check Ethernet cable and Flexi power / Run mode."
             )
-        # Verify device is in Run mode (metadata reg 0 = 0x0003)
         r = client.read_input_registers(address=META_ADDR, count=1)
         if r.isError():
             client.close()
@@ -137,22 +118,15 @@ class FlexiCompactDriver:
                 "flexi.unexpected_status",
                 status=f"0x{status_word:04X}",
                 expected="0x0003 (Run)",
-                note="device may be in config or error mode",
             )
         self._client = client
-        log.info(
-            "flexi.connected",
-            ip=self._ip,
-            port=self._port,
-            device_status=f"0x{status_word:04X}",
-            bit_map_confirmed=BIT_MAP_CONFIRMED,
-        )
-        if not BIT_MAP_CONFIRMED:
+        log.info("flexi.connected", ip=self._ip, port=self._port,
+                 device_status=f"0x{status_word:04X}")
+        if RESET_ACK_REG is None:
             log.warning(
-                "flexi.bit_map_pending",
-                reason="OQ-23 open — SAFETY_BIT_MAP not confirmed yet",
-                action="run rawwatch session + fill in SAFETY_BIT_MAP in safety/driver.py",
-                impact="e-stop / light-curtain detection DISABLED until confirmed",
+                "flexi.reset_ack_pending",
+                note="Light curtain latch release write address not confirmed (OQ-23). "
+                     "send_reset_acknowledge() is a no-op until RESET_ACK_REG is set.",
             )
 
     async def disconnect(self) -> None:
@@ -165,18 +139,18 @@ class FlexiCompactDriver:
         log.info("flexi.disconnected")
 
     # ------------------------------------------------------------------
-    # read_status — called every 100ms by orchestrator safety poll loop
+    # read_status — called every 100ms by orchestrator
     # ------------------------------------------------------------------
 
     async def read_status(self) -> dict[str, Any]:
         """
         Returns:
-            any_fault_active:       bool — True if any fault detected
-            light_curtain_tripped:  bool
-            estop_active:           bool
-            estop_button_index:     int | None
+            any_fault_active:       bool
+            light_curtain_tripped:  bool  — beam broken (protective stop)
+            estop_active:           bool  — e-stop condition latched (contactor open)
+            estop_button_index:     int | None  — 0 = only button confirmed
             contactor_closed:       bool
-            reset_available:        bool
+            reset_available:        bool  — e-stop released, awaiting reset button
         """
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._read_status_sync)
@@ -191,102 +165,80 @@ class FlexiCompactDriver:
             raise RuntimeError(f"Flexi process I/O read failed: {r}")
 
         regs = r.registers
+        w = regs[0] & ~HEARTBEAT_MASK   # mask heartbeat bit before decode
 
-        # ── Heartbeat check ───────────────────────────────────────────────────
-        # Bit 15 of reg 256 toggles at 1 Hz. If it's stuck for several polls
-        # the device may have stopped communicating even though TCP is still up.
-        # We track it here for logging; the orchestrator handles lost connection
-        # via the ConnectionLostEvent path if read_input_registers raises.
-        hb = (regs[0] >> HEARTBEAT_BIT) & 1
-        if self._last_heartbeat_bit is not None and hb == self._last_heartbeat_bit:
-            # Heartbeat didn't toggle — could be aliasing at 100ms poll vs 1Hz,
-            # or a stuck device. Log at debug level; don't fault on a single miss.
-            log.debug("flexi.heartbeat_same", bit=hb,
-                      note="expected to toggle ~1Hz; may be aliasing at 100ms poll")
-        self._last_heartbeat_bit = hb
+        def bit(n: int) -> bool:
+            return bool((w >> n) & 1)
 
-        # ── Fault decode ──────────────────────────────────────────────────────
-        if not BIT_MAP_CONFIRMED:
-            # OQ-23 not answered yet — return optimistic defaults.
-            # The raw register values are logged at debug so the rawwatch
-            # session output can be compared if needed.
-            log.debug("flexi.raw_io",
-                      r256=f"0x{regs[0]:04X}",
-                      r257=f"0x{regs[1]:04X}" if len(regs) > 1 else "n/a")
-            return {
-                "any_fault_active":      False,
-                "light_curtain_tripped": False,
-                "estop_active":          False,
-                "estop_button_index":    None,
-                "contactor_closed":      True,
-                "reset_available":       False,
-            }
+        # Normally-closed: bit=1 means OK, so we INVERT for "tripped/active"
+        estop_btn_pressed  = not bit(_BIT_ESTOP_BUTTON)   # True when button down
+        light_curtain_ok   = bit(_BIT_LIGHT_CURTAIN)
+        contactor_closed   = bit(_BIT_CONTACTOR)
+        reset_available    = bit(_BIT_RESET_AVAIL)
+        safety_ok          = bit(_BIT_SAFETY_OK)
 
-        # ── Confirmed bit map decode ──────────────────────────────────────────
-        def _bit(signal: str) -> bool:
-            if signal not in SAFETY_BIT_MAP:
-                return False
-            reg_idx, bit_num = SAFETY_BIT_MAP[signal]
-            if reg_idx >= len(regs):
-                return False
-            return bool((regs[reg_idx] >> bit_num) & 1)
+        # Light curtain tripped = beam broken RIGHT NOW (bit 2 low)
+        light_curtain_tripped = not light_curtain_ok
 
-        light_curtain = _bit("light_curtain")
-        estop_0       = _bit("estop_button_0")
-        estop_1       = _bit("estop_button_1")
-        contactor     = _bit("contactor")
-        reset_btn     = _bit("reset_button")
+        # E-stop "active" = contactor is open AND light curtain is fine
+        # Covers: button currently pressed, AND latched state after release
+        estop_active = (not contactor_closed) and light_curtain_ok
 
-        estop_active = estop_0 or estop_1
-        estop_idx: int | None = None
-        if estop_0:
-            estop_idx = 0
-        elif estop_1:
-            estop_idx = 1
+        # Overall fault = safety output latched low (any fault, any state)
+        any_fault_active = not safety_ok
 
-        any_fault = estop_active or light_curtain or not contactor
+        estop_button_index: int | None = None
+        if estop_active or estop_btn_pressed:
+            estop_button_index = 0   # one e-stop button confirmed
+
+        log.debug(
+            "flexi.status",
+            raw=f"0x{w:04X}",
+            any_fault=any_fault_active,
+            estop=estop_active,
+            light_curtain=light_curtain_tripped,
+            contactor=contactor_closed,
+            reset_avail=reset_available,
+        )
 
         return {
-            "any_fault_active":      any_fault,
-            "light_curtain_tripped": light_curtain,
+            "any_fault_active":      any_fault_active,
+            "light_curtain_tripped": light_curtain_tripped,
             "estop_active":          estop_active,
-            "estop_button_index":    estop_idx,
-            "contactor_closed":      contactor,
-            "reset_available":       reset_btn,
+            "estop_button_index":    estop_button_index,
+            "contactor_closed":      contactor_closed,
+            "reset_available":       reset_available,
         }
 
     # ------------------------------------------------------------------
-    # Protective-stop reset acknowledge (OQ-23 PENDING)
+    # Protective-stop reset acknowledge
     # ------------------------------------------------------------------
 
     async def send_reset_acknowledge(self) -> None:
         """
         Pulse the protective-stop reset-acknowledge register to release the
-        light curtain latch. Only call this when:
-          (a) light curtain is physically clear (confirmed by read_status), AND
-          (b) operator has pressed CONTINUE on the HMI.
+        light curtain latch. Only called when light curtain is physically
+        clear AND operator has pressed CONTINUE on the HMI.
 
-        OQ-23 PENDING: RESET_ACK_REG is None until David confirms the address.
+        RESET_ACK_REG is None until David confirms the write address (OQ-23).
         """
         if RESET_ACK_REG is None:
             log.warning(
-                "flexi.reset_ack.not_implemented",
-                reason="OQ-23 open — RESET_ACK_REG address not confirmed by David",
+                "flexi.reset_ack.no_op",
+                reason="RESET_ACK_REG not set — ask David for OQ-23 write address",
             )
             return
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._pulse_reset_sync)
 
     def _pulse_reset_sync(self) -> None:
+        import time
         c = self._client
         if c is None:
             raise RuntimeError("Flexi not connected")
         r = c.write_register(address=RESET_ACK_REG, value=1)
         if r.isError():
             raise RuntimeError(f"Flexi reset-ack write failed: {r}")
-        import time
         time.sleep(0.1)
-        r = c.write_register(address=RESET_ACK_REG, value=0)
-        if r.isError():
-            log.warning("flexi.reset_ack.clear_failed", error=str(r))
+        c.write_register(address=RESET_ACK_REG, value=0)
         log.info("flexi.reset_ack_sent", register=RESET_ACK_REG)
