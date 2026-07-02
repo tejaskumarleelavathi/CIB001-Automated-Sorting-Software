@@ -44,8 +44,8 @@ LINEAR_IP    = "172.16.9.60"
 LINEAR_PORT  = 503
 
 # ── Motion parameters (confirmed by live manual jogging on this unit) ─────────
-DROP_STEPS   = -50_000   # forward / dispense
-ASPIRE_STEPS =  50_000   # reverse / draw
+DROP_STEPS   = -200_000   # forward / dispense
+ASPIRE_STEPS =  200_000   # reverse / draw
 
 # ── Timing ────────────────────────────────────────────────────────────────────
 CMD_TIMEOUT_S   = 5.0    # max wait for a single command response
@@ -186,13 +186,16 @@ def check_firmware(sock: socket.socket) -> None:
     """PR VR — confirm we're talking to an MDrive device."""
     print("[CHECK] Firmware version (PR VR) ...")
     resp, ok = send_cmd(sock, "PR VR")
-    if not ok:
-        print("[ERROR] No '>' response to PR VR — device may not be an MDrive.")
-        sys.exit(1)
     lines = [l.strip() for l in resp.splitlines()
              if l.strip() and l.strip() not in ("PR VR", ">", "?")]
     version = lines[0] if lines else "(not found)"
-    print(f"[OK]    Firmware: {version}\n")
+    if not lines:
+        print("[ERROR] No firmware version in PR VR response — device may not be an MDrive.")
+        sys.exit(1)
+    if not ok:
+        print(f"[WARN]  PR VR returned '?' (active error) — firmware: {version}. Will clear error next.")
+    else:
+        print(f"[OK]    Firmware: {version}\n")
 
 
 def check_motor_power(sock: socket.socket) -> None:

@@ -404,34 +404,181 @@ def _annotate(
 def run_eoa_analysis(
     frame: np.ndarray,
     save_dir: Optional[Path] = None,
+    robot_xy: Optional[tuple[float, float]] = None,
 ) -> VisionEoAResultEvent:
-    """Capture and save EoA frame. Always proceeds — classification comes later.
+    """
+    Full EoA classification pipeline.
+
+    1. Segment → coverage guard → morph close → find blobs
+    2. Rank blobs center-first, classify each, stop at first BUG
+    3. Compute intensity-weighted body center (pipette target)
+    4. Log result + pixel offset from image centre
+    5. If EoA calibration exists: convert body-center pixel → refined robot XY
+    6. Save annotated JPEG showing label, body-center crosshair, offset
 
     Args:
-        frame:    BGR numpy array from the EoA camera (ring light on, backlight off).
-        save_dir: If provided, write a JPEG here for offline review.
+        frame:    BGR numpy array from EoA camera (ring light on, backlight off).
+        save_dir: Directory to save annotated JPEG. None = skip saving.
+        robot_xy: Current robot position (mm) — the overhead centroid the arm was
+                  sent to. Required for EoA calibration to produce absolute refined
+                  coordinates. If None, refined_x/y will remain None even if a
+                  calibration file exists.
 
     Returns:
-        VisionEoAResultEvent with proceed_with_pick=True always.
+        VisionEoAResultEvent:
+          proceed_with_pick — True only if a BUG is confirmed
+          refined_x/y       — absolute robot mm pick target (None if no EoA calibration
+                              or robot_xy not provided)
+          label             — BUG | DEBRIS | HAIR | NO_SPECIMEN
+          reason            — classifier reason string (visible in logs)
+          body_center_px    — (px, py) of body centre in EoA image
+          offset_from_center_px — (dx, dy) from image centre in pixels
     """
+    import datetime
+    t0 = time.time()
+
+    gray = _to_gray(frame)
+    h, w = gray.shape[:2]
+    img_cx, img_cy = w / 2.0, h / 2.0
+
+    # ── Step 1: segment ───────────────────────────────────────────────────────
+    binary, _thresh = _segment(gray)
+
+    # ── Step 2: coverage guard ────────────────────────────────────────────────
+    fg_coverage = float(np.count_nonzero(binary)) / binary.size
+    if fg_coverage > MAX_FG_COVERAGE:
+        log.warning("eoa.coverage_fail",
+                    coverage=f"{fg_coverage:.1%}",
+                    limit=f"{MAX_FG_COVERAGE:.0%}",
+                    note="backlight may still be on, or image is overexposed")
+        return VisionEoAResultEvent(
+            proceed_with_pick=False,
+            refined_x=None, refined_y=None,
+            frame_path="",
+            label="NO_SPECIMEN",
+            reason=f"foreground coverage {fg_coverage:.1%} > {MAX_FG_COVERAGE:.0%}",
+        )
+
+    original_binary = binary.copy()
+
+    # ── Step 3: morph close ───────────────────────────────────────────────────
+    closed = _morph_close(binary)
+
+    # ── Step 4: find blobs ────────────────────────────────────────────────────
+    blobs = _find_blobs(closed)
+    if not blobs:
+        log.info("eoa.no_blobs", note="no foreground contours found")
+        return VisionEoAResultEvent(
+            proceed_with_pick=False,
+            refined_x=None, refined_y=None,
+            frame_path="",
+            label="NO_SPECIMEN",
+            reason="no blobs found after segmentation",
+        )
+
+    # ── Step 5: rank center-first ─────────────────────────────────────────────
+    ranked = _rank_candidates(blobs, gray.shape)
+
+    # ── Step 6: classify — stop at first BUG ─────────────────────────────────
+    best_blob   = ranked[0]   # fallback: report the most central blob even if DEBRIS
+    best_label  = "DEBRIS"
+    best_reason = ""
+    body_cx: Optional[float] = None
+    body_cy: Optional[float] = None
+    body_mask_out: Optional[np.ndarray] = None
+
+    for blob in ranked:
+        _intensity_features(blob, gray, frame, original_binary)
+        label, reason = _classify(blob)
+        log.debug("eoa.blob_candidate",
+                  label=label,
+                  diam=f"{blob['equiv_diameter']:.0f}px",
+                  sol=f"{blob['solidity']:.2f}",
+                  dark_ratio=f"{blob['dark_pixel_ratio']:.2f}",
+                  reason=reason)
+
+        if label == "BUG":
+            best_blob   = blob
+            best_label  = "BUG"
+            best_reason = reason
+            body_cx, body_cy, body_mask_out = _body_center(blob, gray, original_binary)
+            break
+        elif best_label != "BUG":
+            best_blob   = blob
+            best_label  = label
+            best_reason = reason
+
+    elapsed_ms = (time.time() - t0) * 1000
+
+    # ── Step 7: pixel offset from image centre ────────────────────────────────
+    body_center_px: tuple = ()
+    offset_px: tuple      = ()
+    if body_cx is not None:
+        body_center_px = (round(body_cx, 1), round(body_cy, 1))
+        offset_px      = (round(body_cx - img_cx, 1), round(body_cy - img_cy, 1))
+
+    log.info("eoa.result",
+             label=best_label,
+             proceed=best_label == "BUG",
+             reason=best_reason,
+             body_center_px=body_center_px or "n/a",
+             image_center_px=f"({img_cx:.0f}, {img_cy:.0f})",
+             offset_from_center_px=offset_px or "n/a",
+             elapsed_ms=f"{elapsed_ms:.0f}ms")
+
+    # ── Step 8: refined robot coords via EoA calibration (optional) ───────────
+    refined_x: Optional[float] = None
+    refined_y: Optional[float] = None
+    if best_label == "BUG" and body_cx is not None and robot_xy is not None:
+        try:
+            from cib.vision.calibration import load_eoa_calibration
+            eoa_cal = load_eoa_calibration()
+            refined_x, refined_y = eoa_cal.pixel_to_absolute_robot(
+                body_cx, body_cy, w, h, robot_xy[0], robot_xy[1]
+            )
+            log.info("eoa.refined_robot_coords",
+                     refined_x=f"{refined_x:.3f}mm",
+                     refined_y=f"{refined_y:.3f}mm",
+                     delta_from_overhead_x=f"{refined_x - robot_xy[0]:.3f}mm",
+                     delta_from_overhead_y=f"{refined_y - robot_xy[1]:.3f}mm",
+                     note="body centre converted via EoA affine calibration")
+        except Exception:
+            log.info("eoa.no_calibration",
+                     note="EoA calibration not found — orchestrator will use overhead centroid. "
+                          "Run camera_calibration/eoa_calibrate.py to get refined pick coordinates.")
+    elif best_label == "BUG" and body_cx is not None and robot_xy is None:
+        log.debug("eoa.no_robot_xy",
+                  note="robot_xy not passed to run_eoa_analysis — cannot compute absolute refined coords")
+
+    # ── Step 9: save annotated JPEG ───────────────────────────────────────────
     frame_path = ""
     if save_dir is not None:
         try:
-            import datetime
             save_dir = Path(save_dir)
             save_dir.mkdir(parents=True, exist_ok=True)
             ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:21]
             name = f"eoa_{ts}.jpg"
             out_path = save_dir / name
-            cv2.imwrite(str(out_path), frame)
+
+            annotated = _annotate(
+                frame, best_blob, best_label,
+                (body_cx, body_cy) if body_cx is not None else None,
+                body_mask_out,
+                elapsed_ms,
+            )
+            cv2.imwrite(str(out_path), annotated)
             frame_path = str(out_path)
-            log.info("eoa.frame_saved", path=name)
+            log.info("eoa.annotated_saved", path=str(out_path), label=best_label)
         except Exception as exc:
             log.warning("eoa.save_failed", error=str(exc))
 
     return VisionEoAResultEvent(
-        proceed_with_pick=True,
-        refined_x=None,
-        refined_y=None,
+        proceed_with_pick=best_label == "BUG",
+        refined_x=refined_x,
+        refined_y=refined_y,
         frame_path=frame_path,
+        label=best_label,
+        reason=best_reason,
+        body_center_px=body_center_px,
+        offset_from_center_px=offset_px,
     )

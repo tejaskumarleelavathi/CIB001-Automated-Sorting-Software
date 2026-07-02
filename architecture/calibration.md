@@ -248,6 +248,119 @@ def measure_camera_to_pipette_offset(
 
 ---
 
+---
+
+## Multi-Quadrant Arm Configuration & U-Angle Calibration
+
+### Background
+
+The Epson T3-B SCARA arm cannot reach all dish coordinates from a single arm configuration.
+David confirmed the dish is divided into 4 quadrants, each requiring a different J2 arm pose and U (wrist) angle:
+
+- **Top 2 quadrants**: U = 170.109° (current calibration)
+- **Bottom 2 quadrants**: U = TBD (David to provide)
+
+This works mechanically, but the EoA camera AND pipette are both mounted **off-center from the U rotation axis**. This means rotating U changes where the tool tip physically sits in world XY — calibration done at one U angle is not directly valid at another.
+
+---
+
+### Why U Rotation Matters When Tools Are Offset
+
+When an offset tool (camera or pipette) is mounted at distance `r` from the U axis, rotating U by `ΔU` moves the tool tip in world XY:
+
+```
+tool_world_x = wrist_x + r × cos(U + α)
+tool_world_y = wrist_y + r × sin(U + α)
+```
+
+Where `α` is the fixed mounting angle of the tool in the end-effector frame.
+
+**Consequence**: the existing calibration at U=170.109° has the camera offset baked in implicitly. At a different U, the camera has physically moved — the same wrist XY no longer puts the camera over the same world point.
+
+---
+
+### Pipette Offset Rotates With U
+
+If at U=170.109° the pipette appears to be `+30mm` in the world X direction from the camera centre, this is **not** a fixed X offset. It is the current direction of a fixed tool-frame vector. When U rotates:
+
+```
+Δangle = U_new − U_old   (radians)
+
+pipette_offset_x_new = px × cos(Δangle) − py × sin(Δangle)
+pipette_offset_y_new = px × sin(Δangle) + py × cos(Δangle)
+```
+
+Example — if U changes from 170.109° to 370° (Δ ≈ 200°):
+- A pipette offset of `(+30mm, 0mm)` at U=170.109° becomes approximately `(−28mm, −10mm)` at U=370°
+- The direction has completely changed — you cannot reuse the same (Δx, Δy) constants
+
+---
+
+### Measurement Procedure (one-time, per U angle)
+
+You do NOT need to redo the full calibration grid for each quadrant. You need one reference measurement per U angle:
+
+**Step 1 — Measure camera U-correction offset**
+1. Place a small target point on the dish
+2. At U=170.109°, command MOVE_IMAGE until camera crosshair is centered over the target. Record wrist position (x1, y1)
+3. Change U to the bottom-quadrant angle. Command MOVE_IMAGE to the same (x1, y1)
+4. Capture EoA image — target will have shifted in frame. Measure pixel shift → convert to mm using EoA scale
+5. This Δx, Δy is the world-frame correction to apply to every MOVE_IMAGE command for the bottom quadrant
+
+**Step 2 — Measure pipette-to-camera offset at each U**
+At each U angle, the pipette offset in world frame is different (see formula above).
+Options:
+- **Option A (measure directly)**: At each U, position the robot so the pipette tip is over a target, take EoA image, measure where target appears relative to image centre
+- **Option B (compute from geometry)**: Measure the physical offset `r` and angle `α` of the pipette in the end-effector frame (calipers or from CAD). Then compute the world-frame offset for any U analytically using the rotation formula above
+
+---
+
+### What Needs to Be Implemented
+
+| # | Task | Where |
+|---|------|--------|
+| 1 | Decide quadrant boundaries (X/Y thresholds) | David to confirm |
+| 2 | Get U angle for bottom 2 quadrants | David to provide |
+| 3 | Add `quadrant_u_angles` and `quadrant_bounds` to `machine_config.yaml` | config |
+| 4 | In `sort_server.prg` MOVE_IMAGE: accept U angle as third parameter `MOVE_IMAGE rx,ry,u` so Python can set per-quadrant U | `robot_programs/sort_server.prg` |
+| 5 | In `EpsonT3BDriver.move_to_image_site()`: add `u_angle` parameter; pass it to MOVE_IMAGE | `cib/drivers/robot/driver.py` |
+| 6 | In orchestrator: compute which quadrant a centroid falls in, look up correct U angle | `cib/core/orchestrator.py` |
+| 7 | Apply camera U-correction offset (measured in Step 1 above) to the wrist XY before sending MOVE_IMAGE | `cib/core/orchestrator.py` |
+| 8 | Measure camera U-correction offset for bottom quadrant U angle (physical, at lab) | lab work |
+| 9 | Measure or compute pipette-to-camera offset at each U angle | lab work |
+| 10 | Apply per-U pipette offset in pick command (when pick-place is implemented) | `cib/core/orchestrator.py` or `cib/drivers/robot/driver.py` |
+| 11 | Store per-U offsets in `machine_config.yaml` or `calibration_eoa.yaml` | config |
+
+---
+
+### Config Shape (planned)
+
+```yaml
+# machine_config.yaml — quadrant arm configuration (values TBD from David)
+robot:
+  quadrants:
+    - name: top_left
+      u_angle_deg: 170.109
+      camera_correction_x_mm: 0.0    # reference quadrant — no correction
+      camera_correction_y_mm: 0.0
+    - name: top_right
+      u_angle_deg: 170.109
+      camera_correction_x_mm: 0.0
+      camera_correction_y_mm: 0.0
+    - name: bottom_left
+      u_angle_deg: ???               # David to provide
+      camera_correction_x_mm: ???    # measure at lab (Step 1 above)
+      camera_correction_y_mm: ???
+    - name: bottom_right
+      u_angle_deg: ???
+      camera_correction_x_mm: ???
+      camera_correction_y_mm: ???
+  quadrant_split_x_mm: ???           # world X dividing left/right — David to confirm
+  quadrant_split_y_mm: ???           # world Y dividing top/bottom — David to confirm
+```
+
+---
+
 ## Questions to Resolve Before Coding Calibration Routine
 
 1. **Calibration target** — printed dot grid (recommended) or use plate wells (option C)?

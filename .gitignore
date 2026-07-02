@@ -26,11 +26,17 @@ htmlcov/
 # ── Images — too large for git, backed up separately ──────────────────────────
 output/overhead_images/
 output/bugs_detected/
+cib/output/
+camera_calibration/output/
 software_tests/overhead_detection/results/
 software_tests/eoa_classification/results/
 # Root-level test captures from hardware bring-up
 capture_*.png
 capture_*.tiff
+# Hardware test one-shot captures
+hardware_tests/*.png
+hardware_tests/*.jpg
+hardware_tests/*.tiff
 
 # ── Runtime state ─────────────────────────────────────────────────────────────
 persist.json
