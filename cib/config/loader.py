@@ -161,9 +161,10 @@ class VisionConfig:
     detection_min_area_px:  int
     detection_max_area_px:  int
     backlight_lead_time_ms: int
-    overhead_save_images:   bool = True
-    overhead_save_format:   str  = "png"
-    eoa_save_format:        str  = "tiff"
+    overhead_save_images:   bool  = True
+    overhead_save_format:   str   = "png"
+    eoa_save_format:        str   = "tiff"
+    centroid_snap_mm:       float = 0.5
 
 
 @dataclass
@@ -370,6 +371,7 @@ def _parse_machine_config(raw: dict) -> MachineConfig:
             overhead_save_images=bool(vi.get("overhead_save_images", True)),
             overhead_save_format=str(vi.get("overhead_save_format", "png")),
             eoa_save_format=str(vi.get("eoa_save_format", "tiff")),
+            centroid_snap_mm=float(vi.get("centroid_snap_mm", 0.5)),
         ),
         logging=LoggingConfig(
             level=lo.get("level", "INFO"),

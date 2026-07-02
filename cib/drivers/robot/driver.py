@@ -166,6 +166,11 @@ class EpsonT3BDriver:
                 log.warning("robot.reconnecting_after_drop", reason=str(exc))
                 self._reconnect_sync()
                 resp = self._send(cmd, timeout=self._motion_timeout)
+        if resp.startswith("ERR MOTION_FAILED"):
+            raise RuntimeError(
+                "Robot Joint 2 limit — arm configuration wrong for this position. "
+                "In sort_server.prg change 'Arm Righty' to 'Arm Lefty' and reload."
+            )
         if not resp.startswith("OK IMAGE_POSITION"):
             raise RuntimeError(f"MOVE_IMAGE failed: {resp!r}")
         log.info("robot.at_image_position", response=resp)

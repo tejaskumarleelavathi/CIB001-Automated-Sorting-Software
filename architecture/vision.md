@@ -1,8 +1,8 @@
 # Vision System — Architecture & Implementation Notes
 
 **Date written:** 2026-06-24 (session 5)  
-**Last updated:** 2026-06-25 (session 7)  
-**Status:** Full pipeline implemented and wired end-to-end. Ring light control added. Backlight timed simultaneously with robot motion. VIEW mode (popup windows for testing) implemented. Visited-set specimen tracking implemented (v1). EoA calibration pending (one-time lab step). Full state machine (PICKED/DEBRIS/RETRY/FAILED) documented for v2.
+**Last updated:** 2026-06-30 (session 8)  
+**Status:** Full pipeline implemented and wired end-to-end. Ring light control added. Backlight timed simultaneously with robot motion. VIEW mode (popup windows for testing) implemented. Visited-set specimen tracking updated to radius-based check (v1.1). EoA calibration pending (one-time lab step). Full state machine (PICKED/DEBRIS/RETRY/FAILED) documented for v2.
 
 ---
 
@@ -393,28 +393,34 @@ Vision and VIEW display both run in the default thread pool executor (CPU-bound 
 
 ## Bug Tracking State Machine
 
-### v1 — Visited set (implemented)
+### v1.1 — Visited set, radius-based check (current)
 
 `Orchestrator` maintains `_visited_centroids: set[tuple[float, float]]` cleared at run start.
 
 - **When marked:** immediately when the target centroid is selected (before robot moves), so it is never re-selected even if the camera still sees it on the next overhead frame.
-- **Matching:** exact — coordinates are snapped to a 0.1mm grid (`round(v, 1)`) before storing and looking up. No radius. Calibration RMSE = 0.043mm, so the same physical spot always lands in the same 0.1mm cell. A radius would risk skipping adjacent bugs (which can be < 1mm apart).
+- **Matching:** Euclidean distance ≤ `centroid_snap_mm` (default 0.5 mm). Actual float coords are stored (not snapped). A centroid from a subsequent cycle is considered visited if it falls within 0.5 mm of any stored centroid.
 - **Sort order:** bottom-left first — `sorted(unvisited, key=lambda c: (c[1], -c[0]))` where x is robot "toward dish bottom" and y is robot "toward dish right".
 - **New overhead per cycle:** after every robot HOME, a fresh overhead image is taken. Newly-picked locations disappear naturally. The visited set only blocks EoA-rejected debris that _remains_ in the dish (would otherwise be re-targeted every cycle).
 
 ```python
 # orchestrator.py
-@staticmethod
-def _snap(v):
-    return round(v, 1)   # 0.1mm grid
-
 def _is_visited(self, centroid):
     cx, cy = centroid
-    return (self._snap(cx), self._snap(cy)) in self._visited_centroids
+    r2 = self._centroid_snap_mm ** 2
+    return any(
+        (cx - vx) ** 2 + (cy - vy) ** 2 <= r2
+        for vx, vy in self._visited_centroids
+    )
 
 def _mark_visited(self, x, y):
-    self._visited_centroids.add((self._snap(x), self._snap(y)))
+    self._visited_centroids.add((float(x), float(y)))
 ```
+
+**Why radius instead of snap-grid (v1 → v1.1, 2026-06-30):**
+
+v1 used a snap-grid: coordinates were rounded to the nearest `centroid_snap_mm` cell before being stored in a set, and lookup was done by snapping the incoming coordinate and checking set membership. This failed in practice — cycle 2 consistently reported all centroids as unvisited (`unvisited=25 total=25`) even when the exact same pixel coordinates were detected, producing the same robot coords to 3 decimal places. The snap math was analytically correct (`round(round(v / 0.5) * 0.5, 6)` gives identical float64 for both store and lookup), so the failure was likely a float64 precision artefact at the 0.5mm grid boundary: the two paths through `perspectiveTransform` → `float()` → snap could produce values differing by machine epsilon, landing in adjacent grid cells even for nominally identical inputs.
+
+The radius check eliminates this failure mode entirely: it compares squared distances rather than hashed float tuples, so sub-epsilon differences in the final float produce zero visible effect. The 0.5 mm radius is safe for this dish (bugs are separated by several mm) and is much larger than inter-cycle centroid noise (RMSE = 0.043 mm, so cycle-to-cycle jitter is < 0.1 mm).
 
 ### v2 — Per-centroid state machine (future, not yet implemented)
 

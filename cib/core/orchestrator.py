@@ -86,11 +86,12 @@ class Orchestrator:
     """
 
     # Tolerance (mm) for "same centroid" comparison across frames.
-    # Visited centroid tracking — exact position match (no radius).
-    # Centroids are snapped to a 0.1mm grid (round to 1 decimal) before storing.
-    # Calibration RMSE = 0.043mm, so inter-frame noise << 0.1mm — same physical
-    # spot will always land in the same grid cell. No radius needed; bugs are
-    # too close together for any meaningful radius to be safe.
+    # Visited centroid tracking — radius-based Euclidean distance check.
+    # A centroid is considered visited if it falls within centroid_snap_mm of
+    # any previously attempted centroid. Stores actual float coords (not snapped)
+    # so the check is not sensitive to grid-cell boundary artefacts.
+    # Calibration RMSE = 0.043mm so inter-frame noise is <<0.5mm — same physical
+    # spot reliably lands within the radius across cycles.
     #
     # Future: replace simple visited set with a per-centroid state machine:
     #   PICKED     → picked successfully, remove from dish model
@@ -110,6 +111,7 @@ class Orchestrator:
         eoa_save_dir: Path | None = None,
         force_sample_detection: bool = False,
         view: bool = False,
+        centroid_snap_mm: float = 0.5,
     ) -> None:
         self._drivers = drivers
         self._queue: asyncio.Queue[SystemEvent] = asyncio.Queue()
@@ -131,6 +133,7 @@ class Orchestrator:
         # Visited centroids — cleared at start of each run.
         # Prevents re-trying positions EoA already rejected in this run.
         self._visited_centroids: set[tuple[float, float]] = set()
+        self._centroid_snap_mm = centroid_snap_mm
         # Set to True only after _startup() posts AllDevicesReadyEvent.
         # Prevents the keepalive loop from firing while sort_server.prg is
         # still executing HOME (it can take >5 s to re-enter Line Input after
@@ -636,17 +639,32 @@ class Orchestrator:
                             note="EoA image will be dark — configure RC+ output 12 and re-run")
 
             # Robot is now stationary at imaging height — start EoA stream.
-            # Wait for robot vibration to fully settle, then drain stale frames
-            # buffered during stream startup before capturing the keeper.
             await d.camera_eoa.start_streaming()
             log.debug("cycle.eoa_stream_started")
-            await asyncio.sleep(0.5)
-            await d.camera_eoa.capture()   # drain stale frame 1
-            await d.camera_eoa.capture()   # drain stale frame 2
-            eoa_frame = await d.camera_eoa.capture()  # fresh stable frame
 
-            # Stop EoA stream before running vision — frees ~588 Mbps on
-            # the adapter while CPU is busy with image analysis.
+            # Frame 1: backlight OFF, ring light ON
+            eoa_frame_no_backlight = await d.camera_eoa.capture()
+            log.debug("cycle.eoa_captured_no_backlight")
+
+            # Frame 2: backlight ON, ring light ON
+            # EoA camera runs at 1 fps with a 2-slot buffer (start_stream(2)).
+            # Both buffer slots may hold pre-backlight frames when we turn the
+            # backlight on. Drain both slots before capturing the keeper so
+            # eoa_frame_with_backlight is guaranteed to be a post-backlight frame.
+            await d.lighting.set_backlight(True)
+            await d.camera_eoa.capture()   # drain slot[0] — pre-backlight
+            await d.camera_eoa.capture()   # drain slot[1] — pre-backlight
+            eoa_frame_with_backlight = await d.camera_eoa.capture()
+            log.debug("cycle.eoa_captured_with_backlight")
+            # Leave backlight ON — overhead camera needs it for the next cycle.
+
+            # Save both raw frames to their respective directories.
+            await loop.run_in_executor(
+                None, self._save_eoa_frames,
+                eoa_frame_no_backlight, eoa_frame_with_backlight
+            )
+
+            # Done capturing — stop EoA stream and ring light.
             await d.camera_eoa.stop_streaming()
             log.debug("cycle.eoa_stream_stopped")
 
@@ -658,8 +676,9 @@ class Orchestrator:
                 log.warning("cycle.ring_light_off_failed", error=str(exc))
 
             # ── Step 5: EoA vision analysis ───────────────────────────────
+            # Run analysis on no_backlight frame (ring light only — best for specimen detection).
             eoa_result = await loop.run_in_executor(
-                None, self._run_vision_eoa, eoa_frame
+                None, self._run_vision_eoa, eoa_frame_no_backlight, target_x, target_y
             )
 
             # ── VIEW: show EoA annotated image ────────────────────────────
@@ -669,14 +688,22 @@ class Orchestrator:
                 )
 
             # ── Step 6: Go / no-go decision ───────────────────────────────
+            log.info("cycle.eoa_classification",
+                     label=eoa_result.label,
+                     proceed=eoa_result.proceed_with_pick,
+                     reason=eoa_result.reason,
+                     body_center_px=eoa_result.body_center_px or "n/a",
+                     offset_from_center_px=eoa_result.offset_from_center_px or "n/a",
+                     refined_x=f"{eoa_result.refined_x:.3f}mm" if eoa_result.refined_x is not None else "no EoA cal yet",
+                     refined_y=f"{eoa_result.refined_y:.3f}mm" if eoa_result.refined_y is not None else "no EoA cal yet",
+                     annotated_image=eoa_result.frame_path or "not saved")
             if not eoa_result.proceed_with_pick:
                 log.info("cycle.eoa_no_pick",
-                         note="EoA rejected specimen — going home, will try next bug")
-                await asyncio.gather(
-                    d.lighting.set_backlight(True),
-                    d.robot.move_to_safe_park(),
-                )
-                log.info("orchestrator.backlight_on_robot_returning")
+                         label=eoa_result.label,
+                         reason=eoa_result.reason,
+                         note="EoA rejected — going home, will try next bug")
+                await d.robot.move_to_safe_park()
+                log.info("orchestrator.robot_returning_backlight_already_on")
                 if self._sm.current == State.CYCLE_STOPPING:
                     await self._finish_stop(d)
                 elif self._sm.is_running():
@@ -692,11 +719,8 @@ class Orchestrator:
             log.info("cycle.eoa_confirmed_bug",
                      refined_x=refined_x, refined_y=refined_y,
                      note="Pick-place not yet implemented — returning home")
-            await asyncio.gather(
-                d.lighting.set_backlight(True),
-                d.robot.move_to_safe_park(),
-            )
-            log.info("orchestrator.backlight_on_robot_returning")
+            await d.robot.move_to_safe_park()
+            log.info("orchestrator.robot_returning_backlight_already_on")
 
             # ── Step 9: Queue next cycle or finish stop ───────────────────
             if self._sm.current == State.CYCLE_STOPPING:
@@ -742,19 +766,21 @@ class Orchestrator:
     # Centroid selection helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _snap(v: float) -> float:
-        """Snap coordinate to 0.1mm grid — used for exact visited-set lookup."""
-        return round(v, 1)
-
     def _is_visited(self, centroid: tuple[float, float]) -> bool:
-        """Return True if this centroid's snapped position has already been attempted."""
+        """
+        Return True if this centroid is within centroid_snap_mm of any
+        previously attempted centroid (Euclidean distance check).
+        """
         cx, cy = centroid
-        return (self._snap(cx), self._snap(cy)) in self._visited_centroids
+        r2 = self._centroid_snap_mm ** 2
+        return any(
+            (cx - vx) ** 2 + (cy - vy) ** 2 <= r2
+            for vx, vy in self._visited_centroids
+        )
 
     def _mark_visited(self, x: float, y: float) -> None:
-        """Record a centroid as visited for this run."""
-        self._visited_centroids.add((self._snap(x), self._snap(y)))
+        """Record a centroid as visited for this run (stores actual coords, not snapped)."""
+        self._visited_centroids.add((float(x), float(y)))
         log.debug("cycle.centroid_marked_visited", x=x, y=y,
                   total_visited=len(self._visited_centroids))
 
@@ -781,9 +807,37 @@ class Orchestrator:
             )
         return result
 
-    def _run_vision_eoa(self, frame: Any) -> VisionEoAResultEvent:
+    def _run_vision_eoa(self, frame: Any, robot_x: float, robot_y: float) -> VisionEoAResultEvent:
         from cib.vision.eoa import run_eoa_analysis
-        return run_eoa_analysis(frame, save_dir=self._eoa_save_dir)
+        return run_eoa_analysis(
+            frame,
+            save_dir=self._eoa_save_dir,
+            robot_xy=(robot_x, robot_y),
+        )
+
+    def _save_eoa_frames(self, frame_no_backlight, frame_with_backlight) -> None:
+        """Save both raw EoA frames to their respective subdirectories."""
+        import cv2
+        from datetime import datetime
+
+        if self._eoa_save_dir is None:
+            return
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+
+        dir_no_bl = self._eoa_save_dir / "backlight_off"
+        dir_with_bl = self._eoa_save_dir / "backlight_on"
+        dir_no_bl.mkdir(parents=True, exist_ok=True)
+        dir_with_bl.mkdir(parents=True, exist_ok=True)
+
+        path_no_bl = dir_no_bl / f"eoa_no_backlight_{ts}.jpg"
+        path_with_bl = dir_with_bl / f"eoa_with_backlight_{ts}.jpg"
+
+        cv2.imwrite(str(path_no_bl), frame_no_backlight)
+        cv2.imwrite(str(path_with_bl), frame_with_backlight)
+        log.info("cycle.eoa_frames_saved",
+                 no_backlight=str(path_no_bl),
+                 with_backlight=str(path_with_bl))
 
     def _get_next_well_coords(self) -> tuple[float, float]:
         """TODO: implement from plate layout + load order config."""

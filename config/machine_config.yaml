@@ -59,7 +59,7 @@ eoa_camera:
   # Lucid TRI245S-CC — identified by serial, not IP.
   serial: "253102169"
   ip: ""                   # empty — cameras use LLA (169.254.x.x), discovered by serial
-  exposure_us: 33333       # 2 × (1/60Hz) = exactly 2 mains cycles — eliminates LED flicker banding
+  exposure_us: 24995.944
   gain_db: 0.0
   pixel_format: "BGR8"    # color for EoA archival images
   max_fps: 1.0             # EoA frame is 70MB (BGR8 full-res) — limit to 1fps to spare bandwidth
@@ -102,6 +102,9 @@ vision:
   overhead_save_format: 'png'         # png (debug) or tiff (archival)
   # EoA image settings (save one TIFF per specimen — Austin requires these)
   eoa_save_format: 'tiff'
+  # Visited centroid grid size (mm) — centroids within this distance are treated
+  # as the same position and not re-targeted in the same run.
+  centroid_snap_mm: 0.5
 
 logging:
   level: "INFO"

@@ -153,9 +153,13 @@ class VisionOverheadResultEvent:
 class VisionEoAResultEvent:
     """Result of EoA close-up analysis."""
     proceed_with_pick: bool
-    refined_x: float | None
-    refined_y: float | None
+    refined_x: float | None       # robot mm — None if no EoA calibration yet
+    refined_y: float | None       # robot mm — None if no EoA calibration yet
     frame_path: str
+    label: str = "UNKNOWN"        # BUG | DEBRIS | HAIR | NO_SPECIMEN | UNKNOWN
+    reason: str = ""              # classifier reason string (for logs/UI)
+    body_center_px: tuple = ()    # (px, py) in EoA image — empty if no specimen
+    offset_from_center_px: tuple = ()  # (dx, dy) from image centre — how far body is from where robot went
 
 
 # ---------------------------------------------------------------------------

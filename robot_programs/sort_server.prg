@@ -12,11 +12,16 @@ Function sort_server
     Speed 5
     Accel 5, 5
 
+server_start:
     OpenNet #201 As Server
     WaitNet #201
 
     Do
+        OnErr GoTo client_gone
+
         Line Input #201, cmd$
+
+        OnErr GoTo 0
         cmd$ = Trim$(cmd$)
 
         If Left$(cmd$, 6) = "STATUS" Then
@@ -50,7 +55,7 @@ Function sort_server
         ElseIf Left$(cmd$, 3) = "BYE" Then
             Print #201, "OK BYE"
             CloseNet #201
-            Exit Do
+            GoTo server_start
 
         Else
             Print #201, "ERR UNKNOWN " + cmd$
@@ -58,6 +63,13 @@ Function sort_server
         EndIf
 
     Loop
+
+client_gone:
+    OnErr GoTo 0
+    EResume client_gone_resume
+client_gone_resume:
+    CloseNet #201
+    GoTo server_start
 
     Motor Off
 

@@ -188,6 +188,7 @@ def main() -> None:
         eoa_save_dir=eoa_save_dir,
         force_sample_detection=FORCE_SAMPLE_DETECTION,
         view=VIEW,
+        centroid_snap_mm=cfg.vision.centroid_snap_mm,
     )
 
     # ── Start asyncio in a background daemon thread ───────────────────────────

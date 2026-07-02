@@ -154,17 +154,12 @@ class LightingControllerDriver:
             return  # already in the right state — no send, no wait
 
         mode = 1 if on else 0
-        # Send one command per channel and drain each response individually.
-        # Batching all 3 in one send leaves 2 unread responses in the TCP buffer
-        # which can be misread as the response to the next command.
-        for ch in CHANNELS:
-            self._send_command(f"SET:MODE:CHANNEL{ch},{mode}")
-
-        if on:
-            # Block until all LEDs reach full brightness before returning.
-            time.sleep(0.2)
-        else:
-            time.sleep(0.05)
+        # Send all 3 channel commands in one TCP write — one packet, one drain.
+        # Previously sent 3 separate _send_command() calls, each with its own
+        # 10ms drain timeout = 3× round trips and variable 0–30ms total latency.
+        # Batching eliminates that variability: all channels switch simultaneously,
+        # one drain handles any response the device sends.
+        self._send_batch([f"SET:MODE:CHANNEL{ch},{mode}" for ch in CHANNELS])
 
         self._backlight_on = on
         log.debug("lighting.backlight", on=on)
@@ -179,7 +174,7 @@ class LightingControllerDriver:
     # ------------------------------------------------------------------
 
     def _send_command(self, command: str) -> None:
-        """Send a single command and drain its response."""
+        """Send a single command and drain its response (fire-and-forget)."""
         self._send_batch([command])
 
     def _send_batch(self, commands: list[str]) -> None:
@@ -196,14 +191,24 @@ class LightingControllerDriver:
         )
         self._sock.sendall(payload.encode("ascii"))
 
-        # Drain any response the device sends — SET commands don't require one.
-        # No sleep: TCP will have buffered the response by the time recv() is called.
+        # Drain loop — read until no new data arrives within RECV_TIMEOUT_S.
+        # A single recv() only reads ONE TCP segment. The DCS-100E sends a
+        # separate response packet per channel command (3 packets for 3 channels),
+        # so one recv() leaves 2 responses in the socket buffer. Those stale
+        # responses accumulate and are read by the NEXT drain, making it appear
+        # that channels are still in the old state. The loop continues reading
+        # until the buffer is truly empty, preventing accumulation entirely.
         self._sock.settimeout(RECV_TIMEOUT_S)
+        buf = b""
         try:
-            resp = self._sock.recv(RECV_BUF).decode("ascii").strip()
-            if resp:
-                log.debug("lighting.response", resp=resp)
+            while True:
+                chunk = self._sock.recv(RECV_BUF)
+                if not chunk:
+                    break
+                buf += chunk
         except socket.timeout:
             pass
         finally:
             self._sock.settimeout(self._connect_timeout)
+        if buf:
+            log.debug("lighting.response", resp=buf.decode("ascii", errors="replace").strip())
