@@ -25,6 +25,7 @@ import structlog
 from cib.core.events import (
     AllDevicesReadyEvent,
     ConnectionLostEvent,
+    CyclePhase,
     DeviceName,
     FrameReadyEvent,
     CameraID,
@@ -112,6 +113,8 @@ class Orchestrator:
         force_sample_detection: bool = False,
         view: bool = False,
         centroid_snap_mm: float = 0.5,
+        eoa_normal_exposure_us: float | None = None,
+        eoa_backlight_on_exposure_us: float | None = None,
     ) -> None:
         self._drivers = drivers
         self._queue: asyncio.Queue[SystemEvent] = asyncio.Queue()
@@ -143,6 +146,17 @@ class Orchestrator:
         # Live light curtain state — updated every 100ms by safety poll loop.
         # Used to gate the CONTINUE button: must be False before reset-ack is sent.
         self._light_curtain_tripped = False
+        # Current phase of the operating cycle — set throughout _run_cycle().
+        # Used by _safe_recovery() to log what was interrupted and decide cleanup.
+        self._cycle_phase = CyclePhase.IDLE
+        # EoA pixel-scale calibration — loaded lazily on first BUG detection.
+        # Populated from camera_calibration/output/eoa_pixel_scale.json.
+        self._eoa_pixel_scale: dict | None = None
+        # EoA dual-exposure: backlight-OFF uses normal_exposure_us (full exposure for
+        # classification), backlight-ON uses backlight_on_exposure_us (shorter to avoid
+        # overexposure from the bright backlight). Both are None = don't change exposure.
+        self._eoa_normal_exposure_us = eoa_normal_exposure_us
+        self._eoa_backlight_on_exposure_us = eoa_backlight_on_exposure_us
 
     # ------------------------------------------------------------------
     # Public API — called by UI via bridge (thread-safe)
@@ -420,13 +434,18 @@ class Orchestrator:
                             reason="light curtain still tripped — clear beam before pressing CONTINUE",
                         )
                     else:
-                        # Beam is clear — send reset-acknowledge to release latch.
+                        # Beam is clear — send reset-acknowledge to release latch,
+                        # then recover to home before restarting the cycle.
                         await d.safety.send_reset_acknowledge()
+                        await self._safe_recovery()
                         sm.start()
                         await d.plc.set_status_light(StatusLight.GREEN)
                         if not self._cycle_active:
                             asyncio.create_task(self._run_cycle())
                 elif sm.current == State.E_STOP:
+                    # E-stop is physically cleared (blue button pressed, contactor
+                    # re-closed) — robot motor is back on. Safe to home now.
+                    await self._safe_recovery()
                     sm.hardware_reset_complete()
                     await d.plc.set_status_light(StatusLight.AMBER)
 
@@ -516,6 +535,73 @@ class Orchestrator:
         await d.plc.set_status_light(StatusLight.AMBER)
         log.info("orchestrator.stopped")
 
+    async def _safe_recovery(self) -> None:
+        """
+        Called after any safety fault (e-stop or protective stop) before
+        resuming normal operation.
+
+        What it does:
+          1. Waits for the active cycle task to exit (it will have raised on
+             the halted robot and set _cycle_active=False in its finally block).
+          2. Stops all camera streams (best-effort — may already be stopped).
+          3. Turns ring light off (best-effort — may already be off).
+          4. Sends HOME: sort_server.prg moves Z to SAFE (-47.700mm) first,
+             then XY. This means the pipette tip retracts before any horizontal
+             movement, so it is safe regardless of what phase was interrupted.
+
+        Note on pick-place (future):
+          When PUMP_ASPIRATING is implemented, a bug may be in the tip at the
+          moment of e-stop. For now (pick-place is a TODO stub), the robot is
+          never in a pick state, so unconditional HOME is always correct.
+          When pick-place is wired in, add a phase check here:
+            if self._cycle_phase == CyclePhase.PUMP_ASPIRATING:
+                # dispense-in-place before homing to avoid losing the specimen
+        """
+        d = self._drivers
+        phase = self._cycle_phase
+        log.info("orchestrator.safe_recovery_start", interrupted_phase=phase.name)
+
+        # Wait for the cycle task to finish cleaning up (up to 10s).
+        # When _evaluate_safety() calls robot.halt(), the active motion command
+        # raises an exception inside _run_cycle(), which exits and sets
+        # _cycle_active=False in its finally block. We wait for that here so
+        # we don't race it on the robot TCP connection.
+        if self._cycle_active:
+            log.info("orchestrator.safe_recovery_waiting_for_cycle_exit")
+            deadline = asyncio.get_event_loop().time() + 10.0
+            while self._cycle_active and asyncio.get_event_loop().time() < deadline:
+                await asyncio.sleep(0.1)
+            if self._cycle_active:
+                log.warning("orchestrator.safe_recovery_cycle_still_active",
+                            note="Proceeding anyway — robot commands may interleave")
+
+        # Stop streams (best-effort)
+        for cam in (d.camera_overhead, d.camera_eoa):
+            try:
+                await cam.stop_streaming()
+            except Exception:
+                pass
+
+        # Ring light off (best-effort)
+        try:
+            await d.robot.ring_light_off()
+        except Exception:
+            pass
+
+        # Home the robot — Z retracts before XY, so always safe
+        try:
+            await d.robot.move_to_safe_park()
+            log.info("orchestrator.safe_recovery_homed", from_phase=phase.name)
+        except Exception as exc:
+            log.error(
+                "orchestrator.safe_recovery_home_failed",
+                error=str(exc),
+                note="Robot did not home — manual intervention required before resuming",
+            )
+
+        self._cycle_phase = CyclePhase.IDLE
+        log.info("orchestrator.safe_recovery_complete")
+
     async def _run_cycle(self) -> None:
         """
         Execute one pick-and-place cycle.
@@ -536,6 +622,7 @@ class Orchestrator:
             return   # don't stack concurrent cycles
 
         self._cycle_active = True
+        self._cycle_phase = CyclePhase.OVERHEAD_CAPTURE
         d = self._drivers
         log.info("cycle.start")
 
@@ -569,6 +656,7 @@ class Orchestrator:
                 return
 
             # ── Step 2: Overhead vision analysis (thread pool — CPU bound) ─
+            self._cycle_phase = CyclePhase.OVERHEAD_VISION
             loop = asyncio.get_running_loop()
             overhead_result = await loop.run_in_executor(
                 None, self._run_vision_overhead, frame
@@ -633,6 +721,7 @@ class Orchestrator:
             # have the full 1 Gbps link with zero contention.
             # Start backlight OFF and robot motion simultaneously — backlight
             # settles in <1s while robot travels (30–60s at 5% speed).
+            self._cycle_phase = CyclePhase.ROBOT_MOVING
             await asyncio.gather(
                 d.lighting.set_backlight(False),
                 d.robot.move_to_image_site(target_x, target_y),
@@ -652,30 +741,34 @@ class Orchestrator:
                             note="EoA image will be dark — configure RC+ output 12 and re-run")
 
             # Robot is now stationary at imaging height — start EoA stream.
+            self._cycle_phase = CyclePhase.EOA_CAPTURE
             await d.camera_eoa.start_streaming()
             log.debug("cycle.eoa_stream_started")
 
-            # Frame 1: backlight OFF, ring light ON
+            # Frame 1: backlight OFF, ring light ON — full exposure for classification
             eoa_frame_no_backlight = await d.camera_eoa.capture()
             log.debug("cycle.eoa_captured_no_backlight")
 
-            # Frame 2: backlight ON, ring light ON
-            # EoA camera runs at 1 fps with a 2-slot buffer (start_stream(2)).
-            # Both buffer slots may hold pre-backlight frames when we turn the
-            # backlight on. Drain both slots before capturing the keeper so
-            # eoa_frame_with_backlight is guaranteed to be a post-backlight frame.
+            # Frame 2: backlight ON, ring light ON — reduced exposure to avoid overexposure.
+            # Switch to shorter exposure BEFORE turning the backlight on, then drain both
+            # buffer slots to flush any frames at the old exposure. The keeper is the first
+            # frame guaranteed to be post-backlight AND at the new shorter exposure.
+            if self._eoa_backlight_on_exposure_us is not None:
+                await d.camera_eoa.set_exposure(self._eoa_backlight_on_exposure_us)
+                log.debug("cycle.eoa_exposure_switched",
+                          exposure_us=self._eoa_backlight_on_exposure_us)
             await d.lighting.set_backlight(True)
-            await d.camera_eoa.capture()   # drain slot[0] — pre-backlight
-            await d.camera_eoa.capture()   # drain slot[1] — pre-backlight
+            await d.camera_eoa.capture()   # drain slot[0] — old exposure / pre-backlight
+            await d.camera_eoa.capture()   # drain slot[1] — old exposure / pre-backlight
             eoa_frame_with_backlight = await d.camera_eoa.capture()
             log.debug("cycle.eoa_captured_with_backlight")
             # Leave backlight ON — overhead camera needs it for the next cycle.
 
-            # Save both raw frames to their respective directories.
-            await loop.run_in_executor(
-                None, self._save_eoa_frames,
-                eoa_frame_no_backlight, eoa_frame_with_backlight
-            )
+            # Restore full exposure for the next cycle's no-backlight capture.
+            if self._eoa_normal_exposure_us is not None:
+                await d.camera_eoa.set_exposure(self._eoa_normal_exposure_us)
+                log.debug("cycle.eoa_exposure_restored",
+                          exposure_us=self._eoa_normal_exposure_us)
 
             # Done capturing — stop EoA stream and ring light.
             await d.camera_eoa.stop_streaming()
@@ -689,9 +782,19 @@ class Orchestrator:
                 log.warning("cycle.ring_light_off_failed", error=str(exc))
 
             # ── Step 5: EoA vision analysis ───────────────────────────────
-            # Run analysis on no_backlight frame (ring light only — best for specimen detection).
+            # Run on no_backlight frame (ring light only — best contrast for classification).
+            self._cycle_phase = CyclePhase.EOA_VISION
             eoa_result = await loop.run_in_executor(
                 None, self._run_vision_eoa, eoa_frame_no_backlight, target_x, target_y
+            )
+
+            # Save both frames — done AFTER analysis so with_backlight is annotated
+            # with a green + crosshair (tool centre) and cyan dot (body centre).
+            # Comparing those two markers tells you if the robot is on the bug.
+            await loop.run_in_executor(
+                None, self._save_eoa_frames,
+                eoa_frame_no_backlight, eoa_frame_with_backlight,
+                eoa_result.body_center_px or None,
             )
 
             # ── VIEW: show EoA annotated image ────────────────────────────
@@ -707,14 +810,13 @@ class Orchestrator:
                      reason=eoa_result.reason,
                      body_center_px=eoa_result.body_center_px or "n/a",
                      offset_from_center_px=eoa_result.offset_from_center_px or "n/a",
-                     refined_x=f"{eoa_result.refined_x:.3f}mm" if eoa_result.refined_x is not None else "no EoA cal yet",
-                     refined_y=f"{eoa_result.refined_y:.3f}mm" if eoa_result.refined_y is not None else "no EoA cal yet",
                      annotated_image=eoa_result.frame_path or "not saved")
             if not eoa_result.proceed_with_pick:
                 log.info("cycle.eoa_no_pick",
                          label=eoa_result.label,
                          reason=eoa_result.reason,
                          note="EoA rejected — going home, will try next bug")
+                self._cycle_phase = CyclePhase.ROBOT_PARKING
                 await d.robot.move_to_safe_park()
                 log.info("orchestrator.robot_returning_backlight_already_on")
                 if self._sm.current == State.CYCLE_STOPPING:
@@ -723,15 +825,54 @@ class Orchestrator:
                     asyncio.create_task(self._run_cycle())
                 return
 
-            # ── Steps 7–8: Pick and place ─────────────────────────────────
-            refined_x = eoa_result.refined_x or target_x
-            refined_y = eoa_result.refined_y or target_y
+            # ── Step 7: Correct robot position using EoA pixel-scale calibration ─
+            # body_center_px is where the classifier found the bug body in the EoA
+            # image. Compute the robot correction so the body centre lands exactly
+            # under the tool tip (image centre), then move there before picking.
+            body_center_px = eoa_result.body_center_px
+            if body_center_px:
+                corrected_x, corrected_y = self._compute_eoa_correction(
+                    body_center_px, eoa_frame_no_backlight.shape, target_x, target_y
+                )
+                if corrected_x != target_x or corrected_y != target_y:
+                    log.info("cycle.eoa_correction_moving",
+                             overhead_xy=f"({target_x:.3f}, {target_y:.3f})",
+                             corrected_xy=f"({corrected_x:.3f}, {corrected_y:.3f})")
+                    self._cycle_phase = CyclePhase.ROBOT_MOVING
+                    await d.robot.move_to_image_site(corrected_x, corrected_y)
+                    log.info("cycle.eoa_correction_complete",
+                             pick_xy=f"({corrected_x:.3f}, {corrected_y:.3f})")
 
+                    # ── Verification capture at corrected position ────────────
+                    # Capture a fresh EoA frame with backlight ON and draw green +
+                    # at image centre. Bug should now sit on the crosshair if the
+                    # correction worked. Saved as eoa_corrected_{ts}.jpg in
+                    # backlight_on/ so you can compare before vs. after.
+                    try:
+                        await d.robot.ring_light_on()
+                        await d.camera_eoa.start_streaming()
+                        await d.camera_eoa.capture()   # drain stale frame 1
+                        await d.camera_eoa.capture()   # drain stale frame 2
+                        frame_corrected = await d.camera_eoa.capture()
+                        await d.camera_eoa.stop_streaming()
+                        await d.robot.ring_light_off()
+                        await loop.run_in_executor(
+                            None, self._save_corrected_frame, frame_corrected
+                        )
+                    except Exception as exc:
+                        log.warning("cycle.eoa_verification_capture_failed", error=str(exc))
+
+                refined_x, refined_y = corrected_x, corrected_y
+            else:
+                refined_x, refined_y = target_x, target_y
+
+            # ── Step 8: Pick and place ────────────────────────────────────
             # TODO: when full pick-place is implemented, execute here.
-            # For now: go home after EoA to test imaging pipeline end-to-end.
+            # For now: go home after positioning to test the pipeline end-to-end.
             log.info("cycle.eoa_confirmed_bug",
                      refined_x=refined_x, refined_y=refined_y,
                      note="Pick-place not yet implemented — returning home")
+            self._cycle_phase = CyclePhase.ROBOT_PARKING
             await d.robot.move_to_safe_park()
             log.info("orchestrator.robot_returning_backlight_already_on")
 
@@ -763,6 +904,7 @@ class Orchestrator:
                     pass
         finally:
             self._cycle_active = False
+            self._cycle_phase = CyclePhase.IDLE
             # Stop streams so the adapter is free for robot TCP keepalive.
             for cam in (d.camera_overhead, d.camera_eoa):
                 try:
@@ -828,9 +970,26 @@ class Orchestrator:
             robot_xy=(robot_x, robot_y),
         )
 
-    def _save_eoa_frames(self, frame_no_backlight, frame_with_backlight) -> None:
-        """Save both raw EoA frames to their respective subdirectories."""
+    def _save_eoa_frames(
+        self,
+        frame_no_backlight,
+        frame_with_backlight,
+        body_center_px: tuple | None = None,
+    ) -> None:
+        """
+        Save both EoA frames with visual overlays on the with_backlight image:
+
+        backlight_off/  — raw no_backlight frame (ring light only, used by classifier)
+        backlight_on/   — with_backlight frame annotated with:
+            • Green +  at image centre  = robot tool tip (pick point)
+            • Cyan dot at body_center_px = body centre found by classifier
+            • Orange line connecting the two (shows offset before correction)
+
+        If the green + and cyan dot coincide after the correction move,
+        the robot is positioned correctly over the bug body.
+        """
         import cv2
+        import numpy as np
         from datetime import datetime
 
         if self._eoa_save_dir is None:
@@ -838,19 +997,168 @@ class Orchestrator:
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
 
-        dir_no_bl = self._eoa_save_dir / "backlight_off"
+        dir_no_bl   = self._eoa_save_dir / "backlight_off"
         dir_with_bl = self._eoa_save_dir / "backlight_on"
         dir_no_bl.mkdir(parents=True, exist_ok=True)
         dir_with_bl.mkdir(parents=True, exist_ok=True)
 
+        # No-backlight: save raw (classifier already saves its own annotated copy)
         path_no_bl = dir_no_bl / f"eoa_no_backlight_{ts}.jpg"
-        path_with_bl = dir_with_bl / f"eoa_with_backlight_{ts}.jpg"
-
         cv2.imwrite(str(path_no_bl), frame_no_backlight)
-        cv2.imwrite(str(path_with_bl), frame_with_backlight)
+
+        # With-backlight: draw overlays for visual positioning verification
+        h, w = frame_with_backlight.shape[:2]
+        cx, cy = w // 2, h // 2
+        vis = frame_with_backlight.copy()
+        arm = max(200, w // 14)
+        lw  = max(4, w // 800)
+
+        # Green + — robot tool centre (EoA image centre = where tool tip is)
+        cv2.line(vis, (cx - arm, cy), (cx + arm, cy), (0, 255, 0), lw)
+        cv2.line(vis, (cx, cy - arm), (cx, cy + arm), (0, 255, 0), lw)
+        cv2.circle(vis, (cx, cy), arm // 4, (0, 255, 0), lw)
+        cv2.circle(vis, (cx, cy), lw * 2, (0, 255, 0), -1)
+
+        if body_center_px:
+            bcx = int(round(body_center_px[0]))
+            bcy = int(round(body_center_px[1]))
+            offset_px = int(np.sqrt((bcx - cx) ** 2 + (bcy - cy) ** 2))
+            # Orange line: tool centre → body centre (shows residual offset)
+            cv2.line(vis, (cx, cy), (bcx, bcy), (0, 165, 255), lw)
+            # Cyan dot: body centre found by classifier
+            cv2.circle(vis, (bcx, bcy), lw * 4, (255, 255, 0), lw)
+            cv2.circle(vis, (bcx, bcy), lw * 2, (0, 255, 255), -1)
+            cv2.putText(
+                vis,
+                f"body offset from tool: {offset_px}px",
+                (20, h - 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                max(1.0, w / 2600),
+                (0, 165, 255),
+                lw,
+            )
+
+        path_with_bl = dir_with_bl / f"eoa_with_backlight_{ts}.jpg"
+        cv2.imwrite(str(path_with_bl), vis)
         log.info("cycle.eoa_frames_saved",
                  no_backlight=str(path_no_bl),
-                 with_backlight=str(path_with_bl))
+                 with_backlight=str(path_with_bl),
+                 body_center_px=body_center_px or "n/a")
+
+    def _save_corrected_frame(self, frame) -> None:
+        """
+        Save a post-correction EoA frame (backlight ON) with only a green +
+        crosshair at image centre. Bug should sit on the + if correction worked.
+        Saved to backlight_on/eoa_corrected_{ts}.jpg alongside the pre-correction
+        frame so you can compare before vs. after side-by-side.
+        """
+        import cv2
+        from datetime import datetime
+
+        if self._eoa_save_dir is None:
+            return
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        dir_with_bl = self._eoa_save_dir / "backlight_on"
+        dir_with_bl.mkdir(parents=True, exist_ok=True)
+
+        h, w = frame.shape[:2]
+        cx, cy = w // 2, h // 2
+        vis = frame.copy()
+        arm = max(200, w // 14)
+        lw  = max(4, w // 800)
+
+        # Green + at image centre
+        cv2.line(vis, (cx - arm, cy), (cx + arm, cy), (0, 255, 0), lw)
+        cv2.line(vis, (cx, cy - arm), (cx, cy + arm), (0, 255, 0), lw)
+        cv2.circle(vis, (cx, cy), arm // 4, (0, 255, 0), lw)
+        cv2.circle(vis, (cx, cy), lw * 2,   (0, 255, 0), -1)
+        cv2.putText(vis, "AFTER CORRECTION",
+                    (20, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    max(1.5, w / 1800),
+                    (0, 255, 0), lw)
+
+        path = dir_with_bl / f"eoa_corrected_{ts}.jpg"
+        cv2.imwrite(str(path), vis)
+        log.info("cycle.eoa_corrected_frame_saved", path=str(path))
+
+    def _compute_eoa_correction(
+        self,
+        body_center_px: tuple[float, float],
+        frame_shape: tuple,
+        target_x: float,
+        target_y: float,
+    ) -> tuple[float, float]:
+        """
+        Compute the corrected robot position so the bug body centre lands at the
+        EoA image centre (= robot tool tip).
+
+        Uses the signed 2×2 calibration matrix from eoa_pixel_scale.json:
+            M @ [drob_x, drob_y]^T = [dcam_x, dcam_y]^T
+        where camera_axis_x / delta_mm gives the camera-pixel shift per mm of
+        robot X motion, and similarly for Y.
+
+        To bring body_center_px to image centre:
+            camera_shift_needed = (W/2 - bx, H/2 - by)
+            robot_delta         = M_inv @ camera_shift_needed
+            corrected           = target + robot_delta
+
+        Returns (corrected_x, corrected_y) or (target_x, target_y) if the
+        calibration file is missing.
+        """
+        import json
+        import numpy as np
+
+        # Lazy-load calibration (load once, reuse across cycles)
+        if self._eoa_pixel_scale is None:
+            cal_path = (
+                Path(__file__).resolve().parents[2]
+                / "camera_calibration" / "output" / "eoa_pixel_scale.json"
+            )
+            if not cal_path.exists():
+                log.warning("cycle.eoa_correction_no_cal",
+                            path=str(cal_path),
+                            note="eoa_pixel_scale.json not found — using overhead centroid as pick point. "
+                                 "Run hardware_tests/eoa_pixel_scale.py to calibrate.")
+                return target_x, target_y
+            with open(cal_path) as f:
+                self._eoa_pixel_scale = json.load(f)
+            log.info("cycle.eoa_pixel_scale_loaded",
+                     px_per_mm=self._eoa_pixel_scale.get("px_per_mm"),
+                     um_per_px=round(self._eoa_pixel_scale.get("mm_per_px", 0) * 1000, 2))
+
+        cal   = self._eoa_pixel_scale
+        delta = cal["delta_mm"]
+        dx_x, dy_x = cal["camera_axis_x"]   # camera pixel shift per delta_mm robot X
+        dx_y, dy_y = cal["camera_axis_y"]   # camera pixel shift per delta_mm robot Y
+
+        # M maps [robot_dx_mm, robot_dy_mm] → [camera_dpx, camera_dpy]
+        M = np.array(
+            [[dx_x / delta, dx_y / delta],
+             [dy_x / delta, dy_y / delta]],
+            dtype=float,
+        )
+        M_inv = np.linalg.inv(M)
+
+        H, W = frame_shape[:2]
+        bx, by = body_center_px
+        # Camera shift needed to bring body centre to image centre
+        cam_shift   = np.array([W / 2.0 - bx, H / 2.0 - by], dtype=float)
+        robot_delta = M_inv @ cam_shift
+
+        corrected_x = target_x + float(robot_delta[0])
+        corrected_y = target_y + float(robot_delta[1])
+
+        log.info("cycle.eoa_correction",
+                 body_px=f"({bx:.1f}, {by:.1f})",
+                 image_centre=f"({W/2:.0f}, {H/2:.0f})",
+                 pixel_offset=f"({bx - W/2:+.1f}, {by - H/2:+.1f})",
+                 robot_delta_mm=f"({robot_delta[0]:+.3f}, {robot_delta[1]:+.3f})",
+                 overhead_xy=f"({target_x:.3f}, {target_y:.3f})",
+                 corrected_xy=f"({corrected_x:.3f}, {corrected_y:.3f})")
+
+        return corrected_x, corrected_y
 
     def _get_next_well_coords(self) -> tuple[float, float]:
         """TODO: implement from plate layout + load order config."""

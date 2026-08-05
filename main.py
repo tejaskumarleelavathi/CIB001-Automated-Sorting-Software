@@ -189,6 +189,8 @@ def main() -> None:
         force_sample_detection=FORCE_SAMPLE_DETECTION,
         view=VIEW,
         centroid_snap_mm=cfg.vision.centroid_snap_mm,
+        eoa_normal_exposure_us=cfg.eoa_camera.exposure_us,
+        eoa_backlight_on_exposure_us=cfg.eoa_camera.backlight_on_exposure_us,
     )
 
     # ── Start asyncio in a background daemon thread ───────────────────────────

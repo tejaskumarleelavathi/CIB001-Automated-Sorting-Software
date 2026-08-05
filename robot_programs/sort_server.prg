@@ -8,6 +8,8 @@ Function sort_server
     Integer sp1, sp2
 
     Motor On
+    TLSet 1, XY(17.1876, -77.0233, 0, 0)   ' EoA camera offset from U axis (measured 2026-07-08)
+    Tool 1                                   ' activate tool 1 so CX/CY report camera position
     Power High
     Speed 5
     Accel 5, 5

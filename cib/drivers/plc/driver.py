@@ -52,7 +52,8 @@ REG_INTENS_PRI = 6   # 40007  primary intensity
 REG_COLOR_SEC  = 7   # 40008  secondary colour
 REG_INTENS_SEC = 8   # 40009  secondary intensity
 
-COIL_DEMO      = 0   # 00001  demo mode (turn off after use)
+COIL_DEMO             = 0   # 00001  demo mode (turn off after use)
+COIL_STATUSLIGHT_SET  = 4   # 00005  pulse high→low to apply new register values
 
 # Colour codes
 _COLOR = {
@@ -165,8 +166,13 @@ class LogicPLCDriver:
                 errs.append(f"reg{addr}={val}: {r}")
         if errs:
             log.error("plc.set_status_light.write_error", colour=colour, errors=errs)
-        else:
-            log.debug("plc.status_light", colour=colour)
+            return
+        # Pulse Statuslight_Set coil high→low so PLC applies the new register values
+        import time
+        c.write_coil(address=COIL_STATUSLIGHT_SET, value=True)
+        time.sleep(0.05)
+        c.write_coil(address=COIL_STATUSLIGHT_SET, value=False)
+        log.debug("plc.status_light", colour=colour)
 
     # ------------------------------------------------------------------
     # Work light  (OQ-11 PENDING — no-op until register address confirmed)

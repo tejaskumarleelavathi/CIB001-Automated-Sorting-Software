@@ -59,7 +59,8 @@ eoa_camera:
   # Lucid TRI245S-CC — identified by serial, not IP.
   serial: "253102169"
   ip: ""                   # empty — cameras use LLA (169.254.x.x), discovered by serial
-  exposure_us: 24995.944
+  exposure_us: 24995.944          # ring-light-only frame (backlight OFF) — used for classification
+  backlight_on_exposure_us: 5000  # backlight-ON verification frame — shorter exposure, AWB corrects ring-light colour cast
   gain_db: 0.0
   pixel_format: "BGR8"    # color for EoA archival images
   max_fps: 1.0             # EoA frame is 70MB (BGR8 full-res) — limit to 1fps to spare bandwidth

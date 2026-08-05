@@ -25,6 +25,41 @@ class SafetyFaultType(Enum):
     CONNECTION_LOSS  = auto()
 
 
+class CyclePhase(Enum):
+    """
+    Tracks where in the operating cycle we are at any moment.
+    Used by _safe_recovery() to decide what cleanup is needed after a fault.
+    Set by the orchestrator throughout _run_cycle(). Reset to IDLE after recovery.
+
+    Current phases (pick-place not yet implemented):
+      IDLE              — between cycles or not running
+      OVERHEAD_CAPTURE  — streaming overhead camera, capturing frame
+      OVERHEAD_VISION   — running overhead blob detection (thread pool)
+      ROBOT_MOVING      — robot travelling to EoA image site
+      EOA_CAPTURE       — streaming EoA camera, capturing frames
+      EOA_VISION        — running EoA classifier (thread pool)
+      ROBOT_PARKING     — robot returning to safe park (HOME)
+
+    Future phases (wire in when pick-place is implemented):
+      ROBOT_PICK        — robot has lowered pipette tip to specimen
+      PUMP_ASPIRATING   — pump pulling specimen into tip (bug in tip here!)
+      ROBOT_TO_WELL     — robot carrying specimen to target well
+      PUMP_DISPENSING   — pump dispensing specimen into well
+    """
+    IDLE             = auto()
+    OVERHEAD_CAPTURE = auto()
+    OVERHEAD_VISION  = auto()
+    ROBOT_MOVING     = auto()
+    EOA_CAPTURE      = auto()
+    EOA_VISION       = auto()
+    ROBOT_PARKING    = auto()
+    # Pick-place phases — not yet implemented
+    ROBOT_PICK       = auto()
+    PUMP_ASPIRATING  = auto()
+    ROBOT_TO_WELL    = auto()
+    PUMP_DISPENSING  = auto()
+
+
 class DeviceName(Enum):
     ROBOT    = "Robot"
     SAFETY   = "Flexi Compact"

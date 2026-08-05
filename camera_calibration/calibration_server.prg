@@ -22,6 +22,8 @@ Function calib_server
     Integer comma_pos
 
     Motor On
+    TLSet 1, XY(17.1876, -77.0233, 0, 0)   ' EoA camera offset from U axis (measured 2026-07-08)
+    Tool 1                                   ' activate tool 1 so CX/CY report camera position
     Power Low
 
     OpenNet #201 As Server

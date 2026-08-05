@@ -153,7 +153,10 @@ def camera_connect():
 
 
 def capture_frame(cam) -> np.ndarray:
+    """Drain 2 stale buffer slots, return a fresh post-settle frame."""
     import asyncio
+    asyncio.run(cam.capture())   # drain stale frame 1
+    asyncio.run(cam.capture())   # drain stale frame 2
     return asyncio.run(cam.capture())
 
 
@@ -455,8 +458,18 @@ def main():
 
     finally:
         import asyncio
-        robot_ring_off(robot)
-        robot_home(robot)
+        try:
+            robot_ring_off(robot)
+        except Exception:
+            pass
+        try:
+            robot_home(robot)
+        except Exception:
+            pass
+        try:
+            _send(robot, "BYE")
+        except Exception:
+            pass
         robot.close()
         try:
             asyncio.run(cam.disconnect())

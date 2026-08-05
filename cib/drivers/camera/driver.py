@@ -273,6 +273,19 @@ class GigECameraDriver:
         nm["GainAuto"].value = "Off"
         nm["Gain"].value = float(self._gain_db)
 
+        # ── White balance (color cameras only) ───────────────────────────
+        # Arena View has BalanceWhiteAuto=Continuous on by default.
+        # Without this, warm ring-light color temperature bleeds through as
+        # a yellow cast whenever the backlight doesn't fully saturate the
+        # background (e.g. at 5000µs). Mono8 cameras don't have WB nodes.
+        if self._pixel_format != "Mono8":
+            try:
+                nm["BalanceWhiteAuto"].value = "Continuous"
+                log.debug("camera.white_balance_auto_enabled", name=self._name)
+            except Exception as e:
+                log.warning("camera.white_balance_auto_failed", name=self._name,
+                            error=str(e)[:80])
+
         # ── Frame rate cap ───────────────────────────────────────────────
         # Both cameras share a single USB-C Ethernet adapter. Without a
         # frame rate cap, combined bandwidth (overhead 24MB + EoA 70MB per
@@ -449,6 +462,22 @@ class GigECameraDriver:
         """
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._capture_sync)
+
+    async def set_exposure(self, exposure_us: float) -> None:
+        """
+        Change exposure time in µs while the stream is running.
+        The new exposure takes effect on the next frame the sensor integrates —
+        drain at least one frame after calling this before taking the keeper.
+        """
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._set_exposure_sync, exposure_us)
+
+    def _set_exposure_sync(self, exposure_us: float) -> None:
+        if not self._device:
+            raise RuntimeError(f"Camera '{self._name}' not connected — call connect() first")
+        self._device.nodemap["ExposureTime"].value = float(exposure_us)
+        self._exposure_us = exposure_us
+        log.debug("camera.exposure_set", name=self._name, exposure_us=exposure_us)
 
     def _capture_sync(self) -> np.ndarray:
         if not self._device or not self._streaming:

@@ -222,7 +222,7 @@ def main():
     print("\n--- Testing OVERHEAD camera ---")
     if overhead_info is not None:
         r = test_camera(system, overhead_info, "OVERHEAD", "overhead_test.png",
-                        exposure_us=2000)
+                        exposure_us=60000)
         if r:
             results["overhead"] = r
     else:

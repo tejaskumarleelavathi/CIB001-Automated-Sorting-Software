@@ -115,12 +115,13 @@ class FlexiConfig:
 
 @dataclass
 class CameraConfig:
-    ip:           str
-    serial:       str
-    exposure_us:  float
-    gain_db:      float
-    pixel_format: str = "Mono8"
-    ip_original:  str = ""   # for EoA camera force_ip
+    ip:                      str
+    serial:                  str
+    exposure_us:             float
+    gain_db:                 float
+    pixel_format:            str = "Mono8"
+    ip_original:             str = ""      # for EoA camera force_ip
+    backlight_on_exposure_us: Optional[float] = None  # if set, use this shorter exposure for the backlight-ON frame
 
 
 @dataclass
@@ -338,6 +339,10 @@ def _parse_machine_config(raw: dict) -> MachineConfig:
             gain_db=float(ec.get("gain_db", 0.0)),
             pixel_format=ec.get("pixel_format", "BGR8"),
             ip_original=ec.get("ip_original", ""),
+            backlight_on_exposure_us=(
+                float(ec["backlight_on_exposure_us"])
+                if ec.get("backlight_on_exposure_us") is not None else None
+            ),
         ),
         backlight=BacklightConfig(
             ip=bl["ip"],

@@ -16,7 +16,7 @@ breaking it.
 Pipeline
 --------
 1.  Grayscale + Otsu inverse threshold -> foreground mask
-2.  Coverage guard: >45% foreground = bad lighting -> no-go
+2.  Coverage guard: >65% foreground = bad lighting -> no-go
 3.  Morphological close -> bridge body/wing gaps
 4.  Find all contour blobs
 5.  Rank blobs center-first (arm holds specimen below camera centre)
@@ -51,7 +51,7 @@ log = structlog.get_logger(__name__)
 # Tunable constants -- must stay in sync with eoa_classifier.py
 # ---------------------------------------------------------------------------
 
-MAX_FG_COVERAGE: float  = 0.45   # >45% foreground = backlight off or bad image
+MAX_FG_COVERAGE: float  = 0.65   # >65% foreground = backlight off or bad image
 MIN_CONTOUR_AREA: int   = 50     # px^2 -- ignore sub-pixel dust
 CLOSE_KERNEL_SIZE: int  = 15     # morphological close kernel (bridges body/wing)
 CLOSE_ITER: int         = 2
@@ -70,7 +70,7 @@ CENTER_SEARCH_FRACS: tuple = (0.15, 0.30, 0.50, 1.0)  # expanding annular rings
 
 DARK_PIXEL_THRESH: int     = 90    # gray < 90 = genuinely dark (bug body/abdomen)
 BLOB_DARK_RATIO_MIN: float = 0.25  # fraction of dark pixels required for bug
-BLOB_CHROMA_MAX: float     = 45.0  # colored objects (reddish, amber) rejected
+BLOB_CHROMA_MAX: float     = 80.0  # colored objects (reddish, amber) rejected -- raised from 45 to pass amber/brown insects
 
 BODY_DARK_THRESH: int      = 70    # tighter: isolates body only, excludes wings
 

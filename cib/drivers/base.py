@@ -126,6 +126,9 @@ class CameraDriver(Protocol):
     async def capture(self) -> Any:
         """Returns numpy ndarray (raw frame). Stream must be running."""
         ...
+    async def set_exposure(self, exposure_us: float) -> None:
+        """Change exposure time in µs. Takes effect on the next frame."""
+        ...
 
 
 # ---------------------------------------------------------------------------
