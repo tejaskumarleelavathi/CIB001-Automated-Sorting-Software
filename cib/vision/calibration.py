@@ -8,13 +8,20 @@ this module loads it and exposes the pixel→robot transform.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import structlog
 
 log = structlog.get_logger(__name__)
 
-DEFAULT_H_PATH      = r"C:\LabAutomation\config\calibration_overhead.npy"
-EOA_CALIBRATION_PATH = r"C:\LabAutomation\config\calibration_eoa.npy"
+# Dev-machine default (2026-08-20): kept inside the project folder rather
+# than C:\LabAutomation, per explicit request — nothing should touch outside
+# the repo while developing solo on one machine. Revert to the
+# C:\LabAutomation runtime location when deploying to the HMI.
+_CALIBRATION_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "camera_calibration", "output")
+DEFAULT_H_PATH       = os.path.join(_CALIBRATION_DIR, "calibration_overhead.npy")
+EOA_CALIBRATION_PATH = os.path.join(_CALIBRATION_DIR, "calibration_eoa.npy")
 
 
 class CalibrationNotFoundError(RuntimeError):

@@ -21,7 +21,10 @@ from typing import List, Optional
 from cib.data.models import Pick, PickResult, PickStatus, Run, RunStatus, SafetyEvent
 
 
-DB_PATH = Path(r"C:\LabAutomation\data\picks.db")
+# Dev-machine default (2026-08-20): kept inside the project folder rather
+# than C:\LabAutomation — revert when deploying to the HMI. main.py always
+# passes an explicit db_path, so this only matters for direct/test use.
+DB_PATH = Path(__file__).resolve().parent.parent.parent / "output" / "picks.db"
 
 # DDL — idempotent, run once on startup
 _SCHEMA = """

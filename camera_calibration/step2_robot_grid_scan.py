@@ -34,10 +34,12 @@ import numpy as np
 import cv2
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
+# Dev-machine default (2026-08-20): H_RUNTIME kept inside the project folder
+# rather than C:\LabAutomation — revert when deploying to the HMI.
 OUT_DIR      = os.path.join(os.path.dirname(__file__), "output")
 CORNERS_JSON = os.path.join(OUT_DIR, "corners.json")
 H_LOCAL      = os.path.join(OUT_DIR, "calibration_overhead.npy")
-H_RUNTIME    = r"C:\LabAutomation\config\calibration_overhead.npy"
+H_RUNTIME    = os.path.join(OUT_DIR, "calibration_overhead.npy")
 
 # ── Robot ─────────────────────────────────────────────────────────────────────
 ROBOT_IP   = "172.16.9.15"

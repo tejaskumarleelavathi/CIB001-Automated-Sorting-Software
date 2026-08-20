@@ -99,13 +99,27 @@ pipette:
   dispense_speed_ul_per_s: 2.0
 
 paths:
-  db: 'C:\LabAutomation\data\picks.db'
-  plate_configs: 'C:\LabAutomation\config\plate_configs'
-  runs_output: 'C:\LabAutomation\data\runs'
-  logs: 'C:\LabAutomation\data\logs'
+  # Dev-machine paths (2026-08-20): kept inside the project folder rather
+  # than C:\LabAutomation, per explicit request — nothing should touch
+  # outside the repo while developing solo on one machine. Revert to the
+  # C:\LabAutomation runtime locations (commented below) when deploying to
+  # the HMI. Currently only reached when USE_MOCKS=False in main.py, since
+  # USE_MOCKS=True routes db/runs_output through project-relative paths of
+  # its own — but any code that reads cfg.paths.* directly should still
+  # land inside the project, not on C:\LabAutomation.
+  db: 'C:\Users\TejasKumarLeelavathi\KTM Research\KTM Research - Documents\Projects\CIB California Institute for Biodiversity\CIB001 Automated Sorting Prototype\Software\CIB_Software\output\picks.db'
+  plate_configs: 'C:\Users\TejasKumarLeelavathi\KTM Research\KTM Research - Documents\Projects\CIB California Institute for Biodiversity\CIB001 Automated Sorting Prototype\Software\CIB_Software\config\plate_configs'
+  runs_output: 'C:\Users\TejasKumarLeelavathi\KTM Research\KTM Research - Documents\Projects\CIB California Institute for Biodiversity\CIB001 Automated Sorting Prototype\Software\CIB_Software\output\runs'
+  logs: 'C:\Users\TejasKumarLeelavathi\KTM Research\KTM Research - Documents\Projects\CIB California Institute for Biodiversity\CIB001 Automated Sorting Prototype\Software\CIB_Software\output\logs'
   # Overhead images are saved here (debug use — not required by Austin).
   # In dev mode (USE_MOCKS=True), main.py uses output/overhead_images/ instead.
-  overhead_images: 'C:\LabAutomation\data\overhead_images'
+  overhead_images: 'C:\Users\TejasKumarLeelavathi\KTM Research\KTM Research - Documents\Projects\CIB California Institute for Biodiversity\CIB001 Automated Sorting Prototype\Software\CIB_Software\output\overhead_images'
+  # Deployment (C:\LabAutomation) values — restore these when moving to the HMI:
+  #   db: 'C:\LabAutomation\data\picks.db'
+  #   plate_configs: 'C:\LabAutomation\config\plate_configs'
+  #   runs_output: 'C:\LabAutomation\data\runs'
+  #   logs: 'C:\LabAutomation\data\logs'
+  #   overhead_images: 'C:\LabAutomation\data\overhead_images'
 
 vision:
   detection_min_area_px: 50

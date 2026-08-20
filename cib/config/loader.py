@@ -1,4 +1,4 @@
-"""
+r"""
 cib/config/loader.py — Load and parse machine config (YAML) and plate config (Excel).
 
 Usage:
@@ -7,7 +7,7 @@ Usage:
     machine = load_machine_config()                      # reads default path
     machine = load_machine_config(Path("custom.yaml"))  # or a custom path
 
-    plate = load_plate_config(Path(r"C:\LabAutomation\config\plate_configs\96well.xlsx"))
+    plate = load_plate_config(Path("config/plate_configs/96well.xlsx"))
 
 Both functions return typed dataclass objects. Validators run automatically —
 ConfigValidationError is raised if anything is wrong.
@@ -25,7 +25,11 @@ import openpyxl
 from cib.config.validator import ConfigValidationError, validate_machine_config, validate_plate_rows
 
 
-DEFAULT_MACHINE_CONFIG = Path(r"C:\LabAutomation\config\machine_config.yaml")
+# Dev-machine default (2026-08-20): kept inside the project folder rather
+# than C:\LabAutomation — revert when deploying to the HMI. main.py always
+# passes an explicit path (_PROD_CONFIG/_DEV_CONFIG), so this only matters
+# for direct/test use of load_machine_config() with no argument.
+DEFAULT_MACHINE_CONFIG = Path(__file__).resolve().parent.parent.parent / "config" / "machine_config.yaml"
 
 
 # ── Plate config dataclasses ──────────────────────────────────────────────────

@@ -10,7 +10,9 @@ import structlog
 
 
 def configure(log_dir: Path | None = None) -> None:
-    log_dir = log_dir or Path("C:/LabAutomation/data/logs")
+    # Dev-machine default (2026-08-20): kept inside the project folder rather
+    # than C:\LabAutomation — revert when deploying to the HMI.
+    log_dir = log_dir or Path(__file__).resolve().parent.parent / "output" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
     structlog.configure(

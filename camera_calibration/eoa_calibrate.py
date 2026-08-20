@@ -86,9 +86,11 @@ Z_SAFE        = -47.700
 Z_IMAGING     = -58.660
 
 # Output paths
+# Dev-machine default (2026-08-20): CAL_RUNTIME kept inside the project
+# folder rather than C:\LabAutomation — revert when deploying to the HMI.
 OUT_DIR       = os.path.join(os.path.dirname(__file__), "output")
 CAL_LOCAL     = os.path.join(OUT_DIR, "calibration_eoa.npy")
-CAL_RUNTIME   = r"C:\LabAutomation\config\calibration_eoa.npy"
+CAL_RUNTIME   = os.path.join(OUT_DIR, "calibration_eoa.npy")
 
 # Target detection: we look for the largest dark blob in the EoA image.
 # Works for: printed black circle, black tape, metal washer, dark sticker.

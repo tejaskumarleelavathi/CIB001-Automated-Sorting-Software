@@ -46,7 +46,9 @@ DISPLAY_WIDTH   = 1400       # px — overhead display window width
 
 OUT_DIR   = Path(__file__).parent / "output"
 H_LOCAL   = OUT_DIR / "calibration_overhead.npy"
-H_RUNTIME = Path(r"C:\LabAutomation\config\calibration_overhead.npy")
+# Dev-machine default (2026-08-20): kept inside the project folder rather
+# than C:\LabAutomation — revert when deploying to the HMI.
+H_RUNTIME = OUT_DIR / "calibration_overhead.npy"
 PAIRS_OUT = OUT_DIR / "calibration_pairs.json"
 
 MIN_PAIRS = 4    # minimum to compute H

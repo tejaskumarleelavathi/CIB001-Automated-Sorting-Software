@@ -67,9 +67,11 @@ CORNERS_JSON = os.path.join(OUT_DIR, "corners.json")
 H_NEW        = os.path.join(OUT_DIR, "calibration_overhead_tooloffset.npy")
 PAIRS_NEW    = os.path.join(OUT_DIR, "calibration_pairs_tooloffset.json")
 
-# Existing production paths — only touched by the PROMOTE step, manually
+# Existing production paths — only touched by the PROMOTE step, manually.
+# Dev-machine default (2026-08-20): kept inside the project folder rather
+# than C:\LabAutomation — revert when deploying to the HMI.
 H_PROD_LOCAL   = os.path.join(OUT_DIR, "calibration_overhead.npy")
-H_PROD_RUNTIME = r"C:\LabAutomation\config\calibration_overhead.npy"
+H_PROD_RUNTIME = os.path.join(OUT_DIR, "calibration_overhead.npy")
 
 # ── Robot ─────────────────────────────────────────────────────────────────────
 ROBOT_IP   = "172.16.9.15"

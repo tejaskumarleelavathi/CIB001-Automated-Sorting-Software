@@ -58,9 +58,11 @@ GAIN_DB       = 0.0
 
 DELTA_MM      = 5.0          # robot moves ±DELTA_MM for scale measurement
 
+# Dev-machine default (2026-08-20): CAL_RUNTIME kept inside the project
+# folder rather than C:\LabAutomation — revert when deploying to the HMI.
 OUT_DIR       = os.path.join(os.path.dirname(__file__), "output")
 CAL_LOCAL     = os.path.join(OUT_DIR, "calibration_eoa.npy")
-CAL_RUNTIME   = r"C:\LabAutomation\config\calibration_eoa.npy"
+CAL_RUNTIME   = os.path.join(OUT_DIR, "calibration_eoa.npy")
 
 # Display: scale down the 5320×4600 image for the click window
 # Show only the central 40% of the image at 35% scale.

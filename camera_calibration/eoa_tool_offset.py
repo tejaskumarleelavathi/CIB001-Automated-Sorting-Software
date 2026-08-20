@@ -48,9 +48,11 @@ import sys
 import numpy as np
 
 # ── Output paths ───────────────────────────────────────────────────────────────
+# Dev-machine default (2026-08-20): TOL_RUNTIME kept inside the project
+# folder rather than C:\LabAutomation — revert when deploying to the HMI.
 OUT_DIR     = os.path.join(os.path.dirname(__file__), "output")
 TOL_LOCAL   = os.path.join(OUT_DIR, "tool_offset.json")
-TOL_RUNTIME = r"C:\LabAutomation\config\tool_offset.json"
+TOL_RUNTIME = os.path.join(OUT_DIR, "tool_offset.json")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

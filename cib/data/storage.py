@@ -36,7 +36,10 @@ CSV_COLUMNS = [
     "error_message",
 ]
 
-_BASE_DIR = Path(r"C:\LabAutomation\data\runs")
+# Dev-machine default (2026-08-20): kept inside the project folder rather
+# than C:\LabAutomation — revert when deploying to the HMI. main.py always
+# passes an explicit base_dir, so this only matters for direct/test use.
+_BASE_DIR = Path(__file__).resolve().parent.parent.parent / "output" / "runs"
 
 
 class RunStorage:
