@@ -12,7 +12,8 @@ FLOW
 ----
   1. Takes ONE overhead snapshot, runs vision pipeline, finds bugs.
   2. You pick which bug to use (or ENTER for auto).
-  3. Overhead camera closes. Robot moves to that bug via MOVE_IMAGE.
+  3. Overhead camera closes. Robot moves to that bug via MOVE_IMAGE_U at the
+     given --u angle (held explicitly for every move in this script).
   4. EoA live feed opens — shows bug and crosshair. Press SPACE to confirm
      bug is visible and well-detected, then close the window.
   5. Script automatically:
@@ -28,14 +29,29 @@ FLOW
 
 No manual jogging. No teach pendant reading. No connection timeout.
 
+WHY --u IS REQUIRED (2026-08-19, see DEV-13 in prd_updated.md)
+----------------------------------------------------------------
+The EoA camera physically rotates with the robot's U (wrist) angle, so the
+pixel-to-mm mapping this script measures is only valid AT the U angle it was
+measured at. Real PICK operations happen at one of two quadrant angles
+(u_top_deg / u_bottom_deg in config/machine_config.yaml — currently 209.0
+and 251.0), never at a fixed/arbitrary U. This script used to move with
+plain MOVE_IMAGE (no U), which silently held whatever U the robot happened
+to already be parked at — producing a calibration that didn't match either
+real quadrant angle, and applying it uniformly to both. That's now fixed:
+you MUST pass --u explicitly, and the output filename encodes it so the two
+quadrant calibrations can coexist without overwriting each other.
+
 OUTPUT
 ------
-  camera_calibration/output/eoa_pixel_scale.json
+  camera_calibration/output/eoa_pixel_scale_u<U>.json  (e.g. _u209.json)
 
 Usage:
-  python hardware_tests/eoa_pixel_scale.py
+  python hardware_tests/eoa_pixel_scale.py --u 209
+  python hardware_tests/eoa_pixel_scale.py --u 251
 """
 
+import argparse
 import ctypes
 import json
 import os
@@ -62,13 +78,18 @@ EOA_GAIN_DB          = 0.0
 OVERHEAD_EXPOSURE_US = 10000
 OVERHEAD_GAIN_DB     = 0.0
 
+# Backlight is left alone entirely by this script — stays ON throughout
+# (explicit operator instruction, 2026-08-19). Do not add backlight control
+# here without checking first.
+
 # How far the robot moves to measure pixel scale.
 # Larger = more accurate. 5mm is a good balance — enough pixel shift
 # without moving the bug out of the EoA frame.
 DELTA_MM = 2.0
 
 OUT_DIR  = os.path.join(os.path.dirname(__file__), "..", "camera_calibration", "output")
-OUT_JSON = os.path.join(OUT_DIR, "eoa_pixel_scale.json")
+# OUT_JSON is set in main() once --u is parsed — filename encodes the U angle
+# so per-quadrant calibrations don't overwrite each other.
 
 # EoA blob detector — finds dark bug on lighter background (ring light only)
 BLOB_THRESHOLD = 100    # pixels darker than this are "bug"
@@ -116,12 +137,19 @@ def robot_connect():
     return s
 
 
-def robot_move_image(s, rx, ry):
-    cmd = f"MOVE_IMAGE {rx:.3f},{ry:.3f}"
+def robot_move_image(s, rx, ry, u):
+    """
+    Always holds an explicit U (MOVE_IMAGE_U) — never the bare MOVE_IMAGE,
+    which silently holds whatever U the robot happens to already be at.
+    This calibration is only valid at the U it was measured at (the EoA
+    camera physically rotates with U), so every move in a run must use the
+    SAME, explicitly-specified angle. See DEV-13.
+    """
+    cmd = f"MOVE_IMAGE_U {rx:.3f},{ry:.3f},{u:.3f}"
     print(f"  Robot → {cmd} ...")
     resp = _send(s, cmd)
     if not resp.startswith("OK IMAGE_POSITION"):
-        raise RuntimeError(f"MOVE_IMAGE failed: {resp!r}")
+        raise RuntimeError(f"MOVE_IMAGE_U failed: {resp!r}")
 
 
 def robot_ring_on(s):
@@ -241,6 +269,44 @@ def find_bug(frame):
     return best_ct
 
 
+# ── Overhead bug-number preview ─────────────────────────────────────────────
+
+def show_labeled_overhead(frame_ov, annotated_frame, centroids_px):
+    """
+    Show the overhead snapshot with each detected bug circled and numbered
+    (matching the [0], [1], ... indices printed to the terminal), so the
+    numeric selection prompt isn't a blind guess. Press any key to close.
+
+    Takes explicit centroids_px (not a whole result object) so the caller
+    can pass an already quadrant-filtered list — only the bugs actually
+    selectable get drawn/numbered.
+    """
+    vis = annotated_frame if annotated_frame is not None else frame_ov
+    vis = vis.copy()
+    if vis.ndim == 2:
+        vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
+
+    h, w = vis.shape[:2]
+    r = max(20, w // 150)
+    fs = max(1.5, w / 2600)
+    th = max(3, int(fs * 3))
+    for i, (px, py) in enumerate(centroids_px):
+        cx, cy = int(px), int(py)
+        cv2.circle(vis, (cx, cy), r, (0, 0, 255), th)
+        cv2.putText(vis, str(i), (cx + r + 10, cy + r // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 0, 255), th)
+
+    win = "Overhead — bug numbers (press any key to continue)"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    disp_w = DISPLAY_WIDTH
+    cv2.resizeWindow(win, disp_w, int(disp_w * h / w))
+    disp = cv2.resize(vis, (disp_w, int(disp_w * h / w)), interpolation=cv2.INTER_AREA)
+    cv2.imshow(win, disp)
+    print("\n  Bug-number preview shown — press any key in that window to continue.")
+    cv2.waitKey(0)
+    cv2.destroyWindow(win)
+
+
 # ── Live preview ──────────────────────────────────────────────────────────────
 
 def show_preview(dev, title, instruction):
@@ -343,9 +409,20 @@ def capture_bug_px(dev, label):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--u", type=float, required=True,
+                     help="Wrist U angle (deg) to hold for this calibration — "
+                          "must match a real quadrant angle (u_top_deg/u_bottom_deg "
+                          "in config/machine_config.yaml), not an arbitrary value.")
+    args = ap.parse_args()
+    u = args.u
+
+    out_json = os.path.join(OUT_DIR, f"eoa_pixel_scale_u{u:g}.json")
+
     print("=" * 65)
     print("  EoA Camera Pixel Scale Calibration (fully automatic)")
     print(f"  Robot will move ±{DELTA_MM}mm to measure pixel scale.")
+    print(f"  Holding U = {u}° for every move — output: {out_json}")
     print("=" * 65)
 
     # ── Connect robot and home FIRST ─────────────────────────────────────────
@@ -371,10 +448,55 @@ def main():
         print("  [ERROR] No bugs detected. Make sure backlight is on and bugs are in the dish.")
         sys.exit(1)
 
-    centroids = result.centroids_robot_xy
-    print(f"\n  Found {len(centroids)} bug(s):")
+    # ── Quadrant filter — only show/allow bugs that actually belong to the
+    # U angle being calibrated, so you can't accidentally calibrate U=209
+    # using a bug that's really in the bottom quadrant (see DEV-13/14:
+    # u_top_deg/u_bottom_deg, config/machine_config.yaml).
+    from cib.config.loader import load_machine_config
+    cfg_path = os.path.join(os.path.dirname(__file__), "..", "config", "machine_config.yaml")
+    robot_cfg = load_machine_config(cfg_path).robot
+    split = robot_cfg.quadrant_split_y_mm
+
+    all_xy = result.centroids_robot_xy
+    all_px = result.centroids_px
+    if split is not None and robot_cfg.u_top_deg is not None and robot_cfg.u_bottom_deg is not None:
+        if abs(u - robot_cfg.u_top_deg) < 0.01:
+            keep = [i for i, (_, ry) in enumerate(all_xy) if ry >= split]
+            quadrant_name = f"TOP (y >= {split})"
+        elif abs(u - robot_cfg.u_bottom_deg) < 0.01:
+            keep = [i for i, (_, ry) in enumerate(all_xy) if ry < split]
+            quadrant_name = f"BOTTOM (y < {split})"
+        else:
+            print(f"  [WARN] --u {u} matches neither u_top_deg ({robot_cfg.u_top_deg}) "
+                  f"nor u_bottom_deg ({robot_cfg.u_bottom_deg}) — showing all bugs, unfiltered.")
+            keep = list(range(len(all_xy)))
+            quadrant_name = "ALL (unfiltered — U doesn't match a configured quadrant)"
+    else:
+        print("  [WARN] quadrant_split_y_mm/u_top_deg/u_bottom_deg not set in machine_config.yaml "
+              "— showing all bugs, unfiltered.")
+        keep = list(range(len(all_xy)))
+        quadrant_name = "ALL (unfiltered — quadrant config missing)"
+
+    centroids = [all_xy[i] for i in keep]
+    centroids_px = [all_px[i] for i in keep]
+
+    if not centroids:
+        print(f"  [ERROR] No bugs found in the {quadrant_name} quadrant for U={u}, "
+              f"out of {len(all_xy)} detected total. Showing ALL detected bugs "
+              f"(unfiltered, numbered) so you can check whether this is a real "
+              f"detection gap or a top/bottom labeling mismatch ...")
+        for i, (rx, ry) in enumerate(all_xy):
+            print(f"    [{i}]  X={rx:.3f}  Y={ry:.3f} mm"
+                  f"  ({'>=' if ry >= split else '<'} {split} -> "
+                  f"{'TOP' if ry >= split else 'BOTTOM'})")
+        show_labeled_overhead(frame_ov, result.annotated_frame, all_px)
+        sys.exit(1)
+
+    print(f"\n  Found {len(all_xy)} bug(s) total — {len(centroids)} in quadrant {quadrant_name}:")
     for i, (rx, ry) in enumerate(centroids):
         print(f"    [{i}]  X={rx:.3f}  Y={ry:.3f} mm")
+
+    show_labeled_overhead(frame_ov, result.annotated_frame, centroids_px)
 
     if len(centroids) == 1:
         idx = 0
@@ -393,6 +515,9 @@ def main():
     target_rx, target_ry = centroids[idx]
     print(f"\n  Target: X={target_rx:.3f}  Y={target_ry:.3f} mm")
 
+    # Backlight stays ON throughout — explicit operator instruction 2026-08-19.
+    # Do NOT turn it off here. (Ring light is still turned on separately below.)
+
     # ── Open EoA camera ───────────────────────────────────────────────────────
     print("\n  Opening EoA camera ...")
     eoa_dev, eoa_sys = camera_open(EOA_SERIAL, EOA_EXPOSURE_US, EOA_GAIN_DB)
@@ -400,7 +525,7 @@ def main():
     try:
         # Move to bug, ring light on
         print(f"\n  Moving robot to bug ...")
-        robot_move_image(robot, target_rx, target_ry)
+        robot_move_image(robot, target_rx, target_ry, u)
         robot_ring_on(robot)
         time.sleep(0.5)  # let ring light stabilise
 
@@ -422,29 +547,29 @@ def main():
         p0 = capture_bug_px(eoa_dev, "P0 baseline")
 
         # Position X+: move +DELTA in X
-        robot_move_image(robot, target_rx + DELTA_MM, target_ry)
+        robot_move_image(robot, target_rx + DELTA_MM, target_ry, u)
         time.sleep(0.5)
         px_plus = capture_bug_px(eoa_dev, f"Px +{DELTA_MM}mm X")
 
         # Back to baseline, then Y: try +Y first, fall back to -Y if not detected
-        robot_move_image(robot, target_rx, target_ry)
+        robot_move_image(robot, target_rx, target_ry, u)
         time.sleep(0.3)
         y_sign = +1
-        robot_move_image(robot, target_rx, target_ry + y_sign * DELTA_MM)
+        robot_move_image(robot, target_rx, target_ry + y_sign * DELTA_MM, u)
         time.sleep(0.8)
         try:
             py_plus = capture_bug_px(eoa_dev, f"Py +{DELTA_MM}mm Y")
         except RuntimeError:
             print(f"  [WARN] +Y detection failed — trying -Y ...")
-            robot_move_image(robot, target_rx, target_ry)
+            robot_move_image(robot, target_rx, target_ry, u)
             time.sleep(0.3)
             y_sign = -1
-            robot_move_image(robot, target_rx, target_ry + y_sign * DELTA_MM)
+            robot_move_image(robot, target_rx, target_ry + y_sign * DELTA_MM, u)
             time.sleep(0.8)
             py_plus = capture_bug_px(eoa_dev, f"Py -{DELTA_MM}mm Y")
 
         # Return to baseline
-        robot_move_image(robot, target_rx, target_ry)
+        robot_move_image(robot, target_rx, target_ry, u)
 
         # ── Calculate ─────────────────────────────────────────────────────────
         # Pixel shifts when robot moves +DELTA_MM
@@ -468,7 +593,7 @@ def main():
 
   P0  (baseline)  : ({p0[0]:.1f},      {p0[1]:.1f}) px
   Px  (+{DELTA_MM}mm X) : ({px_plus[0]:.1f},  {px_plus[1]:.1f}) px  shift=({dx_x:+.1f}, {dy_x:+.1f}) px
-  Py  (+{DELTA_MM}mm Y) : ({py_plus[0]:.1f},  {py_plus[1]:.1f}) px  shift=({dx_x:+.1f}, {dy_y:+.1f}) px
+  Py  (+{DELTA_MM}mm Y) : ({py_plus[0]:.1f},  {py_plus[1]:.1f}) px  shift=({dx_y:+.1f}, {dy_y:+.1f}) px
 
   px/mm  X-axis   : {px_per_mm_x:.2f}  (|shift| = {shift_x_px:.1f} px over {DELTA_MM}mm)
   px/mm  Y-axis   : {px_per_mm_y:.2f}  (|shift| = {shift_y_px:.1f} px over {DELTA_MM}mm)
@@ -483,6 +608,7 @@ def main():
         # ── Save ──────────────────────────────────────────────────────────────
         os.makedirs(OUT_DIR, exist_ok=True)
         out = {
+            "u_deg":            u,
             "px_per_mm":        round(px_per_mm, 4),
             "mm_per_px":        round(mm_per_px, 6),
             "px_per_mm_x":      round(px_per_mm_x, 4),
@@ -497,9 +623,9 @@ def main():
             "camera_axis_x":    [round(dx_x, 2),        round(dy_x, 2)],
             "camera_axis_y":    [round(dx_y, 2),        round(dy_y, 2)],
         }
-        with open(OUT_JSON, "w") as f:
+        with open(out_json, "w") as f:
             json.dump(out, f, indent=2)
-        print(f"  Saved: {OUT_JSON}")
+        print(f"  Saved: {out_json}")
 
     finally:
         robot_ring_off(robot)

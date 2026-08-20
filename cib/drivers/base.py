@@ -29,16 +29,47 @@ class RobotDriver(Protocol):
     async def disconnect(self) -> None: ...
     async def is_ready(self) -> bool: ...
 
-    async def move_to_image_site(self, x: float, y: float) -> None:
-        """Move to pick site for EoA close-up image."""
+    async def move_to_image_site(self, x: float, y: float, u: float | None = None) -> None:
+        """
+        Move to pick site for EoA close-up image.
+
+        u: optional wrist angle (deg). If given, the robot moves to this exact
+        U (quadrant-based U selection). If None, holds whatever U the robot is
+        currently at (pre-2026-08-05 behavior).
+        """
         ...
 
-    async def execute_pick_place(
-        self,
-        pick_x: float, pick_y: float,
-        well_x: float, well_y: float,
+    async def execute_pick(
+        self, pick_x: float, pick_y: float, u: float | None = None,
     ) -> None:
-        """Full pick from refined coords and place into well."""
+        """
+        Aspirate the specimen at (pick_x, pick_y) using the pipette (Tool 2).
+        Returns once the specimen is confirmed in the tip.
+
+        u: wrist angle (deg) for the pick move — same u used for the EoA
+        move that found this specimen (dish quadrant selection).
+
+        Split from the drop step (execute_place) so the orchestrator can
+        record "specimen is now in the pipette" as its own durable state
+        between the two calls — critical for e-stop/light-curtain recovery,
+        which must know whether a specimen was already aspirated when the
+        fault hit, so it can deliver it instead of losing it or attempting
+        a second pick on top of it.
+        """
+        ...
+
+    async def execute_place(
+        self, well_x: float, well_y: float, well_u: float | None = None,
+    ) -> None:
+        """
+        Travel to (well_x, well_y) and dispense the specimen currently held
+        in the pipette (Tool 2).
+
+        well_u: wrist angle (deg) for the drop move. The plate station is a
+        different physical location from the dish and needs its own U —
+        do not reuse the pick's u here. None holds whatever U the arm is
+        currently at.
+        """
         ...
 
     async def move_to_safe_park(self) -> None:
@@ -47,6 +78,15 @@ class RobotDriver(Protocol):
 
     async def halt(self) -> None:
         """Immediate stop — called on safety fault."""
+        ...
+
+    def resume(self) -> None:
+        """
+        Clear the halted flag after a safety fault physically clears.
+        Must be called before any further robot command will be attempted —
+        the driver refuses to reconnect while halted (see driver.py).
+        Synchronous — does not itself reconnect or move anything.
+        """
         ...
 
     async def keepalive(self) -> None:
@@ -75,16 +115,26 @@ class SafetyDriver(Protocol):
         """
         ...
 
+    async def send_reset_acknowledge(self) -> None:
+        """
+        Release the light curtain latch. Only called when the curtain is
+        physically clear AND the operator has pressed CONTINUE.
+        """
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Logic PLC — lights + event log only
 # ---------------------------------------------------------------------------
 
 class StatusLight:
-    GREEN  = "green"
-    AMBER  = "amber"
-    RED    = "red"
-    OFF    = "off"
+    GREEN     = "green"       # steady green  — idle/ready, or e-stop/curtain just cleared
+    RUNNING   = "running"     # chasing green — actively running
+    AMBER     = "amber"       # steady amber  — cycle stopped / aborted, awaiting operator
+    RED       = "red"         # steady red    — e-stop active
+    RED_FLASH = "red_flash"   # flashing red  — light curtain tripped (protective stop)
+    RED_CHASE = "red_chase"   # chasing red   — connection lost / unrecoverable fault
+    OFF       = "off"
 
 
 @runtime_checkable

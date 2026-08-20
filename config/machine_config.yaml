@@ -12,6 +12,17 @@ robot:
   # Z heights (mm) — documented here for reference; hardcoded in sort_server.prg
   z_safe_mm: -47.700        # safe travel Z when moving between XY positions
   z_imaging_mm: -58.660     # EoA imaging Z (robot stops here, camera captures)
+  # Quadrant-based U (wrist) angle selection — lets the arm reach every quadrant
+  # of the dish. Computed 2026-08-05 by transforming the overhead image's pixel
+  # midline through calibration_overhead_tooloffset.npy: it maps to an almost
+  # perfectly constant robot Y (~297.7-299.1mm) regardless of X, so a single
+  # robot-Y threshold is sufficient (see cib/config/loader.py RobotConfig).
+  # u_top_deg/u_bottom_deg measured by hand via hardware_tests/test_quadrant_u_select.py.
+  # All three optional — omit to disable quadrant U-selection (MOVE_IMAGE keeps
+  # holding whatever U the robot is currently at, the pre-2026-08-05 behavior).
+  quadrant_split_y_mm: 298.4   # robot Y dividing physical top/bottom quadrants
+  u_top_deg: 209.0             # wrist U angle (deg) for top-2 quadrants (TL/TR)
+  u_bottom_deg: 251.0          # wrist U angle (deg) for bottom-2 quadrants (BL/BR)
 
 plc:
   ip: "172.16.9.11"
@@ -76,9 +87,11 @@ ring_light:
   robot_output_pin: 12    # robot digital output 4 = pipette pneumatic, 12 = ring light
 
 pipette:
-  # Novanta LMDAE572C (Liberty MDrive) — raw MCode ASCII over TCP
+  # Novanta LMDAE572C linear actuator (Liberty MDrive) — raw MCode ASCII over TCP.
+  # 172.16.9.60 confirmed 2026-08-06 against robot_programs/pipette_test.prg
+  # (the working hardware test) — .16 was a different/earlier motor unit.
   interface: "tcp"
-  ip: "172.16.9.16"
+  ip: "172.16.9.60"
   port: 503
   aspirate_volume_ul: 5.0
   aspirate_speed_ul_per_s: 2.0

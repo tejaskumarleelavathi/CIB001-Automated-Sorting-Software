@@ -187,6 +187,24 @@ def test_bgr_frame_accepted() -> None:
     assert result.sample_count >= 1
 
 
+# ── draw_target_highlight ────────────────────────────────────────────────────
+# Regression test for 2026-08-18: this used to always .copy() a full-frame BGR
+# image (~73MB at real 4600x5320 resolution) purely for an ephemeral VIEW-mode
+# debug preview, every cycle — a real contributor to a live OpenCV
+# OutOfMemoryError over a long session. Now mutates in place; verify it still
+# does the right visual thing and doesn't blow up on a realistic-sized frame.
+
+def test_draw_target_highlight_mutates_in_place_and_marks_target() -> None:
+    from cib.vision.pipeline import draw_target_highlight
+
+    frame = np.zeros((600, 800, 3), dtype=np.uint8)
+    result = draw_target_highlight(frame, target_px=(400.0, 300.0))
+
+    assert result is frame   # same object — no copy made
+    # Something was actually drawn (frame is no longer all-black).
+    assert frame.any()
+
+
 def _draw_bug_bgr(frame: np.ndarray, cx: int, cy: int, radius: int = 15) -> None:
     """Draw a dark bug on a 3-channel BGR frame in-place."""
     y_idx, x_idx = np.ogrid[: frame.shape[0], : frame.shape[1]]

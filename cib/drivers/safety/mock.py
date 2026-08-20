@@ -50,6 +50,11 @@ class MockSafetyDriver:
             "reset_available":        self._reset_available,
         }
 
+    async def send_reset_acknowledge(self) -> None:
+        """Simulate releasing the light curtain latch."""
+        self._light_curtain_tripped = False
+        log.info("mock_safety.reset_acknowledge_sent")
+
     # ------------------------------------------------------------------
     # Test / simulation helpers
     # ------------------------------------------------------------------

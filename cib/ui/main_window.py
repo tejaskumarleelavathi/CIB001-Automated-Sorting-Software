@@ -65,7 +65,7 @@ class MainWindow(QMainWindow):
         self._capture_count = 0
 
         self.setWindowTitle("CIB Automated Sorting Cell")
-        self.setMinimumSize(480, 360)
+        self.setMinimumSize(480, 430)
 
         self._build_ui()
 
@@ -141,6 +141,37 @@ class MainWindow(QMainWindow):
 
         outer.addLayout(btn_row)
 
+        # ── CONTINUE / ABORT buttons — needed to recover from e-stop and
+        # light curtain trips (no way to clear either state without these).
+        recovery_row = QHBoxLayout()
+        recovery_row.setSpacing(16)
+
+        self._continue_btn = QPushButton("CONTINUE")
+        self._continue_btn.setFixedHeight(56)
+        _apply_font(self._continue_btn, size=15, bold=True)
+        self._continue_btn.setStyleSheet(
+            "QPushButton { background-color: #2980b9; color: white; border-radius: 8px; }"
+            "QPushButton:hover { background-color: #3498db; }"
+            "QPushButton:disabled { background-color: #bdc3c7; color: #7f8c8d; }"
+        )
+        self._continue_btn.clicked.connect(self._on_continue)
+        self._continue_btn.setEnabled(False)
+        recovery_row.addWidget(self._continue_btn)
+
+        self._abort_btn = QPushButton("ABORT")
+        self._abort_btn.setFixedHeight(56)
+        _apply_font(self._abort_btn, size=15, bold=True)
+        self._abort_btn.setStyleSheet(
+            "QPushButton { background-color: #7f2d2d; color: white; border-radius: 8px; }"
+            "QPushButton:hover { background-color: #963939; }"
+            "QPushButton:disabled { background-color: #bdc3c7; color: #7f8c8d; }"
+        )
+        self._abort_btn.clicked.connect(self._on_abort)
+        self._abort_btn.setEnabled(False)
+        recovery_row.addWidget(self._abort_btn)
+
+        outer.addLayout(recovery_row)
+
         # ── SHUTDOWN button ───────────────────────────────────────────
         self._shutdown_btn = QPushButton("SHUTDOWN")
         self._shutdown_btn.setFixedHeight(48)
@@ -197,6 +228,12 @@ class MainWindow(QMainWindow):
     def _on_stop(self) -> None:
         self._orchestrator.operator_stop()
 
+    def _on_continue(self) -> None:
+        self._orchestrator.operator_acknowledge()
+
+    def _on_abort(self) -> None:
+        self._orchestrator.operator_abort()
+
     def _on_shutdown(self) -> None:
         """
         Clean shutdown: tell orchestrator to disconnect all hardware (sends
@@ -242,6 +279,25 @@ class MainWindow(QMainWindow):
         # Button enable logic
         self._start_btn.setEnabled(state == State.IDLE)
         self._stop_btn.setEnabled(state in {State.RUNNING, State.CYCLE_STOPPING})
+        # CONTINUE: clears E_STOP only once the FULL hardware reset sequence
+        # has physically completed (button released AND blue reset button
+        # pressed. Corrected 2026-08-18 from live hardware testing: there is
+        # ONE physical blue reset button shared by both fault types — it
+        # must be pressed (once it starts blinking) for E_STOP AND for
+        # PROTECTIVE_STOP. The original design assumption (FR-SAF-08 — light
+        # curtain needs no button, only a clear beam) does not match this
+        # installation; do not revert this without re-confirming on hardware.
+        hardware_reset_done = not self._orchestrator.hardware_fault_active
+        curtain_clear = not self._orchestrator.light_curtain_tripped
+        self._continue_btn.setEnabled(
+            hardware_reset_done and (state == State.E_STOP or
+                                      (state == State.PROTECTIVE_STOP and curtain_clear))
+        )
+        # ABORT: matches the state machine's allowed abort sources exactly.
+        self._abort_btn.setEnabled(
+            state in {State.IDLE, State.CYCLE_STOPPING, State.E_STOP,
+                      State.PROTECTIVE_STOP, State.FAULT}
+        )
         # SHUTDOWN: available in all states except INITIALIZING — operator must
         # always be able to shut down cleanly (e.g. when stuck in CYCLE_STOPPING).
         self._shutdown_btn.setEnabled(state != State.INITIALIZING)

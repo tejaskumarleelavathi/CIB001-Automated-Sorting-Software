@@ -31,12 +31,31 @@ USE_REAL_ROBOT    = True    # real Epson T3-B (sort_server.prg must be running i
 USE_REAL_CAMERA_OVERHEAD = True    # real Lucid overhead camera (serial 253102168)
 USE_REAL_CAMERA_EOA      = True    # real Lucid EoA camera (serial 253102169)
 USE_REAL_LIGHTING = True    # real DCS-100E backlight
+USE_REAL_SAFETY   = True    # real Sick Flexi safety controller
+USE_REAL_PLC      = True    # real Logic PLC (status light / work light)
 
 # Dev testing flag — inject a fake centroid if vision finds no bugs in the dish.
 # Keeps the cycle running so you can test pick-place flow without a full dish.
 # Set False when real bug detection is implemented and tested.
 FORCE_SAMPLE_DETECTION = False
 VIEW = True    # True = show image popups for 3s during testing | False = silent (production)
+
+# Well-drop plate config — TEST-SCOPED (2026-08-11), NOT the final production
+# design. See prd_updated.md Appendix D: the real design (who teaches wells,
+# how often, vision-assisted or not) is still pending discussion with
+# Austin/David. This just loads one fixed plate config file so pick+drop
+# into real wells can be tested with the plate currently installed. Set to
+# None to disable (falls back to the old (100.0, 100.0) placeholder).
+# Generate this file with hardware_tests/teach_plate_wells.py.
+TEST_PLATE_CONFIG = Path(__file__).parent / "config" / "plate_configs" / "test_96well.xlsx"
+PLATE_U = 170.011   # from hardware_tests/plate_from_coords.py, teach pendant 2026-08-14
+
+# Data-layer placeholders (2026-08-18) — the real pre-run setup screen
+# (PRD FR-SETUP-01) doesn't exist yet, so there's nowhere for an operator to
+# type these in. Every pick logged right now uses these fixed values until
+# that screen is built. See prd checklist FR-SETUP-01/FR-RUN-02.
+DEV_FIELD_CODE = "DEV"
+DEV_PLATE_ID   = "DEV-PLATE"
 # ─────────────────────────────────────────────────────────────────────────────
 
 _DEV_CONFIG  = Path(__file__).parent / "config" / "machine_config.yaml"
@@ -61,6 +80,8 @@ def build_drivers(
     use_real_camera_overhead: bool,
     use_real_camera_eoa: bool,
     use_real_lighting: bool,
+    use_real_safety: bool = False,
+    use_real_plc: bool = False,
 ):
     from cib.core.orchestrator import DriverSet
 
@@ -91,10 +112,12 @@ def build_drivers(
             if use_real_lighting
             else MockLightingDriver()
         )
+        safety = _make_real_safety(cfg) if use_real_safety else MockSafetyDriver()
+        plc    = _make_real_plc(cfg)    if use_real_plc    else MockPLCDriver()
         return DriverSet(
             robot           = robot,
-            safety          = MockSafetyDriver(),
-            plc             = MockPLCDriver(),
+            safety          = safety,
+            plc             = plc,
             pump            = MockPumpDriver(),
             camera_overhead = camera_overhead,
             camera_eoa      = camera_eoa,
@@ -103,13 +126,11 @@ def build_drivers(
 
     else:
         from cib.drivers.robot.driver    import EpsonT3BDriver
-        from cib.drivers.safety.driver   import FlexiCompactDriver
-        from cib.drivers.plc.driver      import LogicPLCDriver
         from cib.drivers.pump.driver     import MDriveDriver
         return DriverSet(
             robot           = _make_real_robot(cfg),
-            safety          = FlexiCompactDriver(),
-            plc             = LogicPLCDriver(),
+            safety          = _make_real_safety(cfg),
+            plc             = _make_real_plc(cfg),
             pump            = MDriveDriver(),
             camera_overhead = _make_real_camera(cfg, "overhead"),
             camera_eoa      = _make_real_camera(cfg, "eoa"),
@@ -142,6 +163,16 @@ def _make_real_camera(cfg, which: str):
     )
 
 
+def _make_real_safety(cfg):
+    from cib.drivers.safety.driver import FlexiCompactDriver
+    return FlexiCompactDriver(ip=cfg.flexi.ip, port=cfg.flexi.port)
+
+
+def _make_real_plc(cfg):
+    from cib.drivers.plc.driver import LogicPLCDriver
+    return LogicPLCDriver(ip=cfg.plc.ip, port=cfg.plc.port)
+
+
 def _make_real_lighting(cfg):
     from cib.drivers.lighting.driver import LightingControllerDriver
     return LightingControllerDriver(
@@ -162,6 +193,8 @@ def main() -> None:
         use_real_camera_overhead=USE_REAL_CAMERA_OVERHEAD,
         use_real_camera_eoa=USE_REAL_CAMERA_EOA,
         use_real_lighting=USE_REAL_LIGHTING,
+        use_real_safety=USE_REAL_SAFETY,
+        use_real_plc=USE_REAL_PLC,
     )
 
     # Image save directories
@@ -179,6 +212,39 @@ def main() -> None:
     )
     eoa_save_dir.mkdir(parents=True, exist_ok=True)
 
+    # Data layer (SQLite + per-run CSV) — dev-local db on the laptop, real
+    # path on the HMI. See cfg.paths.db / cib/data/database.py.
+    db_path = (
+        Path(__file__).parent / "output" / "picks.db"
+        if USE_MOCKS
+        else Path(cfg.paths.db)
+    )
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    runs_base_dir = (
+        Path(__file__).parent / "output" / "runs"
+        if USE_MOCKS
+        else Path(cfg.paths.runs_output)
+    )
+    runs_base_dir.mkdir(parents=True, exist_ok=True)
+
+    # Test-scoped plate config (see TEST_PLATE_CONFIG comment above)
+    plate_config = None
+    if TEST_PLATE_CONFIG is not None and TEST_PLATE_CONFIG.exists():
+        from cib.config.loader import load_plate_config
+        try:
+            plate_config = load_plate_config(TEST_PLATE_CONFIG)
+            import structlog
+            structlog.get_logger(__name__).info(
+                "main.plate_config_loaded", path=str(TEST_PLATE_CONFIG),
+                well_count=len(plate_config.wells),
+            )
+        except Exception as exc:
+            import structlog
+            structlog.get_logger(__name__).warning(
+                "main.plate_config_load_failed", path=str(TEST_PLATE_CONFIG), error=str(exc),
+            )
+
     from cib.core.orchestrator import Orchestrator
     orchestrator = Orchestrator(
         drivers=drivers,
@@ -191,6 +257,15 @@ def main() -> None:
         centroid_snap_mm=cfg.vision.centroid_snap_mm,
         eoa_normal_exposure_us=cfg.eoa_camera.exposure_us,
         eoa_backlight_on_exposure_us=cfg.eoa_camera.backlight_on_exposure_us,
+        quadrant_split_y_mm=cfg.robot.quadrant_split_y_mm,
+        u_top_deg=cfg.robot.u_top_deg,
+        u_bottom_deg=cfg.robot.u_bottom_deg,
+        plate_config=plate_config,
+        plate_u=PLATE_U,
+        db_path=db_path,
+        runs_base_dir=runs_base_dir,
+        field_code=DEV_FIELD_CODE,
+        default_plate_id=DEV_PLATE_ID,
     )
 
     # ── Start asyncio in a background daemon thread ───────────────────────────
@@ -203,7 +278,18 @@ def main() -> None:
             loop.run_until_complete(orchestrator.run())
         except Exception as exc:
             import structlog
-            structlog.get_logger(__name__).error("orchestrator.crashed", error=str(exc))
+            import traceback
+            log = structlog.get_logger(__name__)
+            log.error("orchestrator.crashed", error=str(exc))
+            # orchestrator.run() uses asyncio.TaskGroup — a sub-task's real
+            # exception is wrapped in an ExceptionGroup and str(exc) alone
+            # hides it. Unwrap and print every sub-exception's full traceback.
+            if hasattr(exc, "exceptions"):   # ExceptionGroup (Python 3.11+)
+                for i, sub in enumerate(exc.exceptions):
+                    print(f"\n--- sub-exception {i + 1} ---")
+                    traceback.print_exception(type(sub), sub, sub.__traceback__)
+            else:
+                traceback.print_exception(type(exc), exc, exc.__traceback__)
 
     asyncio_thread = threading.Thread(target=_run_asyncio, daemon=True, name="asyncio")
     asyncio_thread.start()

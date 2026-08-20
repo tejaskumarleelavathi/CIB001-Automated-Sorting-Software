@@ -34,20 +34,20 @@ class MockRobotDriver:
     async def is_ready(self) -> bool:
         return self._connected and not self._halted
 
-    async def move_to_image_site(self, x: float, y: float) -> None:
-        log.info("mock_robot.move_to_image_site", x=x, y=y)
+    async def move_to_image_site(self, x: float, y: float, u: float | None = None) -> None:
+        log.info("mock_robot.move_to_image_site", x=x, y=y, u=u)
         await asyncio.sleep(MOCK_MOVE_SECONDS)
         log.info("mock_robot.in_position")
 
-    async def execute_pick_place(
-        self,
-        pick_x: float, pick_y: float,
-        well_x: float, well_y: float,
-    ) -> None:
-        log.info("mock_robot.pick_place_start", pick_x=pick_x, pick_y=pick_y,
-                 well_x=well_x, well_y=well_y)
+    async def execute_pick(self, pick_x: float, pick_y: float, u: float | None = None) -> None:
+        log.info("mock_robot.pick_start", pick_x=pick_x, pick_y=pick_y, u=u)
         await asyncio.sleep(MOCK_PICK_SECONDS)
-        log.info("mock_robot.pick_place_complete")
+        log.info("mock_robot.pick_complete")
+
+    async def execute_place(self, well_x: float, well_y: float, well_u: float | None = None) -> None:
+        log.info("mock_robot.place_start", well_x=well_x, well_y=well_y, well_u=well_u)
+        await asyncio.sleep(MOCK_PICK_SECONDS)
+        log.info("mock_robot.place_complete")
 
     async def move_to_safe_park(self) -> None:
         log.info("mock_robot.parking")

@@ -12,7 +12,12 @@ motion. Never call two methods concurrently.
 Commands used:
     STATUS              -> OK READY
     HOME                -> OK HOME         (lift Z, go to home)
-    MOVE_IMAGE rx,ry    -> OK IMAGE_POSITION rx,ry   (XY + drop Z for EoA)
+    MOVE_IMAGE rx,ry    -> OK IMAGE_POSITION rx,ry   (XY + drop Z for EoA, holds current U)
+    MOVE_IMAGE_U rx,ry,u -> OK IMAGE_POSITION rx,ry  (same, but explicit U — quadrant selection)
+    PICK rx,ry          -> OK PICKED rx,ry           (pipette Tool 2, aspirate, holds current U)
+    PICK_U rx,ry,u      -> OK PICKED rx,ry           (same, but explicit U — quadrant selection)
+    DROP rx,ry          -> OK DROPPED rx,ry          (pipette Tool 2, dispense, holds current U)
+    DROP_U rx,ry,u      -> OK DROPPED rx,ry          (same, but explicit U — quadrant selection)
     BYE                 -> OK BYE
 """
 
@@ -60,6 +65,12 @@ class EpsonT3BDriver:
         self._motion_timeout = motion_timeout_s
         self._sock: socket.socket | None = None
         self._halted = False
+        # Set the moment disconnect() is called. Once True, the reconnect-
+        # on-drop logic in every _xxx_sync method (and the keepalive loop)
+        # stops trying to reconnect+HOME — a broken connection during
+        # shutdown should just fail cleanly, not open a fresh connection and
+        # issue new motion commands while the system is tearing down.
+        self._shutting_down = False
         # Serialises all send/recv exchanges so the keepalive loop cannot
         # interleave with a motion command running in a different thread.
         # RLock (re-entrant) because _reconnect_sync is called from within
@@ -114,6 +125,7 @@ class EpsonT3BDriver:
         await loop.run_in_executor(None, self._disconnect_sync)
 
     def _disconnect_sync(self) -> None:
+        self._shutting_down = True
         if self._sock is None:
             return
         with self._cmd_lock:
@@ -135,7 +147,7 @@ class EpsonT3BDriver:
     # Motion commands — called by orchestrator
     # ------------------------------------------------------------------
 
-    async def move_to_image_site(self, x: float, y: float) -> None:
+    async def move_to_image_site(self, x: float, y: float, u: float | None = None) -> None:
         """
         Move EoA camera above the specimen at (x, y) for imaging.
 
@@ -143,19 +155,27 @@ class EpsonT3BDriver:
           1. Move linearly to (x, y, Z_SAFE=-47.700)   — safe travel height
           2. Move linearly down to (x, y, Z_IMAGING=-58.660) — EoA imaging height
 
+        u: optional wrist angle (deg) for quadrant-based U selection. If given,
+        sends MOVE_IMAGE_U (explicit U). If None, sends MOVE_IMAGE (holds
+        whatever U the robot is currently at).
+
         Blocks until robot is stationary at imaging height (robot sends response
         only after both moves complete). Then Python triggers camera capture.
         """
-        log.info("robot.move_to_image_site", x=x, y=y)
+        log.info("robot.move_to_image_site", x=x, y=y, u=u)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
             None,
             self._move_image_sync,
-            x, y,
+            x, y, u,
         )
 
-    def _move_image_sync(self, x: float, y: float) -> None:
-        cmd = f"MOVE_IMAGE {x:.3f},{y:.3f}"
+    def _move_image_sync(self, x: float, y: float, u: float | None = None) -> None:
+        cmd = (
+            f"MOVE_IMAGE_U {x:.3f},{y:.3f},{u:.3f}"
+            if u is not None
+            else f"MOVE_IMAGE {x:.3f},{y:.3f}"
+        )
         with self._cmd_lock:
             try:
                 resp = self._send(cmd, timeout=self._motion_timeout)
@@ -196,22 +216,76 @@ class EpsonT3BDriver:
             raise RuntimeError(f"HOME failed: {resp!r}")
         log.info("robot.at_home")
 
-    async def execute_pick_place(
-        self,
-        pick_x: float, pick_y: float,
-        well_x: float, well_y: float,
+    async def execute_pick(
+        self, pick_x: float, pick_y: float, u: float | None = None,
     ) -> None:
         """
-        Full pick from refined coords and place into well.
-        TODO: implement pipette deploy, aspirate, well travel, dispense.
-        For now: go home (no-op placeholder until pick sequence is implemented).
+        Aspirate the specimen at (pick_x, pick_y) using the pipette (Tool 2).
+        Returns once the specimen is confirmed in the tip.
+
+        u: wrist angle for the PICK move (dish quadrant U — see
+           cib/core/orchestrator.py _select_quadrant_u()).
+
+        Split from execute_place() so the orchestrator can durably record
+        "specimen is now in the pipette" the instant this returns — needed
+        so an e-stop/light-curtain fault after this point knows to deliver
+        the specimen on recovery instead of losing it or attempting a
+        second pick on top of it.
         """
-        log.warning(
-            "robot.execute_pick_place.not_implemented",
-            note="Pick-place not yet wired — going home instead",
-            pick_x=pick_x, pick_y=pick_y,
+        log.info("robot.execute_pick", pick_x=pick_x, pick_y=pick_y, u=u)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._pick_sync, pick_x, pick_y, u)
+
+    async def execute_place(
+        self, well_x: float, well_y: float, well_u: float | None = None,
+    ) -> None:
+        """
+        Travel to (well_x, well_y) and dispense the specimen currently held
+        in the pipette (Tool 2).
+
+        well_u: wrist angle for the DROP move. The plate station is a
+                physically different location from the dish, almost
+                certainly needing a different U — do NOT reuse the pick's u
+                here. None falls back to holding whatever U the arm is
+                already at (rarely correct once a real plate config is wired in).
+        """
+        log.info("robot.execute_place", well_x=well_x, well_y=well_y, well_u=well_u)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._drop_sync, well_x, well_y, well_u)
+
+    def _pick_sync(self, x: float, y: float, u: float | None = None) -> None:
+        cmd = (
+            f"PICK_U {x:.3f},{y:.3f},{u:.3f}"
+            if u is not None
+            else f"PICK {x:.3f},{y:.3f}"
         )
-        await self.move_to_safe_park()
+        with self._cmd_lock:
+            try:
+                resp = self._send(cmd, timeout=self._motion_timeout)
+            except (ConnectionError, OSError) as exc:
+                log.warning("robot.reconnecting_after_drop", reason=str(exc))
+                self._reconnect_sync()
+                resp = self._send(cmd, timeout=self._motion_timeout)
+        if not resp.startswith("OK PICKED"):
+            raise RuntimeError(f"PICK failed: {resp!r}")
+        log.info("robot.pick_complete", response=resp)
+
+    def _drop_sync(self, x: float, y: float, u: float | None = None) -> None:
+        cmd = (
+            f"DROP_U {x:.3f},{y:.3f},{u:.3f}"
+            if u is not None
+            else f"DROP {x:.3f},{y:.3f}"
+        )
+        with self._cmd_lock:
+            try:
+                resp = self._send(cmd, timeout=self._motion_timeout)
+            except (ConnectionError, OSError) as exc:
+                log.warning("robot.reconnecting_after_drop", reason=str(exc))
+                self._reconnect_sync()
+                resp = self._send(cmd, timeout=self._motion_timeout)
+        if not resp.startswith("OK DROPPED"):
+            raise RuntimeError(f"DROP failed: {resp!r}")
+        log.info("robot.drop_complete", response=resp)
 
     async def halt(self) -> None:
         """
@@ -236,13 +310,11 @@ class EpsonT3BDriver:
     def _ring_on_sync(self) -> None:
         # Use connect_timeout (5 s) not motion_timeout — this is a digital IO
         # toggle, not a motion command. sort_server.prg must handle "RING_ON".
+        # Deliberately NO reconnect-on-drop here (unlike motion commands) —
+        # a light toggle isn't worth reopening a connection and potentially
+        # issuing new commands over. Caller already treats this as best-effort.
         with self._cmd_lock:
-            try:
-                resp = self._send("RING_ON", timeout=self._connect_timeout)
-            except (ConnectionError, OSError) as exc:
-                log.warning("robot.reconnecting_after_drop", reason=str(exc))
-                self._reconnect_sync()
-                resp = self._send("RING_ON", timeout=self._connect_timeout)
+            resp = self._send("RING_ON", timeout=self._connect_timeout)
         if "OK RING_ON" not in resp:
             raise RuntimeError(f"RING_ON failed: {resp!r}")
         log.info("robot.ring_light_on")
@@ -253,13 +325,14 @@ class EpsonT3BDriver:
         await loop.run_in_executor(None, self._ring_off_sync)
 
     def _ring_off_sync(self) -> None:
+        # Deliberately NO reconnect-on-drop here — see _ring_on_sync. This
+        # matters most during shutdown: ring_light_off() is the first thing
+        # the orchestrator calls when tearing down, and reconnecting here
+        # would open a fresh connection (and, via _reconnect_sync's own
+        # re-home step) issue a new motion command in the middle of what's
+        # supposed to be a clean shutdown.
         with self._cmd_lock:
-            try:
-                resp = self._send("RING_OFF", timeout=self._connect_timeout)
-            except (ConnectionError, OSError) as exc:
-                log.warning("robot.reconnecting_after_drop", reason=str(exc))
-                self._reconnect_sync()
-                resp = self._send("RING_OFF", timeout=self._connect_timeout)
+            resp = self._send("RING_OFF", timeout=self._connect_timeout)
         if "OK RING_OFF" not in resp:
             raise RuntimeError(f"RING_OFF failed: {resp!r}")
         log.info("robot.ring_light_off")
@@ -297,7 +370,7 @@ class EpsonT3BDriver:
         if not acquired:
             return
         try:
-            if self._halted:
+            if self._halted or self._shutting_down:
                 return
 
             # ── Reconnect path ───────────────────────────────────────────────
@@ -338,7 +411,19 @@ class EpsonT3BDriver:
         a connection drop, so this will succeed without user intervention in RC+.
         After reconnect, also sends HOME to lift Z to safe position — the robot
         may be anywhere if the previous move was interrupted mid-motion.
+
+        Raises ConnectionError immediately if shutdown has started, or if
+        halt() has been called — never reconnect (and never issue a fresh
+        HOME motion command) while the system is tearing down OR while a
+        safety fault has the robot halted. halt() closes the socket, which
+        makes any command already in flight land here; without this guard,
+        that would silently reopen the connection and re-home the robot
+        mid-e-stop, before the safety system has actually cleared.
         """
+        if self._shutting_down:
+            raise ConnectionError("Robot disconnected — shutdown in progress, not reconnecting")
+        if self._halted:
+            raise ConnectionError("Robot disconnected — halted by safety fault, not reconnecting")
         log.warning("robot.reconnect_start")
         if self._sock is not None:
             try:

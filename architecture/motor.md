@@ -263,7 +263,7 @@ Last updated: 2026-06-18
 | Type            | External threaded lead screw — carriage moves linearly along screw |
 | IP              | 172.16.9.60 |
 | Port            | **503** (same MCode/TCP protocol as rotary motor) |
-| Step counts     | ±50,000 steps confirmed safe by live manual jogging — do NOT change without re-testing |
+| Step counts     | ±1,575,000 steps (2026-08-19). ±200,000 ran successfully in production and is the confirmed-working baseline; increased +50,000 → 250,000, +100,000 → 350,000, 3x'd → 1,050,000, then 1.5x'd → 1,575,000, all same day (drop and aspire both, to stay symmetric) — later increases (past 1,050,000) driven by testing configs to reduce the pipette tip disturbing the specimen before capture, see DEV-16. This is now ~7.9x the last hand-jogged-confirmed value and lead screw travel limit is unconfirmed — watch closely for stall/hard-stop collision on the first real run at this value. |
 | Lead screw pitch | **Unknown** — work in raw steps only until pitch confirmed with Weifeng |
 | Manual          | `Software/MCode-V2.06-NOVA.pdf` (same as rotary motor) |
 
@@ -277,14 +277,29 @@ Flashed 2026-06-18. Survive power cycles.
 
 | Label | MCode body | Purpose |
 |-------|-----------|---------|
-| `G1`  | `MR -50000` + `H` + `E` | Drop / dispense — carriage moves forward |
-| `G2`  | `MR +50000` + `H` + `E` | Aspire / draw — carriage moves backward |
+| `G1`  | `VM=2400000` + `A=2000000` + `D=2000000` + `MR -1575000` + `H` + `E` | Drop / dispense — carriage moves forward |
+| `G2`  | `VM=2400000` + `A=2000000` + `D=2000000` + `MR +1575000` + `H` + `E` | Aspire / draw — carriage moves backward |
 
 Labels use `G*` prefix — confirmed safe in LMDAE firmware.
 Direction was confirmed and corrected during testing (initial assignment was reversed).
 
-> **To re-flash** after changing step counts: update `DROP_STEPS` / `ASPIRE_STEPS`
-> in `hardware_tests/linear_control.py` then re-run `upload`.
+**Velocity profile (2026-08-19):** `VM`/`A`/`D` were never set anywhere before this
+date — motor ran at factory/flash default the whole time. Queried live via
+`linear_control.py speed` and found to be `VM=768000, VI=1000, A=1000000,
+D=1000000` (already a fairly aggressive default, not a neglected slow one —
+at 1,050,000 steps this profile is accel/decel-dominated with only a short
+cruise phase, ~2.1s total move time). Increased to `VM=1200000, A=2000000,
+D=2000000` per explicit "aggressive" choice, after flagging that pushing
+speed and acceleration up together on an already-3x'd travel distance
+carries real stall risk (`ER=86`) that the step-count increases didn't.
+`VI` left unchanged at 1000 (low-speed starting kick, not requested to change).
+Same day, `VM` 2x'd again → `2400000` (`A`/`D` left unchanged — operator
+asked to increase "speed" specifically) while testing configs against the
+tip-disturbance issue (DEV-16).
+
+> **To re-flash** after changing step counts or velocity: update `DROP_STEPS` /
+> `ASPIRE_STEPS` / `VELOCITY_MAX` / `ACCEL` / `DECEL` in
+> `hardware_tests/linear_control.py` then re-run `upload`.
 
 ---
 

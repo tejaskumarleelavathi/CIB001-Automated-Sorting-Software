@@ -60,6 +60,27 @@ CREATE TABLE IF NOT EXISTS safety_events (
     cleared_at   DATETIME,
     FOREIGN KEY (run_id) REFERENCES runs(run_id)
 );
+
+-- A pick attempt interrupted before a specimen was ever aspirated (fault
+-- hit during imaging/moving/classifying — not during transit) is deleted
+-- from `picks` rather than left there as a fake/never-happened record, but
+-- a snapshot is kept here first so nothing is silently lost. See
+-- Orchestrator._cleanup_interrupted_attempt() (2026-08-18).
+CREATE TABLE IF NOT EXISTS pick_attempts_log (
+    log_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id           TEXT NOT NULL,
+    field_code       TEXT NOT NULL,
+    plate_id         TEXT NOT NULL,
+    well_position    TEXT NOT NULL,
+    pick_status      TEXT,
+    timestamp_start  DATETIME,
+    image_filename   TEXT,
+    robot_x          REAL,
+    robot_y          REAL,
+    reason           TEXT NOT NULL,
+    logged_at        DATETIME NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(run_id)
+);
 """
 
 
@@ -265,6 +286,45 @@ class Database:
             error_code="INTERRUPTED",
             error_message="Pick was in progress when power was cut or software crashed",
         )
+
+    def log_interrupted_attempt(self, pick: Pick, reason: str) -> None:
+        """
+        Snapshot a pick attempt that's about to be deleted from `picks` — see
+        delete_pick(). Always call this first so nothing is silently lost.
+        """
+        self._conn().execute(
+            """
+            INSERT INTO pick_attempts_log
+                (run_id, field_code, plate_id, well_position, pick_status,
+                 timestamp_start, image_filename, robot_x, robot_y, reason, logged_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                pick.run_id,
+                pick.field_code,
+                pick.plate_id,
+                pick.well_position,
+                pick.pick_status,
+                pick.timestamp_start.isoformat() if pick.timestamp_start else None,
+                pick.image_filename,
+                pick.robot_x,
+                pick.robot_y,
+                reason,
+                datetime.now().isoformat(),
+            ),
+        )
+        self._conn().commit()
+
+    def delete_pick(self, pick_id: int) -> None:
+        """
+        Remove a pick row entirely — used only for attempts interrupted
+        BEFORE a specimen was ever aspirated (never actually happened, so it
+        shouldn't linger in `picks` as if it did). Call log_interrupted_attempt()
+        first. Never used for attempts where a specimen was in the pipette —
+        those get delivered and recorded as a real success/fail instead.
+        """
+        self._conn().execute("DELETE FROM picks WHERE pick_id = ?", (pick_id,))
+        self._conn().commit()
 
     @staticmethod
     def _row_to_pick(row: sqlite3.Row) -> Pick:

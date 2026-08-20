@@ -42,8 +42,11 @@ class TestMockRobotDriver:
         """Smoke test — should not raise."""
         await robot.move_to_image_site(100.0, 200.0)
 
-    async def test_execute_pick_place_completes(self, robot: MockRobotDriver) -> None:
-        await robot.execute_pick_place(10.0, 20.0, 100.0, 100.0)
+    async def test_execute_pick_completes(self, robot: MockRobotDriver) -> None:
+        await robot.execute_pick(10.0, 20.0)
+
+    async def test_execute_place_completes(self, robot: MockRobotDriver) -> None:
+        await robot.execute_place(100.0, 100.0)
 
     async def test_move_to_safe_park_completes(self, robot: MockRobotDriver) -> None:
         await robot.move_to_safe_park()

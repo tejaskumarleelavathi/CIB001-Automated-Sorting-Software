@@ -153,10 +153,31 @@ def test_protective_stop_resumes_with_start(sm: SystemStateMachine) -> None:
     assert sm.current == State.RUNNING
 
 
-def test_cannot_protective_stop_from_idle(sm: SystemStateMachine) -> None:
+def test_protective_stop_legal_from_idle(sm: SystemStateMachine) -> None:
+    """
+    Regression test for a real crash found 2026-08-18: the light curtain can
+    trip while nothing is running (e.g. between cycles) — this transition
+    must NOT raise. It used to (this test asserted the crash as "correct"
+    until this fix), which took the entire orchestrator backend down with
+    it (unhandled MachineError inside an asyncio.TaskGroup). Matches
+    safety_fault_estop, which already allowed IDLE as a source.
+    """
     sm.all_devices_ready()
-    with pytest.raises(MachineError):
-        sm.safety_fault_protective()
+    sm.safety_fault_protective()
+    assert sm.current == State.PROTECTIVE_STOP
+
+
+def test_protective_stop_from_idle_recovers_to_idle_not_running(sm: SystemStateMachine) -> None:
+    """
+    Recovering from a curtain trip that happened while IDLE must land back
+    in IDLE, not RUNNING — nothing was running before, so nothing should
+    start running now. Uses hardware_reset_complete, not start (start would
+    incorrectly begin a cycle nobody asked for).
+    """
+    sm.all_devices_ready()
+    sm.safety_fault_protective()
+    sm.hardware_reset_complete()
+    assert sm.current == State.IDLE
 
 
 # ── Fault (unrecoverable) ──────────────────────────────────────────────────────

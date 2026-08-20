@@ -23,6 +23,12 @@ ENV/
 htmlcov/
 .tox/
 
+# ── Backup files — working artifacts from editing scripts, not source ─────────
+*.bak
+
+# ── Generated test/diagnostic output ───────────────────────────────────────────
+software_tests/results/
+
 # ── Images — too large for git, backed up separately ──────────────────────────
 output/overhead_images/
 output/bugs_detected/

@@ -17,11 +17,24 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
 import structlog
 
+from cib.config.loader import PlateConfig
+from cib.data.database import Database
+from cib.data.storage import RunStorage
+from cib.data.models import (
+    Pick,
+    PickResult,
+    PickStatus,
+    Run,
+    RunStatus,
+    SafetyEvent,
+    SafetyEventType,
+)
 from cib.core.events import (
     AllDevicesReadyEvent,
     ConnectionLostEvent,
@@ -64,6 +77,16 @@ SAFETY_POLL_INTERVAL       = 0.10   # 100ms
 PLC_POLL_INTERVAL          = 0.10   # 100ms
 ROBOT_POLL_INTERVAL        = 0.20   # 200ms
 ROBOT_KEEPALIVE_INTERVAL_S = 0.5    # seconds — Epson TCP idle timer fires at ~1 s; 0.5s keeps well under it
+
+# Fine correction applied to the vision-computed PICK target only (2026-08-19,
+# see DEV-15 in prd_updated.md) — deliberately NOT in TLSet 2 (sort_server.prg)
+# and NOT in the plate config, after those approaches spent a full session
+# chasing what turned out to be a vision-calibration bug (DEV-14), not a tool-
+# offset one, and kept leaking the "fix" into DROP in the process. Living here
+# means it can only ever affect PICK. Re-tune/zero out once real picks confirm
+# whether it's still needed after the DEV-14 per-quadrant EoA fix.
+PICK_TARGET_CORRECTION_X_MM = -2.0
+PICK_TARGET_CORRECTION_Y_MM = 0.0
 
 
 @dataclass
@@ -115,6 +138,15 @@ class Orchestrator:
         centroid_snap_mm: float = 0.5,
         eoa_normal_exposure_us: float | None = None,
         eoa_backlight_on_exposure_us: float | None = None,
+        quadrant_split_y_mm: float | None = None,
+        u_top_deg: float | None = None,
+        u_bottom_deg: float | None = None,
+        plate_config: PlateConfig | None = None,
+        plate_u: float | None = None,
+        db_path: Path | None = None,
+        runs_base_dir: Path | None = None,
+        field_code: str = "DEV",
+        default_plate_id: str = "DEV-PLATE",
     ) -> None:
         self._drivers = drivers
         self._queue: asyncio.Queue[SystemEvent] = asyncio.Queue()
@@ -146,17 +178,75 @@ class Orchestrator:
         # Live light curtain state — updated every 100ms by safety poll loop.
         # Used to gate the CONTINUE button: must be False before reset-ack is sent.
         self._light_curtain_tripped = False
+        # Live "any Flexi fault latched" state — updated every 100ms. For
+        # E_STOP specifically, this stays True through button-released and
+        # awaiting-reset, and only clears once the FULL hardware reset
+        # sequence completes (reset button pressed too — bit 10 restored,
+        # "back to normal" per driver.py's confirmed bit map). Used to gate
+        # CONTINUE for e-stop the same way light_curtain_tripped gates it
+        # for the light curtain (FR-SAF-05: reset must fully complete first).
+        self._hardware_fault_active = True   # unknown/assume faulted until first poll
         # Current phase of the operating cycle — set throughout _run_cycle().
         # Used by _safe_recovery() to log what was interrupted and decide cleanup.
         self._cycle_phase = CyclePhase.IDLE
-        # EoA pixel-scale calibration — loaded lazily on first BUG detection.
-        # Populated from camera_calibration/output/eoa_pixel_scale.json.
-        self._eoa_pixel_scale: dict | None = None
+        # EoA pixel-scale calibration — loaded lazily, cached per-U (see DEV-13:
+        # the calibration is only valid at the U angle it was measured at, since
+        # the EoA camera physically rotates with U — u_top_deg/u_bottom_deg each
+        # need their own file). Keyed by the exact target_u float; None key =
+        # the old single un-quadranted eoa_pixel_scale.json fallback.
+        self._eoa_pixel_scale: dict[float | None, dict] = {}
         # EoA dual-exposure: backlight-OFF uses normal_exposure_us (full exposure for
         # classification), backlight-ON uses backlight_on_exposure_us (shorter to avoid
         # overexposure from the bright backlight). Both are None = don't change exposure.
         self._eoa_normal_exposure_us = eoa_normal_exposure_us
         self._eoa_backlight_on_exposure_us = eoa_backlight_on_exposure_us
+        # Quadrant-based U (wrist) angle selection — all three None disables it
+        # (move_to_image_site is called without u, robot holds current U, same
+        # as pre-2026-08-05 behavior). See _select_quadrant_u().
+        self._quadrant_split_y_mm = quadrant_split_y_mm
+        self._u_top_deg = u_top_deg
+        self._u_bottom_deg = u_bottom_deg
+        # Plate config for well-drop sequencing (2026-08-11, test-scoped —
+        # see prd_updated.md Appendix D for the not-yet-finalized production
+        # design). None = fall back to the old hardcoded stub coordinate.
+        self._plate_config = plate_config
+        self._plate_u = plate_u
+        self._next_well_index = 0
+
+        # ── Data layer (SQLite + per-run CSV) ──────────────────────────
+        # field_code/default_plate_id are placeholders until the real
+        # pre-run setup screen exists (PRD FR-SETUP-01) — see prd checklist.
+        self._db = Database(db_path) if db_path is not None else Database()
+        self._runs_base_dir = runs_base_dir
+        self._storage: RunStorage | None = None
+        self._current_run: Run | None = None
+        self._field_code = field_code
+        self._default_plate_id = default_plate_id
+        # In-flight pick row (DB) for whatever the cycle is currently doing.
+        self._current_pick: Pick | None = None
+        # Set the instant a specimen is confirmed aspirated (in the pipette
+        # tip), cleared the instant it's confirmed dispensed. If a safety
+        # fault interrupts the cycle while this is set, recovery MUST
+        # deliver this specimen to (well_x, well_y, well_u) before doing
+        # anything else — never lose it, never start a new pick on top of it.
+        # Tuple: (well_x, well_y, well_u, well_label, pick_id)
+        self._pending_well: tuple[float, float, float | None, str, int | None] | None = None
+        # DB row id of the currently-open (uncleared) safety event, if any.
+        self._current_safety_event_id: int | None = None
+        # What state we were in right before a safety fault interrupted us —
+        # captured in _evaluate_safety(). PROTECTIVE_STOP recovery uses this
+        # to decide whether to resume RUNNING or just settle back to IDLE:
+        # if nothing was running when the curtain tripped (e.g. it tripped
+        # between cycles), recovery must NOT start picking that was never
+        # asked for. Found 2026-08-18 via a live crash — see state_machine.py.
+        self._state_before_fault: State | None = None
+        # Image file paths saved so far by the CURRENT cycle attempt (reset
+        # at the top of every _run_cycle()). If that attempt gets interrupted
+        # before a specimen was ever aspirated, these get deleted — they'd
+        # otherwise be orphaned files with no completed pick record pointing
+        # at them. NOT touched on a normal reject or a normal success — both
+        # are complete, legitimate outcomes, not interruptions.
+        self._cycle_image_paths: list[str] = []
 
     # ------------------------------------------------------------------
     # Public API — called by UI via bridge (thread-safe)
@@ -193,6 +283,24 @@ class Orchestrator:
     @property
     def state(self) -> State:
         return self._sm.current
+
+    @property
+    def light_curtain_tripped(self) -> bool:
+        """Live light-curtain state, updated every 100ms by the safety poll.
+        Used by the UI to gate the CONTINUE button (FR-UI-05)."""
+        return self._light_curtain_tripped
+
+    @property
+    def hardware_fault_active(self) -> bool:
+        """
+        Live "any Flexi fault latched" state, updated every 100ms. Stays
+        True through an e-stop's entire hardware reset sequence (button
+        released, awaiting reset) and only clears once the reset button has
+        actually been pressed too. Used by the UI to gate CONTINUE for
+        E_STOP the same way light_curtain_tripped gates it for the light
+        curtain (FR-SAF-05).
+        """
+        return self._hardware_fault_active
 
     # ------------------------------------------------------------------
     # Main run loop
@@ -308,6 +416,7 @@ class Orchestrator:
             try:
                 status = await self._drivers.safety.read_status()
                 self._light_curtain_tripped = status["light_curtain_tripped"]
+                self._hardware_fault_active = status["any_fault_active"]
                 event = SafetyStatusEvent(
                     any_fault_active=status["any_fault_active"],
                     light_curtain_tripped=status["light_curtain_tripped"],
@@ -394,13 +503,16 @@ class Orchestrator:
             case AllDevicesReadyEvent():
                 sm.all_devices_ready()
                 await d.plc.set_status_light(StatusLight.GREEN)
+                await d.plc.set_work_light(True)
 
             # ---- Operator commands ----
             case OperatorStartEvent():
                 if sm.is_safe_to_start():
                     sm.start()
                     self._visited_centroids.clear()   # fresh run — reset visited set
-                    await d.plc.set_status_light(StatusLight.GREEN)
+                    await self._ensure_run_open()
+                    await d.plc.set_status_light(StatusLight.RUNNING)
+                    await d.plc.set_work_light(False)
                     await d.lighting.set_backlight(True)
                     log.info("orchestrator.backlight_on")
                     if not self._cycle_active:
@@ -419,39 +531,138 @@ class Orchestrator:
                     # CYCLE_STOPPING at its next exit point and call _finish_stop().
 
             case OperatorAbortEvent():
+                # Guard against illegal transitions the same way every other
+                # handler in this match does (is_safe_to_start(), is_running(),
+                # etc.) — found via testing: sm.abort() unconditionally raises
+                # MachineError from RUNNING (abort is only legal from IDLE,
+                # CYCLE_STOPPING, E_STOP, PROTECTIVE_STOP, FAULT — matches the
+                # ABORT button's own enable logic in main_window.py). Without
+                # this guard, an out-of-order call here doesn't just fail
+                # cleanly — it raises out of _handle_event uncaught, which
+                # crashes the whole asyncio.TaskGroup in run(): safety polling,
+                # PLC polling, and robot keepalive all die with it, silently.
+                if sm.current not in {
+                    State.IDLE, State.CYCLE_STOPPING, State.E_STOP,
+                    State.PROTECTIVE_STOP, State.FAULT,
+                }:
+                    log.warning("orchestrator.abort_ignored_illegal_state",
+                                state=sm.current.value,
+                                note="ABORT is only valid from IDLE/CYCLE_STOPPING/E_STOP/PROTECTIVE_STOP/FAULT")
+                    return
+                if self._pending_well is not None:
+                    # A specimen was aspirated when a safety fault interrupted the
+                    # cycle, and the operator chose ABORT instead of CONTINUE.
+                    # Deliver it to its intended well before closing the run —
+                    # exactly the same single motion CONTINUE would do. There is
+                    # no safety reason to treat this differently: the only thing
+                    # ABORT changes is that picking does NOT resume afterward.
+                    # Discarding or leaving it hanging in the tip would be worse
+                    # than finishing this one already-in-flight delivery.
+                    await self._deliver_pending_specimen()
+                else:
+                    # Nothing was aspirated — ABORT can be reached directly from
+                    # E_STOP/PROTECTIVE_STOP/FAULT without ever going through
+                    # CONTINUE (_safe_recovery()), so this cleanup has to happen
+                    # here too, not just there. See _cleanup_interrupted_attempt.
+                    await self._cleanup_interrupted_attempt(reason="operator_abort")
                 sm.abort()
                 await d.lighting.set_backlight(False)
                 await d.robot.move_to_safe_park()
                 await d.plc.set_status_light(StatusLight.AMBER)
+                await d.plc.set_work_light(True)
+                await self._close_run(RunStatus.ABORTED)
                 log.info("orchestrator.backlight_off")
 
             case OperatorAcknowledgeEvent():
                 if sm.current in {State.PROTECTIVE_STOP}:
-                    if self._light_curtain_tripped:
-                        # Light curtain still obstructed — block resume, warn UI.
+                    if self._light_curtain_tripped or self._hardware_fault_active:
+                        # Light curtain still obstructed, OR the physical blue
+                        # reset button hasn't been pressed yet. Corrected
+                        # 2026-08-18 from live hardware testing: this
+                        # installation's Flexi requires the SAME blue button
+                        # for light curtain recovery as for e-stop — the
+                        # original FR-SAF-08 assumption ("no button needed")
+                        # doesn't hold here. Checked independently of the UI's
+                        # own button-enable logic — never trust that alone for
+                        # a safety gate.
                         log.warning(
                             "orchestrator.continue_blocked",
-                            reason="light curtain still tripped — clear beam before pressing CONTINUE",
+                            reason="light curtain still tripped, or blue reset button not yet pressed",
+                            curtain_tripped=self._light_curtain_tripped,
+                            hardware_fault_active=self._hardware_fault_active,
                         )
                     else:
                         # Beam is clear — send reset-acknowledge to release latch,
                         # then recover to home before restarting the cycle.
                         await d.safety.send_reset_acknowledge()
-                        await self._safe_recovery()
-                        sm.start()
-                        await d.plc.set_status_light(StatusLight.GREEN)
-                        if not self._cycle_active:
-                            asyncio.create_task(self._run_cycle())
+                        robot_ok = await self._safe_recovery()
+                        await self._clear_safety_event()
+                        if not robot_ok:
+                            # Found 2026-08-18: a fault mid-motion can crash the
+                            # SPEL+ task itself (sort_server.prg's error handler
+                            # only covers the idle wait, not active motion — see
+                            # its header comment). Do NOT declare RUNNING with a
+                            # robot that isn't actually connected — that just
+                            # spins retrying forever while claiming to be fine.
+                            log.error(
+                                "orchestrator.recovery_failed_robot_unreachable",
+                                note="Robot did not reconnect — restart sort_server.prg "
+                                     "in RC+ (F5), then press ABORT to clear this and "
+                                     "start a new run.",
+                            )
+                            sm.fault()
+                            await d.plc.set_status_light(StatusLight.RED_CHASE)
+                            return
+                        if self._pending_well is not None:
+                            # Deliver whatever was already in the tip BEFORE any
+                            # new pick is allowed to start.
+                            await self._deliver_pending_specimen()
+                        if self._state_before_fault in (State.RUNNING, State.CYCLE_STOPPING):
+                            # Was actually running — resume, per FR-SAF-08 (no
+                            # separate START needed for this fault type).
+                            sm.start()
+                            await d.plc.set_status_light(StatusLight.RUNNING)
+                            await d.plc.set_work_light(False)
+                            if not self._cycle_active:
+                                asyncio.create_task(self._run_cycle())
+                        else:
+                            # Found 2026-08-18: the curtain can trip while
+                            # nothing is running at all (e.g. between cycles).
+                            # Settling straight back to IDLE, not RUNNING — do
+                            # not start picking that nobody asked for.
+                            sm.hardware_reset_complete()
+                            await d.plc.set_status_light(StatusLight.GREEN)
+                            await d.plc.set_work_light(True)
+                        self._state_before_fault = None
                 elif sm.current == State.E_STOP:
                     # E-stop is physically cleared (blue button pressed, contactor
                     # re-closed) — robot motor is back on. Safe to home now.
-                    await self._safe_recovery()
+                    robot_ok = await self._safe_recovery()
+                    await self._clear_safety_event()
+                    if not robot_ok:
+                        log.error(
+                            "orchestrator.recovery_failed_robot_unreachable",
+                            note="Robot did not reconnect — restart sort_server.prg "
+                                 "in RC+ (F5), then press ABORT to clear this and "
+                                 "start a new run.",
+                        )
+                        sm.fault()
+                        await d.plc.set_status_light(StatusLight.RED_CHASE)
+                        return
+                    if self._pending_well is not None:
+                        # Deliver whatever was already in the tip. Lands back in
+                        # IDLE afterward (below) — per FR-SAF-06, e-stop recovery
+                        # never auto-resumes RUNNING; a separate START is required.
+                        await self._deliver_pending_specimen()
                     sm.hardware_reset_complete()
-                    await d.plc.set_status_light(StatusLight.AMBER)
+                    await d.plc.set_status_light(StatusLight.GREEN)
+                    await d.plc.set_work_light(True)
+                    self._state_before_fault = None
 
             # ---- Shutdown ----
             case OperatorShutdownEvent():
                 log.info("orchestrator.shutdown_started")
+                await self._close_run(RunStatus.ABORTED)
                 try:
                     await d.robot.ring_light_off()
                 except Exception as exc:
@@ -492,7 +703,7 @@ class Orchestrator:
             case ConnectionLostEvent():
                 log.error("connection_lost", device=event.device.value, detail=event.detail)
                 sm.fault()
-                await d.plc.set_status_light(StatusLight.RED)
+                await d.plc.set_status_light(StatusLight.RED_CHASE)
 
             # ---- PLC event log ----
             case PLCEventLogEntry():
@@ -508,17 +719,24 @@ class Orchestrator:
         if sm.current not in {State.RUNNING, State.CYCLE_STOPPING, State.IDLE}:
             return  # already in a fault state
 
+        # Capture what we were doing before this fault, while sm.current is
+        # still the pre-fault state — recovery needs this to know whether to
+        # resume RUNNING or just settle back to IDLE (see constructor comment).
+        self._state_before_fault = sm.current
+
         if status.estop_active:
             log.warning("safety.estop_detected", button=status.estop_button_index)
             await self._drivers.robot.halt()
             sm.safety_fault_estop()
             await self._drivers.plc.set_status_light(StatusLight.RED)
+            await self._record_safety_event(SafetyEventType.ESTOP)
 
         elif status.light_curtain_tripped:
             log.warning("safety.light_curtain_tripped")
             await self._drivers.robot.halt()
             sm.safety_fault_protective()
-            await self._drivers.plc.set_status_light(StatusLight.AMBER)
+            await self._drivers.plc.set_status_light(StatusLight.RED_FLASH)
+            await self._record_safety_event(SafetyEventType.LIGHT_CURTAIN)
 
     # ------------------------------------------------------------------
     # Operating cycle — called as a background task when RUNNING
@@ -533,33 +751,67 @@ class Orchestrator:
         await d.lighting.set_backlight(False)
         await d.robot.move_to_safe_park()
         await d.plc.set_status_light(StatusLight.AMBER)
+        await d.plc.set_work_light(True)
         log.info("orchestrator.stopped")
 
-    async def _safe_recovery(self) -> None:
+    async def _safe_recovery(self) -> bool:
         """
-        Called after any safety fault (e-stop or protective stop) before
-        resuming normal operation.
+        Called after any safety fault (e-stop or protective stop), once the
+        operator has confirmed the hardware is physically clear/reset, and
+        BEFORE resuming normal operation.
 
         What it does:
+          0. Calls robot.resume() to clear the driver's halted flag — until
+             this is called, the driver refuses to reconnect at all (see
+             cib/drivers/robot/driver.py _reconnect_sync), which is exactly
+             what we want DURING the fault but must be lifted before any of
+             the steps below can talk to the robot again.
           1. Waits for the active cycle task to exit (it will have raised on
              the halted robot and set _cycle_active=False in its finally block).
           2. Stops all camera streams (best-effort — may already be stopped).
           3. Turns ring light off (best-effort — may already be off).
-          4. Sends HOME: sort_server.prg moves Z to SAFE (-47.700mm) first,
+          4. Turns backlight ON (best-effort) — every cycle assumes it starts
+             this way; a fault mid-EoA-capture would otherwise leave it off.
+          5. Restores EoA camera exposure to normal (best-effort) — a fault
+             mid-EoA-capture could otherwise leave the shorter backlight-on
+             exposure active for the next cycle's classification frame.
+          6. Sends HOME: sort_server.prg moves Z to SAFE (-47.700mm) first,
              then XY. This means the pipette tip retracts before any horizontal
              movement, so it is safe regardless of what phase was interrupted.
 
-        Note on pick-place (future):
-          When PUMP_ASPIRATING is implemented, a bug may be in the tip at the
-          moment of e-stop. For now (pick-place is a TODO stub), the robot is
-          never in a pick state, so unconditional HOME is always correct.
-          When pick-place is wired in, add a phase check here:
-            if self._cycle_phase == CyclePhase.PUMP_ASPIRATING:
-                # dispense-in-place before homing to avoid losing the specimen
+        Homing here is always correct even if a specimen is still in the
+        pipette — retracting up and going home never drops it. Delivering an
+        in-transit specimen to its well is a SEPARATE step the caller runs
+        AFTER this returns, once self._pending_well is set — see
+        _deliver_pending_specimen() and the OperatorAcknowledgeEvent handler.
+
+        Returns True if the robot actually reconnected and homed, False
+        otherwise. Found 2026-08-18: if the fault interrupted the robot
+        mid-motion, sort_server.prg's own error handling doesn't cover that
+        (only covers the idle Line Input wait — see sort_server.prg header),
+        so the SPEL+ task itself can crash, leaving nothing listening on
+        port 2000. Homing then fails with a plain connection-refused error.
+        The caller MUST check this return value and refuse to resume RUNNING
+        if it's False — otherwise the system declares itself "running" while
+        the robot is silently disconnected, and just spins retrying forever.
         """
         d = self._drivers
         phase = self._cycle_phase
-        log.info("orchestrator.safe_recovery_start", interrupted_phase=phase.name)
+        log.info("orchestrator.safe_recovery_start", interrupted_phase=phase.name,
+                 specimen_pending=self._pending_well is not None)
+
+        # If nothing was aspirated yet, this interrupted attempt never
+        # actually became a pick — clean it up so the next cycle starts
+        # completely fresh (see _cleanup_interrupted_attempt docstring).
+        # Pure DB/filesystem work, independent of robot connectivity, so do
+        # it regardless of whether homing below succeeds.
+        if self._pending_well is None:
+            await self._cleanup_interrupted_attempt(reason=f"safety_fault_during_{phase.name}")
+
+        try:
+            d.robot.resume()
+        except Exception as exc:
+            log.error("orchestrator.safe_recovery_resume_failed", error=str(exc))
 
         # Wait for the cycle task to finish cleaning up (up to 10s).
         # When _evaluate_safety() calls robot.halt(), the active motion command
@@ -582,25 +834,232 @@ class Orchestrator:
             except Exception:
                 pass
 
-        # Ring light off (best-effort)
+        # Ring light off (best-effort) — only ever meant to be on briefly
+        # during EoA capture, never a resting state.
         try:
             await d.robot.ring_light_off()
         except Exception:
             pass
 
+        # Backlight ON (best-effort) — every cycle's Step 1 assumes it's
+        # already on (see _run_cycle() comment: "Backlight already on").
+        # If the fault interrupted mid-EoA-capture, where it's briefly OFF
+        # for the ring-light image, it would otherwise stay off and starve
+        # the next cycle's overhead capture of light.
+        try:
+            await d.lighting.set_backlight(True)
+        except Exception:
+            pass
+
+        # EoA exposure restored to normal (best-effort) — mid-EoA-capture,
+        # exposure is briefly switched to the shorter backlight-on setting
+        # and switched back at the end of that block. If the fault hit in
+        # between, the next cycle's classification frame would otherwise be
+        # captured at the wrong (too-short) exposure.
+        if self._eoa_normal_exposure_us is not None:
+            try:
+                await d.camera_eoa.set_exposure(self._eoa_normal_exposure_us)
+            except Exception:
+                pass
+
         # Home the robot — Z retracts before XY, so always safe
+        homed = False
         try:
             await d.robot.move_to_safe_park()
+            homed = True
             log.info("orchestrator.safe_recovery_homed", from_phase=phase.name)
         except Exception as exc:
             log.error(
                 "orchestrator.safe_recovery_home_failed",
                 error=str(exc),
-                note="Robot did not home — manual intervention required before resuming",
+                note="Robot did not home — check sort_server.prg is still running in "
+                     "RC+ (F5 to restart it), then press CONTINUE again.",
             )
 
         self._cycle_phase = CyclePhase.IDLE
-        log.info("orchestrator.safe_recovery_complete")
+        log.info("orchestrator.safe_recovery_complete", robot_reconnected=homed)
+        return homed
+
+    async def _deliver_pending_specimen(self) -> None:
+        """
+        A specimen was already confirmed aspirated (self._pending_well is
+        set) when a safety fault interrupted the cycle. Called by the
+        OperatorAcknowledgeEvent handler, immediately after _safe_recovery()
+        (robot already re-homed), and BEFORE anything else is allowed to run
+        — this is the hard gate that prevents a new pick from ever starting
+        while a specimen is still physically in the tip.
+
+        Delivers the specimen to its originally-intended well and marks that
+        pick as successfully completed (DB + CSV) — nothing is lost.
+        """
+        if self._pending_well is None:
+            return
+        d = self._drivers
+        well_x, well_y, well_u, well_label, pick_id = self._pending_well
+        log.warning("orchestrator.delivering_interrupted_specimen",
+                    well=well_label, well_xy=f"({well_x:.1f}, {well_y:.1f})")
+        try:
+            self._cycle_phase = CyclePhase.PUMP_DISPENSING
+            if pick_id is not None:
+                await self._db_update_pick_status(pick_id, PickStatus.DISPENSING)
+            await d.robot.execute_place(well_x, well_y, well_u)
+            log.info("orchestrator.interrupted_specimen_delivered", well=well_label)
+            if pick_id is not None:
+                await self._db_finish_pick(pick_id, PickResult.SUCCESS)
+                if self._current_pick is not None:
+                    self._current_pick.result = PickResult.SUCCESS
+                    self._current_pick.timestamp_end = datetime.now()
+                    await self._csv_append(self._current_pick)
+            self._cycle_phase = CyclePhase.ROBOT_PARKING
+            await d.robot.move_to_safe_park()
+        except Exception as exc:
+            log.error(
+                "orchestrator.interrupted_specimen_delivery_failed",
+                well=well_label, error=str(exc),
+                note="MANUAL CHECK REQUIRED — specimen may still be in the pipette tip.",
+            )
+            if pick_id is not None:
+                await self._db_finish_pick(
+                    pick_id, PickResult.FAIL,
+                    error_code="DELIVERY_FAILED",
+                    error_message=f"Interrupted-specimen delivery to {well_label} failed: {exc}",
+                )
+        finally:
+            self._pending_well = None
+            self._current_pick = None
+            self._cycle_phase = CyclePhase.IDLE
+
+    # ------------------------------------------------------------------
+    # Data layer helpers — all DB calls are sync SQLite, run in executor
+    # ------------------------------------------------------------------
+
+    async def _db_start_pick(self, pick: Pick) -> int:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._db.start_pick, pick)
+
+    async def _db_update_pick_status(self, pick_id: int, status: str) -> None:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._db.update_pick_status, pick_id, status)
+
+    async def _db_finish_pick(
+        self, pick_id: int, result: str,
+        error_code: str | None = None, error_message: str | None = None,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, self._db.finish_pick, pick_id, result, datetime.now(), error_code, error_message
+        )
+
+    async def _csv_append(self, pick: Pick) -> None:
+        if self._storage is None:
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._storage.append_pick, pick)
+
+    async def _record_safety_event(self, event_type: str) -> None:
+        if self._current_run is None or self._current_safety_event_id is not None:
+            return   # already have an open event, or no run to attach it to
+        loop = asyncio.get_running_loop()
+        event = SafetyEvent(
+            run_id=self._current_run.run_id, event_type=event_type, triggered_at=datetime.now(),
+        )
+        self._current_safety_event_id = await loop.run_in_executor(
+            None, self._db.record_safety_event, event
+        )
+
+    async def _clear_safety_event(self) -> None:
+        if self._current_safety_event_id is None:
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._db.clear_safety_event, self._current_safety_event_id)
+        self._current_safety_event_id = None
+
+    async def _cleanup_interrupted_attempt(self, reason: str) -> None:
+        """
+        Called on recovery (CONTINUE or ABORT) whenever a cycle was
+        interrupted BEFORE a specimen was ever aspirated (self._pending_well
+        is None — if it's set, that's the transit case, handled separately
+        by _deliver_pending_specimen(), never this method).
+
+        This is the "start completely fresh" behavior for every stage other
+        than transit: if a fault hit mid-imaging, mid-moving, or
+        mid-classifying, that attempt never actually happened, so:
+          1. Any images already saved for it (self._cycle_image_paths) are
+             deleted from disk — they're orphaned, nothing will ever
+             reference them from a completed record.
+          2. If a picks-table row was already created for it (self._current_pick,
+             set at Step 8 in _run_cycle), it's snapshotted into
+             pick_attempts_log (nothing is silently lost) and then deleted
+             from `picks` — it never resulted in a real pick, so it
+             shouldn't linger there looking like one.
+          3. The next cycle starts fresh from Step 1 (overhead image) —
+             already true by construction, nothing extra needed: the next
+             _run_cycle() call always starts at Step 1 regardless.
+          4. The well-fill sequence is untouched — _next_well_index only
+             advances when _get_next_well_coords() is actually called
+             (Step 8, right before committing to a pick), so an attempt
+             that never got that far never advanced it. The next successful
+             pick still goes to the next assigned well, not back to the start.
+        """
+        import os
+
+        if self._current_pick is not None and self._current_pick.pick_id is not None:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None, self._db.log_interrupted_attempt, self._current_pick, reason
+            )
+            await loop.run_in_executor(None, self._db.delete_pick, self._current_pick.pick_id)
+            log.info("orchestrator.interrupted_pick_deleted",
+                     well=self._current_pick.well_position, reason=reason)
+            self._current_pick = None
+
+        for path in self._cycle_image_paths:
+            try:
+                os.remove(path)
+                log.debug("orchestrator.interrupted_image_deleted", path=path)
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                log.warning("orchestrator.interrupted_image_delete_failed", path=path, error=str(exc))
+        self._cycle_image_paths = []
+
+    async def _ensure_run_open(self) -> None:
+        """
+        Create a new Run row + CSV file if none is currently open. Pressing
+        START again after a CYCLE STOP (without ABORT in between) continues
+        the SAME run — only ABORT/SHUTDOWN or a fresh start after one of
+        those creates a new run id.
+
+        field_code/plate_id are placeholders (see constructor) until the
+        real pre-run setup screen exists (PRD FR-SETUP-01).
+        """
+        if self._current_run is not None:
+            return
+        loop = asyncio.get_running_loop()
+        run = Run(
+            run_id=f"run_{datetime.now():%Y%m%d_%H%M%S}",
+            field_code=self._field_code,
+            started_at=datetime.now(),
+        )
+        await loop.run_in_executor(None, self._db.create_run, run)
+        self._storage = await loop.run_in_executor(
+            None, RunStorage, run.run_id, self._runs_base_dir
+        )
+        self._current_run = run
+        self._next_well_index = 0
+        log.info("orchestrator.run_opened", run_id=run.run_id, field_code=run.field_code)
+
+    async def _close_run(self, status: str) -> None:
+        if self._current_run is None:
+            return
+        loop = asyncio.get_running_loop()
+        run_id = self._current_run.run_id
+        await loop.run_in_executor(None, self._db.finish_run, run_id, status, self._next_well_index)
+        if self._storage is not None:
+            await loop.run_in_executor(None, self._storage.close)
+        log.info("orchestrator.run_closed", run_id=run_id, status=status)
+        self._current_run = None
+        self._storage = None
 
     async def _run_cycle(self) -> None:
         """
@@ -623,6 +1082,7 @@ class Orchestrator:
 
         self._cycle_active = True
         self._cycle_phase = CyclePhase.OVERHEAD_CAPTURE
+        self._cycle_image_paths = []   # fresh slate — see constructor comment
         d = self._drivers
         log.info("cycle.start")
 
@@ -721,10 +1181,15 @@ class Orchestrator:
             # have the full 1 Gbps link with zero contention.
             # Start backlight OFF and robot motion simultaneously — backlight
             # settles in <1s while robot travels (30–60s at 5% speed).
+            # Quadrant U selection: pick once here, reuse for the Step 7
+            # correction move below (that move is a tiny EoA-derived delta —
+            # always the same quadrant — so recomputing would be redundant
+            # and risks flip-flopping right at the quadrant boundary).
+            target_u = self._select_quadrant_u(target_y)
             self._cycle_phase = CyclePhase.ROBOT_MOVING
             await asyncio.gather(
                 d.lighting.set_backlight(False),
-                d.robot.move_to_image_site(target_x, target_y),
+                d.robot.move_to_image_site(target_x, target_y, u=target_u),
             )
             log.info("orchestrator.backlight_off_for_eoa")
 
@@ -750,16 +1215,26 @@ class Orchestrator:
             log.debug("cycle.eoa_captured_no_backlight")
 
             # Frame 2: backlight ON, ring light ON — reduced exposure to avoid overexposure.
-            # Switch to shorter exposure BEFORE turning the backlight on, then drain both
-            # buffer slots to flush any frames at the old exposure. The keeper is the first
-            # frame guaranteed to be post-backlight AND at the new shorter exposure.
+            # This is now the frame Step 5 actually classifies on (see below) — the
+            # no_backlight frame proved too dark for reliable segmentation on this
+            # hardware (2026-08-11 diagnosis: Otsu called 70-100% of it "foreground",
+            # tripping the coverage guard before real classification even ran).
+            #
+            # Switch to shorter exposure BEFORE turning the backlight on, then drain
+            # several buffer frames. This isn't just exposure settling (fast, ~1
+            # frame) — the camera's Continuous auto-white-balance also needs frames
+            # to converge to the new backlight+ring-light colour mix. Draining only 2
+            # left a yellow cast from the previous ring-light-only WB gains still
+            # baked into the keeper frame. 6 gives real margin; tune down if this
+            # proves excessive — each EoA capture is throttled to ~1fps (max_fps in
+            # machine_config.yaml), so every extra drained frame costs ~1s of cycle time.
             if self._eoa_backlight_on_exposure_us is not None:
                 await d.camera_eoa.set_exposure(self._eoa_backlight_on_exposure_us)
                 log.debug("cycle.eoa_exposure_switched",
                           exposure_us=self._eoa_backlight_on_exposure_us)
             await d.lighting.set_backlight(True)
-            await d.camera_eoa.capture()   # drain slot[0] — old exposure / pre-backlight
-            await d.camera_eoa.capture()   # drain slot[1] — old exposure / pre-backlight
+            for _ in range(6):
+                await d.camera_eoa.capture()   # drain — exposure settle + WB convergence
             eoa_frame_with_backlight = await d.camera_eoa.capture()
             log.debug("cycle.eoa_captured_with_backlight")
             # Leave backlight ON — overhead camera needs it for the next cycle.
@@ -782,20 +1257,25 @@ class Orchestrator:
                 log.warning("cycle.ring_light_off_failed", error=str(exc))
 
             # ── Step 5: EoA vision analysis ───────────────────────────────
-            # Run on no_backlight frame (ring light only — best contrast for classification).
+            # Run on the WITH-backlight frame — see the capture comment above for
+            # why (no_backlight is too dark on this hardware). Its residual colour
+            # cast doesn't trip the chroma gate for dark bug bodies (validated
+            # against real captures — see software_tests/diagnose_eoa_20260811.py).
             self._cycle_phase = CyclePhase.EOA_VISION
             eoa_result = await loop.run_in_executor(
-                None, self._run_vision_eoa, eoa_frame_no_backlight, target_x, target_y
+                None, self._run_vision_eoa, eoa_frame_with_backlight, target_x, target_y
             )
 
             # Save both frames — done AFTER analysis so with_backlight is annotated
             # with a green + crosshair (tool centre) and cyan dot (body centre).
             # Comparing those two markers tells you if the robot is on the bug.
-            await loop.run_in_executor(
+            saved_paths = await loop.run_in_executor(
                 None, self._save_eoa_frames,
                 eoa_frame_no_backlight, eoa_frame_with_backlight,
                 eoa_result.body_center_px or None,
             )
+            if saved_paths is not None:
+                self._cycle_image_paths.extend(saved_paths)
 
             # ── VIEW: show EoA annotated image ────────────────────────────
             if self._view and eoa_result.frame_path:
@@ -832,14 +1312,25 @@ class Orchestrator:
             body_center_px = eoa_result.body_center_px
             if body_center_px:
                 corrected_x, corrected_y = self._compute_eoa_correction(
-                    body_center_px, eoa_frame_no_backlight.shape, target_x, target_y
+                    body_center_px, eoa_frame_with_backlight.shape, target_x, target_y,
+                    target_u,
                 )
+                # Fine correction applied ONLY to the vision-computed PICK target,
+                # deliberately not to TLSet 2 or the plate config (2026-08-19,
+                # see DEV-15) — those were reverted to their true original values
+                # after several rounds of chasing this as a tool-offset problem
+                # turned out to be misdiagnosed (the real cause was DEV-14's
+                # unrecorded-U EoA calibration). Living here means it can only
+                # ever affect PICK, never leak into DROP the way the tool-offset/
+                # well-config approach kept doing.
+                corrected_x += PICK_TARGET_CORRECTION_X_MM
+                corrected_y += PICK_TARGET_CORRECTION_Y_MM
                 if corrected_x != target_x or corrected_y != target_y:
                     log.info("cycle.eoa_correction_moving",
                              overhead_xy=f"({target_x:.3f}, {target_y:.3f})",
                              corrected_xy=f"({corrected_x:.3f}, {corrected_y:.3f})")
                     self._cycle_phase = CyclePhase.ROBOT_MOVING
-                    await d.robot.move_to_image_site(corrected_x, corrected_y)
+                    await d.robot.move_to_image_site(corrected_x, corrected_y, u=target_u)
                     log.info("cycle.eoa_correction_complete",
                              pick_xy=f"({corrected_x:.3f}, {corrected_y:.3f})")
 
@@ -856,9 +1347,11 @@ class Orchestrator:
                         frame_corrected = await d.camera_eoa.capture()
                         await d.camera_eoa.stop_streaming()
                         await d.robot.ring_light_off()
-                        await loop.run_in_executor(
+                        corrected_path = await loop.run_in_executor(
                             None, self._save_corrected_frame, frame_corrected
                         )
+                        if corrected_path is not None:
+                            self._cycle_image_paths.append(corrected_path)
                     except Exception as exc:
                         log.warning("cycle.eoa_verification_capture_failed", error=str(exc))
 
@@ -866,12 +1359,59 @@ class Orchestrator:
             else:
                 refined_x, refined_y = target_x, target_y
 
-            # ── Step 8: Pick and place ────────────────────────────────────
-            # TODO: when full pick-place is implemented, execute here.
-            # For now: go home after positioning to test the pipeline end-to-end.
-            log.info("cycle.eoa_confirmed_bug",
-                     refined_x=refined_x, refined_y=refined_y,
-                     note="Pick-place not yet implemented — returning home")
+            # ── Step 8: Pick + drop — travels to the next well in sequence ──
+            # Test-scoped well sequencing (2026-08-11) — see
+            # prd_updated.md Appendix D for the not-yet-finalized production
+            # design (this is NOT that; see _get_next_well_coords() docstring).
+            well_x, well_y, well_label = self._get_next_well_coords()
+            log.info("cycle.picking", refined_x=refined_x, refined_y=refined_y,
+                     u=target_u, well=well_label, well_xy=f"({well_x:.1f}, {well_y:.1f})")
+
+            # Log this pick attempt now — from here on, a safety fault means
+            # a specimen may end up in the pipette, and recovery needs to
+            # know exactly which well it was headed to.
+            pick = Pick(
+                run_id=self._current_run.run_id if self._current_run else "NO_RUN",
+                field_code=self._field_code,
+                plate_id=self._default_plate_id,
+                well_position=well_label,
+                pick_status=PickStatus.MOVING_TO_PICK,
+                timestamp_start=datetime.now(),
+                image_filename=eoa_result.frame_path,
+                robot_x=refined_x, robot_y=refined_y,
+            )
+            pick.pick_id = await self._db_start_pick(pick)
+            self._current_pick = pick
+
+            self._cycle_phase = CyclePhase.ROBOT_PICK
+            await self._db_update_pick_status(pick.pick_id, PickStatus.ASPIRATING)
+            await d.robot.execute_pick(refined_x, refined_y, u=target_u)
+            log.info("cycle.pick_complete", refined_x=refined_x, refined_y=refined_y)
+
+            # Specimen is now physically in the tip — this is the hard gate:
+            # from this line until _deliver_pending_specimen() clears it,
+            # NOTHING may start a new pick, and any safety fault MUST
+            # deliver this specimen on recovery instead of losing it.
+            self._pending_well = (well_x, well_y, self._plate_u, well_label, pick.pick_id)
+            pick.pick_status = PickStatus.BUG_IN_PIPETTE
+            await self._db_update_pick_status(pick.pick_id, PickStatus.BUG_IN_PIPETTE)
+
+            self._cycle_phase = CyclePhase.ROBOT_TO_WELL
+            await self._db_update_pick_status(pick.pick_id, PickStatus.DISPENSING)
+            self._cycle_phase = CyclePhase.PUMP_DISPENSING
+            await d.robot.execute_place(well_x, well_y, self._plate_u)
+            log.info("cycle.pick_place_complete", refined_x=refined_x, refined_y=refined_y,
+                     well=well_label)
+
+            # Delivered successfully — clear the gate and record completion.
+            pick.result = PickResult.SUCCESS
+            pick.pick_status = PickStatus.DONE
+            pick.timestamp_end = datetime.now()
+            await self._db_finish_pick(pick.pick_id, PickResult.SUCCESS)
+            await self._csv_append(pick)
+            self._pending_well = None
+            self._current_pick = None
+
             self._cycle_phase = CyclePhase.ROBOT_PARKING
             await d.robot.move_to_safe_park()
             log.info("orchestrator.robot_returning_backlight_already_on")
@@ -884,6 +1424,19 @@ class Orchestrator:
 
         except Exception as exc:
             err_str = str(exc)
+            in_safety_stop = self._sm.current in {State.E_STOP, State.PROTECTIVE_STOP}
+
+            # A pick was in flight when this failed. If a specimen was
+            # already aspirated (self._pending_well set), leave it alone —
+            # it's not lost, recovery will deliver it. Otherwise, this pick
+            # never got the specimen — safe to mark it failed and retry.
+            if self._current_pick is not None and self._pending_well is None and self._current_pick.pick_id is not None:
+                await self._db_finish_pick(
+                    self._current_pick.pick_id, PickResult.FAIL,
+                    error_code="INTERRUPTED", error_message=err_str[:250],
+                )
+                self._current_pick = None
+
             # Camera start_stream failures on USB-Ethernet adapters are
             # transient — don't FAULT, just retry the cycle after a delay.
             if "start_stream" in err_str or "GC_ERR_TIMEOUT" in err_str or "get_buffer" in err_str.lower():
@@ -894,10 +1447,21 @@ class Orchestrator:
                     await asyncio.sleep(3.0)
                     if self._sm.is_running():
                         asyncio.create_task(self._run_cycle())
+            elif in_safety_stop:
+                # _evaluate_safety() already transitioned us to E_STOP/
+                # PROTECTIVE_STOP concurrently — this exception is just the
+                # in-flight robot command reacting to halt(). Do NOT also
+                # call sm.fault() here: the state machine only allows one
+                # active fault state, and calling fault() would silently
+                # bounce us from E_STOP/PROTECTIVE_STOP into FAULT, which
+                # needs a different (harder) recovery path than what actually
+                # happened. Recovery is already correctly gated on the real
+                # state — nothing else to do here.
+                log.info("cycle.exited_on_safety_fault", state=self._sm.current.value)
             else:
                 log.error("cycle.error", error=str(exc))
                 self._sm.fault()
-                await d.plc.set_status_light(StatusLight.RED)
+                await d.plc.set_status_light(StatusLight.RED_CHASE)
                 try:
                     await d.lighting.set_backlight(False)
                 except Exception:
@@ -975,25 +1539,31 @@ class Orchestrator:
         frame_no_backlight,
         frame_with_backlight,
         body_center_px: tuple | None = None,
-    ) -> None:
+    ) -> tuple[str, str] | None:
         """
         Save both EoA frames with visual overlays on the with_backlight image:
 
-        backlight_off/  — raw no_backlight frame (ring light only, used by classifier)
-        backlight_on/   — with_backlight frame annotated with:
+        backlight_off/  — raw no_backlight frame (ring light only — archival record
+                          only; too dark for reliable classification on this hardware,
+                          see the Step 5 capture comment in _run_cycle())
+        backlight_on/   — with_backlight frame (used by classifier) annotated with:
             • Green +  at image centre  = robot tool tip (pick point)
             • Cyan dot at body_center_px = body centre found by classifier
             • Orange line connecting the two (shows offset before correction)
 
         If the green + and cyan dot coincide after the correction move,
         the robot is positioned correctly over the bug body.
+
+        Returns (path_no_backlight, path_with_backlight) as strings, or None
+        if saving is disabled — callers track these to delete them if this
+        cycle attempt ends up interrupted before ever aspirating a specimen.
         """
         import cv2
         import numpy as np
         from datetime import datetime
 
         if self._eoa_save_dir is None:
-            return
+            return None
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
 
@@ -1044,19 +1614,23 @@ class Orchestrator:
                  no_backlight=str(path_no_bl),
                  with_backlight=str(path_with_bl),
                  body_center_px=body_center_px or "n/a")
+        return (str(path_no_bl), str(path_with_bl))
 
-    def _save_corrected_frame(self, frame) -> None:
+    def _save_corrected_frame(self, frame) -> str | None:
         """
         Save a post-correction EoA frame (backlight ON) with only a green +
         crosshair at image centre. Bug should sit on the + if correction worked.
         Saved to backlight_on/eoa_corrected_{ts}.jpg alongside the pre-correction
         frame so you can compare before vs. after side-by-side.
+
+        Returns the saved path (str), or None if saving is disabled — see
+        _save_eoa_frames() docstring for why callers track this.
         """
         import cv2
         from datetime import datetime
 
         if self._eoa_save_dir is None:
-            return
+            return None
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         dir_with_bl = self._eoa_save_dir / "backlight_on"
@@ -1082,6 +1656,87 @@ class Orchestrator:
         path = dir_with_bl / f"eoa_corrected_{ts}.jpg"
         cv2.imwrite(str(path), vis)
         log.info("cycle.eoa_corrected_frame_saved", path=str(path))
+        return str(path)
+
+    def _select_quadrant_u(self, target_y: float) -> float | None:
+        """
+        Pick the wrist U angle (deg) for a target's robot-Y position, so the
+        arm can reach every quadrant of the dish.
+
+        robot_y >= quadrant_split_y_mm -> physical top    -> u_top_deg
+        robot_y <  quadrant_split_y_mm -> physical bottom -> u_bottom_deg
+
+        Returns None if quadrant U-selection is not configured (any of the
+        three config values missing) — callers should then omit u from
+        move_to_image_site(), which preserves the pre-2026-08-05 behavior of
+        holding whatever U the robot is currently at.
+        """
+        if (
+            self._quadrant_split_y_mm is None
+            or self._u_top_deg is None
+            or self._u_bottom_deg is None
+        ):
+            return None
+        return (
+            self._u_top_deg
+            if target_y >= self._quadrant_split_y_mm
+            else self._u_bottom_deg
+        )
+
+    def _load_eoa_pixel_scale(self, target_u: float | None) -> dict | None:
+        """
+        Load (and cache) the EoA pixel-scale calibration for a specific U angle.
+
+        The calibration is only valid at the U it was measured at — the EoA
+        camera physically rotates with U, so a matrix measured at one angle
+        does not correctly convert pixel offsets at another (see DEV-13,
+        2026-08-19: this was the actual root cause of PICK staying off in X
+        no matter how much the pipette tool offset was adjusted — the tool
+        offset was fine, the vision correction feeding it a target was not).
+
+        target_u = u_top_deg or u_bottom_deg  -> eoa_pixel_scale_u<target_u>.json
+        target_u = None (quadrant U-selection not configured) -> the old
+            single eoa_pixel_scale.json, for backward compatibility.
+        Falls back to the single file (with a warning) if a U-specific file
+        is requested but hasn't been calibrated yet.
+        """
+        import json
+
+        if target_u in self._eoa_pixel_scale:
+            return self._eoa_pixel_scale[target_u]
+
+        out_dir = Path(__file__).resolve().parents[2] / "camera_calibration" / "output"
+        if target_u is not None:
+            cal_path = out_dir / f"eoa_pixel_scale_u{target_u:g}.json"
+            if not cal_path.exists():
+                log.warning("cycle.eoa_correction_no_u_specific_cal",
+                            path=str(cal_path), target_u=target_u,
+                            note="No calibration for this U angle — falling back to the "
+                                 "un-quadranted eoa_pixel_scale.json (may be wrong for this "
+                                 "quadrant). Run: python hardware_tests/eoa_pixel_scale.py "
+                                 f"--u {target_u}")
+                cal_path = out_dir / "eoa_pixel_scale.json"
+        else:
+            cal_path = out_dir / "eoa_pixel_scale.json"
+
+        if not cal_path.exists():
+            log.warning("cycle.eoa_correction_no_cal",
+                        path=str(cal_path),
+                        note="No EoA pixel-scale calibration found — using overhead centroid "
+                             "as pick point. Run hardware_tests/eoa_pixel_scale.py --u <angle> "
+                             "to calibrate.")
+            self._eoa_pixel_scale[target_u] = None
+            return None
+
+        with open(cal_path) as f:
+            cal = json.load(f)
+        self._eoa_pixel_scale[target_u] = cal
+        log.info("cycle.eoa_pixel_scale_loaded",
+                 path=str(cal_path), target_u=target_u,
+                 cal_u_deg=cal.get("u_deg"),
+                 px_per_mm=cal.get("px_per_mm"),
+                 um_per_px=round(cal.get("mm_per_px", 0) * 1000, 2))
+        return cal
 
     def _compute_eoa_correction(
         self,
@@ -1089,12 +1744,14 @@ class Orchestrator:
         frame_shape: tuple,
         target_x: float,
         target_y: float,
+        target_u: float | None = None,
     ) -> tuple[float, float]:
         """
         Compute the corrected robot position so the bug body centre lands at the
         EoA image centre (= robot tool tip).
 
-        Uses the signed 2×2 calibration matrix from eoa_pixel_scale.json:
+        Uses the signed 2×2 calibration matrix from the per-U eoa_pixel_scale
+        file (see _load_eoa_pixel_scale — DEV-13):
             M @ [drob_x, drob_y]^T = [dcam_x, dcam_y]^T
         where camera_axis_x / delta_mm gives the camera-pixel shift per mm of
         robot X motion, and similarly for Y.
@@ -1104,31 +1761,15 @@ class Orchestrator:
             robot_delta         = M_inv @ camera_shift_needed
             corrected           = target + robot_delta
 
-        Returns (corrected_x, corrected_y) or (target_x, target_y) if the
-        calibration file is missing.
+        Returns (corrected_x, corrected_y) or (target_x, target_y) if no
+        calibration file is available for this U angle.
         """
-        import json
         import numpy as np
 
-        # Lazy-load calibration (load once, reuse across cycles)
-        if self._eoa_pixel_scale is None:
-            cal_path = (
-                Path(__file__).resolve().parents[2]
-                / "camera_calibration" / "output" / "eoa_pixel_scale.json"
-            )
-            if not cal_path.exists():
-                log.warning("cycle.eoa_correction_no_cal",
-                            path=str(cal_path),
-                            note="eoa_pixel_scale.json not found — using overhead centroid as pick point. "
-                                 "Run hardware_tests/eoa_pixel_scale.py to calibrate.")
-                return target_x, target_y
-            with open(cal_path) as f:
-                self._eoa_pixel_scale = json.load(f)
-            log.info("cycle.eoa_pixel_scale_loaded",
-                     px_per_mm=self._eoa_pixel_scale.get("px_per_mm"),
-                     um_per_px=round(self._eoa_pixel_scale.get("mm_per_px", 0) * 1000, 2))
+        cal = self._load_eoa_pixel_scale(target_u)
+        if cal is None:
+            return target_x, target_y
 
-        cal   = self._eoa_pixel_scale
         delta = cal["delta_mm"]
         dx_x, dy_x = cal["camera_axis_x"]   # camera pixel shift per delta_mm robot X
         dx_y, dy_y = cal["camera_axis_y"]   # camera pixel shift per delta_mm robot Y
@@ -1160,9 +1801,34 @@ class Orchestrator:
 
         return corrected_x, corrected_y
 
-    def _get_next_well_coords(self) -> tuple[float, float]:
-        """TODO: implement from plate layout + load order config."""
-        return (100.0, 100.0)
+    def _get_next_well_coords(self) -> tuple[float, float, str]:
+        """
+        Return (x, y, well_label) for the next well to drop into, advancing
+        the internal well index each call.
+
+        Test-scoped (2026-08-11) — sequential fill order from a single
+        loaded PlateConfig, wrapping back to the first well when the plate
+        is full (fine for repeated hardware testing; NOT correct production
+        behavior — production should stop/alert when a plate fills up, not
+        silently overwrite already-filled wells. See prd_updated.md
+        Appendix D — this whole area is still an open design question,
+        including whether one config covers one station or needs a
+        per-station registration offset).
+
+        Falls back to the old hardcoded (100.0, 100.0) placeholder if no
+        plate config was loaded (e.g. mock/dev runs without a real plate).
+        """
+        if self._plate_config is None or not self._plate_config.wells:
+            return (100.0, 100.0, "NONE")
+
+        wells = self._plate_config.wells
+        well = wells[self._next_well_index % len(wells)]
+        if self._next_well_index >= len(wells):
+            log.warning("cycle.plate_wrapped",
+                        note="well index wrapped past the end of the plate — "
+                             "test-scoped behavior, not correct for production")
+        self._next_well_index += 1
+        return (well.x, well.y, well.well)
 
     # ------------------------------------------------------------------
     # VIEW helpers — image display for testing (VIEW=True in main.py)
@@ -1172,36 +1838,60 @@ class Orchestrator:
     # the saved file paths for review.
 
     def _show_image(self, img: Any, title: str) -> None:
-        """Save image to disk and open with Windows default viewer (VIEW mode).
+        """Display an image for VIEW=True debugging — self-closing preview.
 
-        Uses os.startfile() — launches a separate Photos/viewer process so
-        there is no conflict with the PyQt6 main thread message pump.
+        Was os.startfile() until 2026-08-18: that opens a brand new external
+        Photos/viewer process EVERY cycle and never closes any of them — the
+        module docstring's own "3s" comment describes a timed auto-closing
+        preview that this never actually implemented. Over a long session
+        that's dozens of full-size (73MB decoded) viewer windows accumulating
+        indefinitely, which was very likely the dominant contributor to a
+        live OpenCV OutOfMemoryError (on top of the internal buffer reuse
+        fixed separately in cib/vision/pipeline.py — see draw_target_highlight).
+        cv2.imshow()/waitKey()/destroyWindow() shows the same preview inline,
+        in-process, and guarantees it's gone again after ~3s, every time.
         """
-        import os
-        import tempfile
-        from datetime import datetime
         import cv2
 
         h, w = img.shape[:2]
         log.info("view.image", title=title, shape=f"{w}x{h}")
-
-        save_dir = self._overhead_save_dir or Path(tempfile.gettempdir())
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        out_path = save_dir / f"overhead_target_{ts}.png"
         try:
-            cv2.imwrite(str(out_path), img, [cv2.IMWRITE_PNG_COMPRESSION, 3])
-            log.info("view.target_image_saved", path=str(out_path))
-            os.startfile(str(out_path))
+            cv2.namedWindow(title, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(title, min(1400, w), min(1000, h))
+            cv2.imshow(title, img)
+            cv2.waitKey(3000)
         except Exception as exc:
-            log.warning("view.image_open_failed", error=str(exc))
+            log.warning("view.image_show_failed", error=str(exc))
+        finally:
+            try:
+                cv2.destroyWindow(title)
+            except Exception:
+                pass
 
     def _show_image_path(self, path: str, title: str) -> None:
-        """Open a saved image with Windows default viewer (VIEW mode)."""
-        import os
+        """Display a saved image for VIEW=True debugging — self-closing preview.
+
+        See _show_image() — same fix, same reasoning (was os.startfile()).
+        """
+        import cv2
+
         if not path:
             return
         log.info("view.image_saved", title=title, path=path)
+        img = cv2.imread(path)
+        if img is None:
+            log.warning("view.image_show_failed", path=path, error="cv2.imread returned None")
+            return
         try:
-            os.startfile(path)
+            h, w = img.shape[:2]
+            cv2.namedWindow(title, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(title, min(1400, w), min(1000, h))
+            cv2.imshow(title, img)
+            cv2.waitKey(3000)
         except Exception as exc:
-            log.warning("view.image_open_failed", path=path, error=str(exc))
+            log.warning("view.image_show_failed", path=path, error=str(exc))
+        finally:
+            try:
+                cv2.destroyWindow(title)
+            except Exception:
+                pass

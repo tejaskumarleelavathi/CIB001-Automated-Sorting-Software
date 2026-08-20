@@ -10,8 +10,8 @@ along a lead screw.  All positions are in raw steps — do NOT assume a
 real-world distance until lead screw pitch is confirmed and measured.
 
 Programs stored on motor flash:
-  G1  →  MR +50000   (drop / dispense — carriage moves forward)
-  G2  →  MR -50000   (aspire / draw — carriage moves backward)
+  G1  →  MR -1575000  (drop / dispense — carriage moves forward)
+  G2  →  MR +1575000  (aspire / draw — carriage moves backward)
 
 Python just sends "EX G1" or "EX G2" to trigger them.  The motor
 executes the move autonomously and signals completion via the ">" prompt.
@@ -23,8 +23,8 @@ Labels G1 / G2 chosen because:
 
 Usage:
   python hardware_tests/linear_control.py upload    # flash G1+G2 to motor (run once)
-  python hardware_tests/linear_control.py drop      # execute G1 (forward 50000 steps)
-  python hardware_tests/linear_control.py aspire    # execute G2 (reverse 50000 steps)
+  python hardware_tests/linear_control.py drop      # execute G1 (forward 1575000 steps)
+  python hardware_tests/linear_control.py aspire    # execute G2 (reverse 1575000 steps)
   python hardware_tests/linear_control.py pos       # print position, no motion
   python hardware_tests/linear_control.py run       # interactive loop
 
@@ -43,9 +43,32 @@ import sys
 LINEAR_IP    = "172.16.9.60"
 LINEAR_PORT  = 503
 
-# ── Motion parameters (confirmed by live manual jogging on this unit) ─────────
-DROP_STEPS   = -200_000   # forward / dispense
-ASPIRE_STEPS =  200_000   # reverse / draw
+# ── Motion parameters ───────────────────────────────────────────────────────
+# 200,000 steps ran successfully in production — confirmed working baseline.
+# Increased +50,000 -> 250,000 -> +100,000 -> 350,000 -> 3x -> 1,050,000
+# (all 2026-08-19), then 1.5x -> 1,575,000 same day (operator testing
+# different aspirate configs to reduce the pipette tip disturbing/pushing
+# the specimen before it can be captured — see DEV-16). Drop increased by
+# the same amount every time to stay symmetric. This is now ~7.9x the last
+# value actually confirmed safe by hand-jogging (200,000) and lead screw
+# pitch/travel limit is still unconfirmed — watch closely for a stall or
+# hard-stop collision on the first real run at this value.
+DROP_STEPS   = -1_575_000   # forward / dispense
+ASPIRE_STEPS =  1_575_000   # reverse / draw
+
+# Velocity profile (steps/sec, steps/sec^2) — governs how FAST G1/G2 run,
+# completely separate from DROP_STEPS/ASPIRE_STEPS above (which only govern
+# how FAR). Never set anywhere in this file before 2026-08-19 — motor was
+# running at factory/flash default the whole time (VM=768000, VI=1000,
+# A=D=1000000). Increased to VM=1,200,000/A=D=2,000,000 same day, then VM
+# 2x'd -> 2,400,000 (A/D left unchanged — operator asked to increase
+# "speed" specifically, not acceleration) same day, testing configs for the
+# tip-disturbance issue (DEV-16). Baked into each program body (not set
+# once) since G1/G2 are separate onboard programs and each must set its own
+# profile explicitly.
+VELOCITY_MAX =  2_400_000   # VM
+ACCEL        =  2_000_000   # A
+DECEL        =  2_000_000   # D
 
 # ── Timing ────────────────────────────────────────────────────────────────────
 CMD_TIMEOUT_S   = 5.0    # max wait for a single command response
@@ -326,6 +349,22 @@ def print_position(sock: socket.socket) -> int:
     return pos
 
 
+def print_velocity(sock: socket.socket) -> None:
+    """
+    Read and display the motion profile actually governing G1/G2 right now:
+    VM (max velocity), VI (initial velocity), A (acceleration), D (deceleration)
+    — all in steps/sec (or steps/sec^2 for A/D). None of these are set anywhere
+    in this file's upload_programs(), so G1/G2 run at whatever the motor's
+    factory/flash default is. This queries the real, current values instead
+    of guessing.
+    """
+    for reg, label in (("VM", "Max velocity (VM)"), ("VI", "Initial velocity (VI)"),
+                        ("A", "Acceleration (A)"), ("D", "Deceleration (D)")):
+        resp, _ = send_cmd(sock, f"PR {reg}", verbose=False)
+        val = extract_value(resp, f"PR {reg}")
+        print(f"[VEL]   {label:24s} = {val or '(no response)'}")
+
+
 def run_program(sock: socket.socket, label: str, description: str) -> None:
     """
     Execute a stored onboard program by label name and wait for completion.
@@ -372,8 +411,8 @@ def _pgm_or_die(sock: socket.socket, command: str) -> None:
 def upload_programs(sock: socket.socket) -> None:
     """
     Flash two programs to the motor's non-volatile flash memory:
-      G1  →  MR +50000   (drop / forward / dispense)
-      G2  →  MR -50000   (aspire / reverse / draw)
+      G1  →  VM=/A=/D= + MR -1575000   (drop / forward / dispense)
+      G2  →  VM=/A=/D= + MR +1575000   (aspire / reverse / draw)
 
     Full sequence:
       1.  Check motor is not moving (Error 73 if CP/PG run while moving)
@@ -385,8 +424,9 @@ def upload_programs(sock: socket.socket) -> None:
 
     Label choice: G1/G2 — 'G' prefix confirmed safe in LMDAE firmware.
     Avoid: F* (reserved, causes ER=24), R* (RT = return cmd), SU (auto-runs on boot).
-    Each program ends with H (hold — waits for move to finish) then E (end).
-    H is CRITICAL: without it the program exits before the carriage stops moving.
+    Each program sets VM/A/D (velocity profile), then MR (the move), then
+    H (hold — waits for move to finish), then E (end). H is CRITICAL:
+    without it the program exits before the carriage stops moving.
     """
 
     # ── Guard: must not be moving ─────────────────────────────────────────────
@@ -426,15 +466,21 @@ def upload_programs(sock: socket.socket) -> None:
     print("[OK]    In program mode.\n")
 
     # ── Write programs ────────────────────────────────────────────────────────
+    # VM/A/D set INSIDE each program body — G1 and G2 are separate onboard
+    # programs, so each must set its own velocity profile explicitly rather
+    # than relying on whatever an earlier immediate-mode command left behind.
     programs = [
         # (label,  move_cmd,                  description)
-        ("G1", f"MR {DROP_STEPS}",   f"drop / forward  (+{DROP_STEPS} steps)"),
+        ("G1", f"MR {DROP_STEPS}",   f"drop / forward  ({DROP_STEPS} steps)"),
         ("G2", f"MR {ASPIRE_STEPS}", f"aspire / reverse ({ASPIRE_STEPS} steps)"),
     ]
 
     for label, move_cmd, desc in programs:
         print(f"  -- Program '{label}'  ({desc})")
         _pgm_or_die(sock, f"LB {label}")   # declare label
+        _pgm_or_die(sock, f"VM={VELOCITY_MAX}")   # max velocity
+        _pgm_or_die(sock, f"A={ACCEL}")           # acceleration
+        _pgm_or_die(sock, f"D={DECEL}")           # deceleration
         _pgm_or_die(sock, move_cmd)         # motion instruction
         _pgm_or_die(sock, "H")              # hold: wait for move to finish
         _pgm_or_die(sock, "E")              # end program
@@ -458,18 +504,22 @@ def upload_programs(sock: socket.socket) -> None:
         sys.exit(1)
 
     print("\n[UPLOAD] Done.")
-    print(f"         G1 = drop   (MR +{DROP_STEPS} steps, forward)")
+    print(f"         G1 = drop   (MR {DROP_STEPS} steps, forward)")
     print(f"         G2 = aspire (MR {ASPIRE_STEPS} steps, reverse)")
-    print("         Programs survive power cycles.  Re-run 'upload' only if step counts change.\n")
+    print(f"         VM={VELOCITY_MAX}  A={ACCEL}  D={DECEL}  (both programs)")
+    print("         Programs survive power cycles.  Re-run 'upload' if step counts OR velocity change.\n")
 
 
 # ── Interactive loop ──────────────────────────────────────────────────────────
 
 _HELP = """
   Commands:
-    drop    → execute G1  (forward  +50000 steps — dispense/drop)
-    aspire  → execute G2  (reverse  -50000 steps — draw/aspire)
+    drop    → execute G1  (forward  -1575000 steps — dispense/drop)
+    aspire  → execute G2  (reverse  +1575000 steps — draw/aspire)
     pos     → print current position (no motion)
+    speed   → print VM/VI/A/D — the actual current aspirate/drop velocity
+              profile (no motion). Never set in this file, so this is
+              whatever the motor's factory/flash default is.
     zero    → set current position as the new 0  (P=0, no motion)
     q       → quit
 """
@@ -492,6 +542,8 @@ def interactive_loop(sock: socket.socket) -> None:
             run_program(sock, "G2", "aspire (reverse)")
         elif cmd == "pos":
             print_position(sock)
+        elif cmd == "speed":
+            print_velocity(sock)
         elif cmd == "zero":
             _, ok = send_cmd(sock, "P=0")
             if ok:
@@ -510,9 +562,10 @@ def interactive_loop(sock: socket.socket) -> None:
 _USAGE = """
 Usage:
   python hardware_tests/linear_control.py upload    # flash G1+G2 to motor (run once)
-  python hardware_tests/linear_control.py drop      # forward  +50000 steps
-  python hardware_tests/linear_control.py aspire    # reverse  -50000 steps
+  python hardware_tests/linear_control.py drop      # forward  -1575000 steps
+  python hardware_tests/linear_control.py aspire    # reverse  +1575000 steps
   python hardware_tests/linear_control.py pos       # print position, no motion
+  python hardware_tests/linear_control.py speed     # print VM/VI/A/D velocity profile, no motion
   python hardware_tests/linear_control.py run       # interactive control loop
 """
 
@@ -522,7 +575,7 @@ def main() -> None:
         sys.exit(0)
 
     sub = sys.argv[1].lower()
-    if sub not in {"upload", "drop", "aspire", "pos", "run"}:
+    if sub not in {"upload", "drop", "aspire", "pos", "speed", "run"}:
         print(f"Unknown sub-command: '{sub}'\n{_USAGE}")
         sys.exit(1)
 
@@ -543,6 +596,8 @@ def main() -> None:
                 run_program(sock, "G2", "aspire (reverse)")
             elif sub == "pos":
                 print_position(sock)
+            elif sub == "speed":
+                print_velocity(sock)
             elif sub == "run":
                 interactive_loop(sock)
 

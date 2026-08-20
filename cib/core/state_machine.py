@@ -58,17 +58,24 @@ class SystemStateMachine:
         {"trigger": "start",              "source": "IDLE",             "dest": "RUNNING"},
         {"trigger": "cycle_stop",         "source": "RUNNING",          "dest": "CYCLE_STOPPING"},
         {"trigger": "cycle_complete",     "source": "CYCLE_STOPPING",   "dest": "IDLE"},
-        {"trigger": "abort",              "source": ["IDLE", "CYCLE_STOPPING", "E_STOP", "PROTECTIVE_STOP"], "dest": "IDLE"},
+        {"trigger": "abort",              "source": ["IDLE", "CYCLE_STOPPING", "E_STOP", "PROTECTIVE_STOP", "FAULT"], "dest": "IDLE"},
 
         # Resume after graceful stop
         {"trigger": "start",              "source": "CYCLE_STOPPING",   "dest": "RUNNING"},
 
         # Safety — e-stop (full reset required)
         {"trigger": "safety_fault_estop", "source": ["RUNNING", "CYCLE_STOPPING", "IDLE"], "dest": "E_STOP"},
-        {"trigger": "hardware_reset_complete", "source": "E_STOP",      "dest": "IDLE"},
+        {"trigger": "hardware_reset_complete", "source": ["E_STOP", "PROTECTIVE_STOP"], "dest": "IDLE"},
 
-        # Safety — protective stop (just press start)
-        {"trigger": "safety_fault_protective", "source": ["RUNNING", "CYCLE_STOPPING"], "dest": "PROTECTIVE_STOP"},
+        # Safety — protective stop (just press start). IDLE is a legal
+        # source too — found via a live crash 2026-08-18: the light curtain
+        # can trip while nothing is running (someone reaches in between
+        # cycles), and the orchestrator's own guard let it try this
+        # transition from IDLE without checking, hitting this exact gap and
+        # taking the whole backend down. hardware_reset_complete (not
+        # "start") is used to recover FROM that specific case, since nothing
+        # was running before the fault and nothing should start running now.
+        {"trigger": "safety_fault_protective", "source": ["RUNNING", "CYCLE_STOPPING", "IDLE"], "dest": "PROTECTIVE_STOP"},
         {"trigger": "start",              "source": "PROTECTIVE_STOP",  "dest": "RUNNING"},
 
         # Fault (unrecoverable)

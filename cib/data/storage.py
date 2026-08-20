@@ -49,9 +49,9 @@ class RunStorage:
         storage.close()             # called when run ends
     """
 
-    def __init__(self, run_id: str) -> None:
+    def __init__(self, run_id: str, base_dir: Path | None = None) -> None:
         self._run_id = run_id
-        self._run_dir = _BASE_DIR / run_id
+        self._run_dir = (base_dir if base_dir is not None else _BASE_DIR) / run_id
         self._run_dir.mkdir(parents=True, exist_ok=True)
         self._csv_path = self._run_dir / f"{run_id}_picks.csv"
 

@@ -17,8 +17,8 @@ STATUS LIGHT — register map confirmed 2026-06-18 via test_status_light.py:
   Reg 8  (40009) Secondary Intensity   (same values as Primary Intensity)
   Coil 0 (00001) Demo Mode             0=off 1=on
 
-WORK LIGHT — register address OQ-11 PENDING.
-  set_work_light() is a no-op until David confirms the register address.
+WORK LIGHT — confirmed 2026-08-18 via hardware_tests/test_work_light.py:
+  WorkLightOn -> coil 000001 -> pymodbus FC1/FC5 address 0.
 
 EVENT LOG — register address OQ-11 PENDING.
   read_event_log() returns [] until David confirms the register address.
@@ -52,8 +52,9 @@ REG_INTENS_PRI = 6   # 40007  primary intensity
 REG_COLOR_SEC  = 7   # 40008  secondary colour
 REG_INTENS_SEC = 8   # 40009  secondary intensity
 
-COIL_DEMO             = 0   # 00001  demo mode (turn off after use)
-COIL_STATUSLIGHT_SET  = 4   # 00005  pulse high→low to apply new register values
+COIL_WORK_LIGHT        = 0   # 00001  work light on/off — confirmed 2026-08-18
+COIL_DEMO              = 1   # 00002  demo mode (turn off after use)
+COIL_STATUSLIGHT_SET   = 4   # 00005  pulse high→low to apply new register values
 
 # Colour codes
 _COLOR = {
@@ -70,16 +71,22 @@ _MODE = {
 }
 
 # Status-light colour → (mode, primary_color, primary_intensity, secondary_color, anim_speed)
-# GREEN  = steady green   — system running normally
-# AMBER  = steady amber   — paused / cycle-stop / waiting
-# RED    = flashing red   — fault / e-stop / connection loss
-# OFF    = all off
+# GREEN     = steady green   — idle/ready, or e-stop/curtain just cleared
+# RUNNING   = chasing green  — actively running
+# AMBER     = steady amber   — cycle stopped / aborted, awaiting operator
+# RED       = steady red     — e-stop active
+# RED_FLASH = flashing red   — light curtain tripped (protective stop)
+# RED_CHASE = chasing red    — connection lost / unrecoverable fault
+# OFF       = all off
 _LIGHT_CONFIG: dict[str, tuple[int, int, int, int, int]] = {
     #               mode              pri_col  pri_int  sec_col  speed
-    "green":  (_MODE["steady"], _COLOR["green"],  0, _COLOR["green"],  1),
-    "amber":  (_MODE["steady"], _COLOR["amber"],  0, _COLOR["amber"],  1),
-    "red":    (_MODE["flash"],  _COLOR["red"],    0, _COLOR["red"],    1),
-    "off":    (_MODE["off"],    _COLOR["green"],  4, _COLOR["green"],  1),
+    "green":     (_MODE["steady"], _COLOR["green"], 0, _COLOR["green"], 1),
+    "running":   (_MODE["chase"],  _COLOR["green"], 0, _COLOR["green"], 1),
+    "amber":     (_MODE["steady"], _COLOR["amber"], 0, _COLOR["amber"], 1),
+    "red":       (_MODE["steady"], _COLOR["red"],   0, _COLOR["red"],   1),
+    "red_flash": (_MODE["flash"],  _COLOR["red"],   0, _COLOR["red"],   1),
+    "red_chase": (_MODE["chase"],  _COLOR["red"],   0, _COLOR["red"],   1),
+    "off":       (_MODE["off"],    _COLOR["green"], 4, _COLOR["green"], 1),
 }
 
 
@@ -127,6 +134,26 @@ class LogicPLCDriver:
             self._client = None
         log.info("plc.disconnected")
 
+    def _reconnect_sync(self) -> None:
+        """
+        Close and reopen the Modbus connection.
+
+        Found 2026-08-18: the P1-622 silently closes an idle TCP connection —
+        connect() succeeds fine at startup, but if ~20-30s pass with no
+        traffic on it (e.g. while the robot and both cameras are still
+        connecting), the FIRST real write afterward (status light) fails
+        with pymodbus ConnectionException: "Connection unexpectedly closed
+        ... without response from device before it closed connection".
+        Every write now retries once through this after a failure.
+        """
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+        log.warning("plc.reconnecting")
+        self._connect_sync()
+
     # ------------------------------------------------------------------
     # Status light  (registers confirmed)
     # ------------------------------------------------------------------
@@ -147,11 +174,29 @@ class LogicPLCDriver:
         await loop.run_in_executor(None, self._set_light_sync, colour, cfg)
 
     def _set_light_sync(self, colour: str, cfg: tuple) -> None:
-        mode, pri_col, pri_int, sec_col, speed = cfg
-        c = self._client
-        if c is None:
+        if self._client is None:
             log.error("plc.set_status_light.not_connected", colour=colour)
             return
+        try:
+            self._write_light_registers(cfg)
+        except Exception as exc:
+            log.warning("plc.set_status_light.retrying_after_reconnect",
+                        colour=colour, error=str(exc))
+            try:
+                self._reconnect_sync()
+                self._write_light_registers(cfg)
+            except Exception as exc2:
+                # Losing the status light is a cosmetic failure — it must
+                # never take down safety polling / robot / cameras with it.
+                # Log loudly and move on rather than crash the orchestrator.
+                log.error("plc.set_status_light.failed_after_retry",
+                          colour=colour, error=str(exc2))
+                return
+        log.debug("plc.status_light", colour=colour)
+
+    def _write_light_registers(self, cfg: tuple) -> None:
+        mode, pri_col, pri_int, sec_col, speed = cfg
+        c = self._client
         errs = []
         for addr, val in [
             (REG_MODE,       mode),
@@ -165,25 +210,42 @@ class LogicPLCDriver:
             if r.isError():
                 errs.append(f"reg{addr}={val}: {r}")
         if errs:
-            log.error("plc.set_status_light.write_error", colour=colour, errors=errs)
-            return
+            raise RuntimeError(f"plc write_register error(s): {errs}")
         # Pulse Statuslight_Set coil high→low so PLC applies the new register values
         import time
         c.write_coil(address=COIL_STATUSLIGHT_SET, value=True)
         time.sleep(0.05)
         c.write_coil(address=COIL_STATUSLIGHT_SET, value=False)
-        log.debug("plc.status_light", colour=colour)
 
     # ------------------------------------------------------------------
-    # Work light  (OQ-11 PENDING — no-op until register address confirmed)
+    # Work light  (coil 0 — confirmed 2026-08-18)
     # ------------------------------------------------------------------
 
     async def set_work_light(self, on: bool) -> None:
-        log.warning(
-            "plc.set_work_light.not_implemented",
-            on=on,
-            reason="OQ-11 open — work light register address not yet confirmed by David",
-        )
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._set_work_light_sync, on)
+
+    def _set_work_light_sync(self, on: bool) -> None:
+        if self._client is None:
+            log.error("plc.set_work_light.not_connected", on=on)
+            return
+        try:
+            self._write_work_light(on)
+        except Exception as exc:
+            log.warning("plc.set_work_light.retrying_after_reconnect",
+                        on=on, error=str(exc))
+            try:
+                self._reconnect_sync()
+                self._write_work_light(on)
+            except Exception as exc2:
+                log.error("plc.set_work_light.failed_after_retry", on=on, error=str(exc2))
+                return
+        log.debug("plc.work_light", on=on)
+
+    def _write_work_light(self, on: bool) -> None:
+        r = self._client.write_coil(address=COIL_WORK_LIGHT, value=on)
+        if r.isError():
+            raise RuntimeError(f"plc write_coil error: {r}")
 
     # ------------------------------------------------------------------
     # Event log  (OQ-11 PENDING — returns [] until register address confirmed)

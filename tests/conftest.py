@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
+
 import pytest
 
 from cib.core.state_machine import SystemStateMachine
@@ -44,6 +46,17 @@ def mock_drivers() -> DriverSet:
 
 
 @pytest.fixture
-def orchestrator(mock_drivers: DriverSet) -> Orchestrator:
-    """Orchestrator wired with mock drivers."""
-    return Orchestrator(drivers=mock_drivers)
+def orchestrator(mock_drivers: DriverSet, tmp_path: Path) -> Orchestrator:
+    """
+    Orchestrator wired with mock drivers.
+
+    db_path/runs_base_dir point at pytest's tmp_path — without this, every
+    test using this fixture would create/write C:\\LabAutomation\\data on
+    whatever machine runs the suite, which is the production HMI path, not
+    a test sandbox.
+    """
+    return Orchestrator(
+        drivers=mock_drivers,
+        db_path=tmp_path / "picks.db",
+        runs_base_dir=tmp_path / "runs",
+    )

@@ -31,6 +31,7 @@
 - [Appendix A — End-to-End Communication Flow](#appendix-a--end-to-end-communication-flow)
 - [Appendix B — CSV Output Format](#appendix-b--csv-output-format)
 - [Appendix C — David (DTM) Review Comments](#appendix-c--david-dtm-review-comments)
+- [Appendix C2 — Development Session Notes (DEV)](#appendix-c2--development-session-notes-dev)
 
 ---
 
@@ -252,7 +253,7 @@ Pneumatic stage control is coordinated through the robot (digital I/O) — it do
 
 - **FR-ROB-01:** Software shall connect to the Epson T3-B controller over TCP on startup and verify connection before allowing any run.
 - **FR-ROB-05:** Robot connection loss shall trigger an immediate cycle stop and operator alert.
-- **FR-ROB-06:** The robot shall coordinate the syringe pump and pneumatic stage during pick-and-place execution.
+- **FR-ROB-06:** The robot shall coordinate the syringe pump and pneumatic stage during pick-and-place execution. **The final approach to the specimen/well is a two-stage controlled descent, not a single pneumatic extension** — the pipette's own pneumatic stroke is mechanically limited so it cannot reach the glass dish/well bottom, and the robot's own (speed/accel-controlled) Z axis performs the final approach instead. Retraction reverses in the corresponding order: robot Z first, pneumatic second. *(→ DEV-11)*
 
 ### 8.3 Logic PLC
 
@@ -260,7 +261,7 @@ Pneumatic stage control is coordinated through the robot (digital I/O) — it do
 > The Logic PLC is **not a safety device**. It does not sit between Python and the Sick safety controller for safety monitoring. Its job is outputs (lights) and logging.
 
 - **FR-PLC-01:** Software shall connect to the Logic PLC over ModbusTCP on startup and poll it at 100ms intervals during all operating states.
-- **FR-PLC-02:** Software shall write to the Logic PLC to control the cell status light and work light (e.g. green = running, amber = stopped, red = fault).
+- **FR-PLC-02:** Software shall write to the Logic PLC to control the cell status light and work light (e.g. green = running, amber = stopped, red = fault). *(→ DEV-2, DEV-4)*
 - **FR-PLC-03:** Software shall read the PLC hardware event log and store entries in the structured application log for traceability.
 - **FR-PLC-04:** PLC connection loss shall be logged and shall prevent a new run from starting (since light/status control would be unavailable).
 
@@ -285,8 +286,8 @@ The following are software monitoring and control requirements. The safety circu
 - **FR-SAF-02:** Software shall detect and log: light curtain trip, e-stop button activation (which button), reset button press, contactor state change.
 - **FR-SAF-03:** When a safety fault is detected via the 100ms poll, software shall immediately transition the state machine to `E_STOP` or `PROTECTIVE_STOP` (depending on fault type) and block all further motion commands. **This is a software mirror state only — the hardware safety circuit has already acted independently before this transition occurs. The software state machine transition does not cause the hardware stop; it reflects it.** *(→ DTM-6)*
 - **FR-SAF-04:** The system shall NOT allow a run to start if any active safety fault is detected. This is a software-level gate that provides operator feedback; the hardware independently enforces this regardless — even if software attempted to start a run while a safety fault is active, the hardware safety system would prevent any motion. *(→ DTM-7)*
-- **FR-SAF-05:** After an e-stop, the hardware reset sequence must fully complete in hardware (e-stop button released → blue reset button pressed and released) before software re-enables the START/CONTINUE button. Software detects this by polling the Sick Flexi controller status. **Additionally, after the e-stop hardware reset sequence completes, the software shall also send a light curtain circuit reset-acknowledge to the Sick controller to ensure the light curtain latch is released (exact register and sequence pending OQ-23 register map confirmation).** *(→ DTM-8)*
-- **FR-SAF-06:** After hardware reset is confirmed (e-stop) or latch released (light curtain), software shall additionally require an explicit operator action (START/CONTINUE button press on HMI) before motion resumes. Software never resumes autonomously.
+- **FR-SAF-05:** After an e-stop, the hardware reset sequence must fully complete in hardware (e-stop button released → blue reset button pressed and released) before software re-enables the START/CONTINUE button. Software detects this by polling the Sick Flexi controller status. **Additionally, after the e-stop hardware reset sequence completes, the software shall also send a light curtain circuit reset-acknowledge to the Sick controller to ensure the light curtain latch is released (exact register and sequence pending OQ-23 register map confirmation).** *(→ DTM-8, DEV-1)*
+- **FR-SAF-06:** After hardware reset is confirmed (e-stop) or latch released (light curtain), software shall additionally require an explicit operator action (START/CONTINUE button press on HMI) before motion resumes. Software never resumes autonomously. *(→ DEV-5)*
 - **FR-SAF-07:** Software shall display the specific fault type on the UI — which e-stop button was pressed, or light curtain, or contactor — not just a generic "safety fault." This information is read from the Sick Flexi controller's Modbus registers (register map required — OQ-23). *(→ DTM-9)*
 - **FR-SAF-08:** Light curtain mode is **latching protective stop**. When the light curtain trips:
   - Hardware immediately stops the robot and opens the contactor (no software involved).
@@ -295,8 +296,8 @@ The following are software monitoring and control requirements. The safety circu
   - UI shows PROTECTIVE_STOP banner. The **CONTINUE button is disabled (grayed out) until the light curtain is physically clear** (no obstruction detected by the 100ms poll). The ABORT button is available at any time. This prevents the operator from attempting to reset the system while their arm or any obstruction is still in the cell. *(→ DTM-10)*
   - Once the light curtain reads clear and the operator presses CONTINUE, software sends a reset-acknowledge write to the Sick safety controller via ModbusTCP.
   - Safety controller releases the latch, circuit closes, contactor closes, robot ready.
-  - State machine transitions back to RUNNING; cycle resumes.
-  - No physical hardware button pressing required (unlike e-stop reset).
+  - State machine transitions back to RUNNING; cycle resumes. *(→ DEV-1 — "cycle resumes" means the run continues and any in-transit specimen is delivered first, not that the interrupted motion itself is resumed mid-air.)*
+  - No physical hardware button pressing required (unlike e-stop reset). *(→ DEV-8 — CORRECTED by live hardware testing: this installation DOES require the physical blue reset button for light curtain recovery too. Do not revert without re-confirming on hardware.)*
 - **FR-SAF-09:** Software shall send the reset-acknowledge write to the Sick safety controller only when: (a) the light curtain is physically clear (no obstruction detected — confirmed by live 100ms poll), AND (b) the operator has explicitly pressed CONTINUE on the HMI. The CONTINUE button shall reflect the light curtain status in real time — it is disabled while any obstruction is detected. Software shall not send this signal automatically. *(→ DTM-10)*
 
 > **Hardware behavior David described — e-stop (for UI reference):** When an e-stop button is pressed, its indicator light on the physical hardware button flashes (tells you which one is active). Other e-stop buttons that are not pressed have their light lit steady. Once the pressed button is released and nothing else is blocking reset, the blue reset button light starts flashing. Operator presses and releases the blue reset button → safety controller returns to operational mode → safety contactor closes → robot safety signal restored. Software must reflect this state progression in the UI.
@@ -357,7 +358,7 @@ This state machine is documented here to inform future implementation. **Do not 
   **This post-pick check is optional and hits cycle time.** It shall be implemented as a configurable feature (enabled/disabled in machine config). The failure rate shall be evaluated once the system is running to determine whether the cycle-time cost is justified.
 
   **Post-plate well QC scan (NOT in v1 scope):** Imaging inside the destination wells was removed from the hardware design due to backlight cost and robot reach constraints (current robot reaches all four plates for picking but cannot simultaneously image wells; stepping up to a larger robot would be required). In prior similar cells, a separate inverted microscope was used after plating for well inspection and debris detection — that is an external offline process and is out of scope for this software. If post-plate well QC is needed in a future version, the hardware design will need to be revisited.
-- **FR-EOA-05:** Pick result shall be logged with timestamps, pick coordinates, and pass/fail status.
+- **FR-EOA-05:** Pick result shall be logged with timestamps, pick coordinates, and pass/fail status. *(→ DEV-7)*
 - **FR-EOA-06:** Configurable number of consecutive pick failures shall trigger a cycle stop and operator alert.
 - **FR-EOA-07:** All EoA images shall be saved to disk in TIFF format (PNG acceptable if TIFF blocked; JPEG not acceptable). These are the primary archival deliverable to the lab. Filenames shall be included in the CSV output row in **separate columns per lighting variant** (OQ-24, OQ-05c resolved): `image_filename_backlight` and `image_filename_ringlight`. There is no separate QA image column — post-pick confirmation uses the overhead camera re-capture, which is a debug/internal frame not included in the CSV. See Appendix B.
 
@@ -389,7 +390,7 @@ This state machine is documented here to inform future implementation. **Do not 
 - **FR-UI-03 — Stopped state:** When the cell is not running, UI shall show **START** and **ABORT** buttons.
   - **START** begins processing (or resumes after a cycle stop — may be labeled **CONTINUE** in that context).
   - **ABORT** clears all in-progress run data and returns to the pre-run setup screen, ready for a new run.
-- **FR-UI-04 — Running state:** When the cell is running, UI shall show a **CYCLE STOP** button. Pressing it allows the current cycle to complete gracefully, then stops. Once stopped, **CONTINUE** and **ABORT** buttons become active. To change the field code, the operator presses ABORT and starts a new run from the pre-run setup screen. *(→ DTM-1)*
+- **FR-UI-04 — Running state:** When the cell is running, UI shall show a **CYCLE STOP** button. Pressing it allows the current cycle to complete gracefully, then stops. Once stopped, **CONTINUE** and **ABORT** buttons become active. To change the field code, the operator presses ABORT and starts a new run from the pre-run setup screen. *(→ DTM-1, DEV-3)*
 - **FR-UI-05 — Light curtain trip (protective stop with latch):** When the light curtain is tripped during a run:
   - Robot stops immediately (hardware).
   - UI shows a PROTECTIVE STOP banner indicating the light curtain is the cause.
@@ -399,7 +400,7 @@ This state machine is documented here to inform future implementation. **Do not 
   - Safety controller releases the light curtain latch; circuit closes.
   - State machine transitions back to RUNNING; cycle resumes.
   - The machine does NOT resume automatically when the person leaves the zone — operator CONTINUE is always required.
-- **FR-UI-06 — E-stop state:** UI shall display a prominent alert showing the specific e-stop source (data from Flexi controller registers — OQ-23). The operator must complete the hardware reset procedure (release e-stop button → press blue reset button) before software enables the CONTINUE button. Software detects reset completion by polling safety controller status. *(→ DTM-9)*
+- **FR-UI-06 — E-stop state:** UI shall display a prominent alert showing the specific e-stop source (data from Flexi controller registers — OQ-23). The operator must complete the hardware reset procedure (release e-stop button → press blue reset button) before software enables the CONTINUE button. Software detects reset completion by polling safety controller status. *(→ DTM-9, DEV-5)*
 - **FR-UI-15 — Plate ID entry:** Plate ID fields on the pre-run screen accept manual text input in v1. Barcode reading approach for future versions is still being evaluated (OQ-25 open): overhead camera stitching has reliability concerns; EoA barcode reader on robot arm has reach constraints with 4 plates. USB HID scanner is confirmed to work if a physical scanner is used. No barcode integration in v1 — manual entry only.
 
 **Run monitoring:**
@@ -425,7 +426,7 @@ This state machine is documented here to inform future implementation. **Do not 
 
 - **FR-RUN-04:** Config files shall be read-only (locked) once a run starts.
 
-- **FR-RUN-05:** Abort shall clear all in-progress run state and data, returning the system to IDLE ready for a new run.
+- **FR-RUN-05:** Abort shall clear all in-progress run state and data, returning the system to IDLE ready for a new run. *(→ DEV-3)*
 
 - **FR-RUN-06 — Mid-plate field code change:** When an operator needs to change the field code mid-plate (e.g. when switching to a new sorting dish with a different field code while the destination plates are still partially filled): *(→ DTM-1)*
   
@@ -464,7 +465,7 @@ This state machine is documented here to inform future implementation. **Do not 
 | NFR-07 | Security        | No device on the cell network shall have direct internet access                                                                                                                                                                                                                                                                         |
 | NFR-08 | Security        | Remote access exclusively via Ewon Cosy+ VPN — no direct RDP/SSH exposure                                                                                                                                                                                                                                                               |
 | NFR-09 | Auditability    | Every operator action and system event shall be timestamped and written to the structured log                                                                                                                                                                                                                                           |
-| NFR-10 | Recoverability  | After an e-stop, operator shall be able to resume (re-home + re-detect) without restarting software                                                                                                                                                                                                                                     |
+| NFR-10 | Recoverability  | After an e-stop, operator shall be able to resume (re-home + re-detect) without restarting software *(→ DEV-1, DEV-6)*                                                                                                                                                                                                                                    |
 | NFR-11 | Platform        | Application shall run on Windows 11 and be packaged as a Windows installer                                                                                                                                                                                                                                                              |
 | NFR-12 | Data integrity  | CSV export shall be written incrementally per pick (not at run end) so partial data is preserved if the system faults mid-run                                                                                                                                                                                                           |
 
@@ -781,6 +782,25 @@ C:\LabAutomation\data\
 | event_type | TEXT       | estop / light_curtain / contactor / connection_loss |
 | detail     | TEXT       | Free text detail                                    |
 
+**pick_attempts_log table** *(added 2026-08-18 — → DEV-7)*
+
+Audit trail for pick attempts interrupted by a safety fault **before** a specimen was ever aspirated. That row is snapshotted here, then removed from `picks` — it never resulted in a real pick, so it shouldn't sit in `picks` looking like a failed one. Never used for the transit case (specimen already in the tip) — those are delivered and kept as a real record in `picks` instead.
+
+| Column          | Type       | Notes                                                          |
+| --------------- | ---------- | --------------------------------------------------------------- |
+| log_id          | INTEGER PK |                                                                  |
+| run_id          | TEXT FK    |                                                                  |
+| field_code      | TEXT       |                                                                   |
+| plate_id        | TEXT       |                                                                   |
+| well_position   | TEXT       |                                                                   |
+| pick_status     | TEXT       | Which step it was on when interrupted (e.g. `MOVING_TO_PICK`)   |
+| timestamp_start | DATETIME   |                                                                   |
+| image_filename  | TEXT       | Reference only — the actual image file is deleted from disk     |
+| robot_x         | REAL       |                                                                   |
+| robot_y         | REAL       |                                                                   |
+| reason          | TEXT       | Why it was interrupted (e.g. `safety_fault_during_EOA_VISION`)  |
+| logged_at       | DATETIME   | When the snapshot was taken (recovery time, not interrupt time) |
+
 ### 14.3 CSV Export
 
 The CSV file is the primary output for Austin's lab. One file per run, appended row-by-row as picks complete (not written at run end — see NFR-12). See Appendix B for the exact column specification.
@@ -848,10 +868,11 @@ Every log entry (via `structlog`) includes:
 | OQ-19 | ~~Light curtain mode — protective stop vs. e-stop?~~                                                                                                                                                                                                                                                                                                                                                                                                                                              | David / Austin   | High     | **PARTIALLY CLOSED: Light curtain = latching protective stop. Hardware stops robot immediately. Latch stays until operator presses CONTINUE on HMI (CONTINUE button disabled until light curtain reads clear → DTM-10) → software writes reset-acknowledge to Sick controller → latch releases. No physical reset button required (unlike e-stop). Confirm Sick controller register for reset-acknowledge write — see OQ-23.** |
 | OQ-20 | EoA imaging lighting — ring light only, or both back light and ring light (multiple images)? Affects cycle time and image analysis pipeline                                                                                                                                                                                                                                                                                                                                                       | Lab / SW         | Medium   | Open — see OQ-24                                                                                                                                                                                                                                                                                                                                           |
 | OQ-21 | Vision algorithm selection — OpenCV (open source, classical contour/blob detection) vs. Halcon (MVTec commercial library, more powerful built-in tools)? Tejas to evaluate. Decision affects software dependencies and licensing cost.                                                                                                                                                                                                                                                            | Tejas            | High     | Open                                                                                                                                                                                                                                                                                                                                                       |
-| OQ-22 | Config file format for plate configs — who creates these files, and how? Options: (a) **CSV** — operator creates in Excel, saves as .csv; (b) **Excel (.xlsx)** — operator works directly in Excel. A template file shall be provided. File placement onto the HMI is outside software scope — see FR-SETUP-09. *(→ DTM-3)* | Austin / Tejas   | High     | Open                                                                                                                                                                                                                                                                                                                                                       |
+| OQ-22 | Config file format for plate configs — who creates these files, and how? Options: (a) **CSV** — operator creates in Excel, saves as .csv; (b) **Excel (.xlsx)** — operator works directly in Excel. A template file shall be provided. File placement onto the HMI is outside software scope — see FR-SETUP-09. *(→ DTM-3, see also OQ-26)* | Austin / Tejas   | High     | Open                                                                                                                                                                                                                                                                                                                                                       |
 | OQ-23 | **Sick Flexi safety controller exact model + Modbus register map.** Required before implementing safety driver. Specifically need: (a) registers for reading light curtain state, e-stop states (individual buttons), contactor state, reset state, fault type; (b) register(s) for writing the protective-stop reset-acknowledge to release light curtain latch; (c) register(s) for writing the light curtain circuit reset after e-stop recovery. *(→ DTM-8, DTM-9)* | David            | High     | Open                                                                                                                                                                                                                                                                                                                                                       |
 | OQ-24 | **Multiple EoA images per pick** — Austin noted the lab may want more than one EoA image per specimen, especially early in the project. Confirm: (a) How many images per pick (one per lighting variant? One before pick, one after?); (b) Which lighting combinations (ring light only / backlight only / both); (c) How image filenames are represented in the CSV (one column? comma-separated within one column? multiple columns?); (d) Whether this changes before v1 ships.                | Austin / Tejas   | Medium   | **CLOSED (Austin 2026-06-24): (a) One image per lighting variant before pick + 1 post-pick QA image. (b) Backlight + ring light both captured before pick; ring light is the primary archival image. (c) Separate CSV columns per image: image_filename_backlight, image_filename_ringlight, image_filename_qa. (d) This is the v1 spec. Applied at: FR-EOA-01, FR-EOA-07, Section 13.3, Appendix B.** |
 | OQ-25 | **Barcode scanner for plate ID entry** — Austin's team is flexible on plate labeling. Confirm: (a) 1D vs. 2D barcode type; (b) Label location on plate (side label, short side, etc.); (c) Scanner interface (USB HID is most common and simplest — plug in and it emulates keyboard input); (d) Whether USB HID is acceptable (no driver needed) or a dedicated serial scanner is preferred. v1 uses manual text entry; barcode scanner planned for future release.                              | Austin / Tejas   | Low      | **PARTIALLY CLOSED (Austin 2026-06-24): 1D barcode confirmed. Label on top of plate. USB HID confirmed to work. v1 = manual text entry only (no barcode). Future reading approach still being evaluated: (a) overhead camera image stitching — technically challenging, not guaranteed reliable; (b) barcode reader on robot EoA — robot already near reach limits with 4 plates, needs careful check. Options being worked through. No barcode integration in v1.** |
+| OQ-26 | **How are per-well X/Y positions in a plate config actually determined?** OQ-22 covers file *format*; this is specifically about the *values* — who measures them and how, and whether that has to happen on every plate load or only once per plate-type-per-station. A proposed approach was brainstormed 2026-08-11 (teach 2 reference wells/corners per plate-type-per-station, compute the rest from known SBS pitch) but is **not yet confirmed with Austin/David** — depends on (a) whether plate station nests register plates repeatably (determines teach-once-per-type vs. teach-every-load), and (b) whether the overhead/EoA camera has physical line-of-sight to the plate stations (determines whether this can be vision-automatic vs. manual jog-teach). See Appendix D. | Tejas / Austin / David | High | Open — pending discussion |
 
 ---
 
@@ -866,6 +887,8 @@ Every log entry (via `structlog`) includes:
 | 0.5     | 2026-06-05 | TBD    | Major update from Austin (CIB) input: (1) Added Section 2 Glossary. (2) Added Appendix B — CSV output format. (3) Corrected safety controller brand to Sick; updated interface to read + reset-acknowledge write. (4) Closed OQ-17, OQ-18, OQ-16. (5) Partially closed OQ-19. (6) Removed load_orders directory. (7) Rewrote picks table and CSV output. (8) Added FR-RUN-06/07. (9) Added OQ-23/24/25. (10) Added NFR-12. (11) Marked overhead images as debug-only. |
 | 0.7     | 2026-06-25 | TKL    | Incorporated Austin (CIB) lab feedback: (OQ-04) Post-pick confirmation = overhead re-capture checking dish location is now empty; configurable (cycle time impact); well imaging in plates removed from scope (cost + robot reach); post-plate well QC out of scope v1 — FR-EOA-04 rewritten, Section 13.3 updated. (OQ-05a) Auto-save confirmed. (OQ-05c) Separate CSV columns per lighting variant (image_filename_backlight, image_filename_ringlight) — no QA column — Appendix B rewritten, picks table updated, FR-EOA-07 updated. (OQ-10) Dish ~120x85x12mm. (OQ-24) Backlight + ring light before pick; ring light = primary archival; two CSV columns. (OQ-25) 1D barcode top of plate, USB HID works; v1 manual only; future approach (overhead stitch vs EoA reader) still being evaluated — FR-SETUP-01, FR-UI-15 updated
 | 0.6     | 2026-06-08 | TBD    | Incorporated David (DTM) review comments (see Appendix C): (DTM-1) Mid-plate field code change redesigned as full-stop + new run flow — removed CHANGE FIELD CODE button/state; updated Goals, FR-SETUP-04, FR-UI-04, FR-RUN-06/07, state machine, Appendix A.13, Glossary Run definition. (DTM-2) Plate ID now required to activate a plate station — updated FR-SETUP-01/03, FR-UI-01, FR-RUN-02, Appendix A.2/A.3. (DTM-3) Config file transfer declared out of scope — replaced FR-SETUP-09/11, updated Appendix A.2, added to Non-Goals. (DTM-4) Config management screen shows filename list only, no preview/editing — updated FR-SETUP-10, FR-UI-12, Section 15, Non-Goals. (DTM-5) OQ-12 closed — Python reads Sick Flexi directly via ModbusTCP; endian-aware pymodbus decoder required — updated Section 7, Section 11.3, Section 10, OQ-12 table row. (DTM-6) FR-SAF-03 reworded to clarify software state is a mirror of hardware state. (DTM-7) FR-SAF-04 updated with note that hardware independently enforces run-start block. (DTM-8) FR-SAF-05 updated — software must also reset light curtain circuit after e-stop; OQ-23 updated to include this register. (DTM-9) FR-SAF-07 updated — fault detail data sourced from Flexi controller registers; Section 4, Section 8.4, FR-UI-06 updated. (DTM-10) FR-SAF-08/09, FR-UI-05, state machine table, Appendix A.10 updated — CONTINUE button disabled until light curtain physically clear per live poll. |
+| 0.8     | 2026-08-18 | TKL    | Safety/PLC wiring decisions from implementation session (see Appendix C2): (DEV-1) Clarified NFR-10 "resume (re-home + re-detect)" — an in-transit specimen (already aspirated) is delivered to its intended well before anything else on recovery, never lost, never picked-over; updated FR-SAF-05, FR-SAF-08, NFR-10. (DEV-2) FR-PLC-02's example status-light colors replaced with a complete steady/chase/flash mapping distinguishing e-stop vs. light curtain vs. connection loss. (DEV-3) FR-RUN-05/FR-UI-04 — ABORT now also delivers an in-transit specimen (same action as CONTINUE) before closing the run, rather than discarding or leaving it hanging. (DEV-4) FR-PLC-02 — work light trigger logic decided: off on run start, on whenever back at IDLE. |
+| 0.9     | 2026-08-18 | TKL    | Findings from first live hardware test of safety/PLC wiring (see Appendix C2): (DEV-5) FR-SAF-06/FR-UI-06 — CONTINUE for e-stop was only checking "are we in E_STOP," not whether the hardware reset sequence actually completed; now gated on the Flexi's live fault signal, same rigor as light curtain's existing beam-clear gate. (DEV-6) NFR-10 — recovery now also restores backlight/EoA exposure (not just robot position), and verifies the robot actually reconnected before declaring RUNNING — a fault mid-motion can crash the SPEL+ task itself, which was previously undetected and left the system spinning while claiming to be fine; now falls to FAULT instead. (DEV-7) FR-EOA-05 — an attempt interrupted before a specimen is ever aspirated (not the transit case) now gets fully cleaned up on recovery: orphaned images deleted, and its `picks` row snapshotted into a new `pick_attempts_log` audit table then removed, so it never lingers looking like a real failed pick; well-fill sequence is unaffected either way. (DEV-8) **Corrects DTM-10/FR-SAF-08** — live testing shows this installation's Flexi requires the physical blue reset button for light curtain recovery too, not just e-stop as originally assumed; CONTINUE gating and the orchestrator's own independent check both updated to require it for both fault types. (DEV-9) Fixed a real live `cv2.OutOfMemoryError` in the overhead pipeline — dominant cause was `os.startfile()` leaking a new external viewer process every VIEW-enabled cycle, never closed; also removed a redundant full-frame copy and added explicit cleanup + `gc.collect()` in the detection pipeline itself. (DEV-10) **Root cause of the "CONTINUE never worked" report** — the light curtain tripped while the system was IDLE, an illegal state transition (`safety_fault_protective` didn't allow IDLE as a source) that the safety-evaluation code's own guard let through anyway, raising an unhandled error that silently crashed the entire orchestrator backend (HMI window survives, everything else dies). Fixed: IDLE is now a legal source, and recovery remembers whether anything was actually running before the fault so it lands back in the right place instead of assuming RUNNING. |
 
 ---
 
@@ -1031,32 +1054,47 @@ The **Sick safety controller** runs entirely independently in hardware at all ti
     │
 [Robot worker thread → Epson T3-B]
 
-  a. Robot moves to safe height above pick site
+  a. Robot moves to refined pick XY position, at hover/imaging height
+
+  *** TWO-STAGE CONTROLLED DESCENT (→ DEV-11) — same pattern at pick and
+      place, see (b)-(c) below and (h) ***
 
   b. Robot fires digital output → pneumatic valve opens → pipette deploys
+     (short, mechanically-limited stroke — cannot reach the glass dish/well
+     bottom even at full extension)
 
-  c. Robot moves to refined pick XY position
+  c. ROBOT_AT_PIPETTE_DOWN received (Input 22 confirms full pneumatic
+     extension) → robot then performs its OWN controlled Z-only descent
+     (same XY, no lateral travel) down to the final approach height — this
+     robot-controlled move, not the pneumatic, is what actually reaches the
+     specimen
 
   d. ROBOT_AT_PICK_POSITION received
      → asyncio sends ASPIRATE → M-Drive worker
      → M-Drive aspirates specimen (syringe pulls back)
      → ASPIRATE_COMPLETE put onto queue
 
-  e. [Pick done — robot lifts clear]
+  e. [Pick done] Robot Z retracts FIRST (back to hover height, same XY) —
+     THEN digital output closes → pneumatic retracts SECOND, only once the
+     robot Z is already clear. Only after Input 20 confirms pipette fully up
+     does the robot make any XY (lateral) travel move.
 
   f. Robot moves to safe height, then toward target plate station
 
   g. *** AS ROBOT EXITS OVERHEAD CAMERA FIELD OF VIEW ***
      Triggers next overhead image acquisition in parallel (overlaps robot travel time)
 
-  h. Robot descends above target well
+  h. Robot descends above target well, then repeats the same two-stage
+     descent as (b)-(c): pneumatic deploys (short stroke) → robot Z-only
+     descent to final approach height
 
   i. ROBOT_AT_PLACE_POSITION received
      → asyncio sends DISPENSE → M-Drive worker
      → M-Drive dispenses specimen into well (syringe pushes forward)
      → DISPENSE_COMPLETE put onto queue
 
-  j. Robot fires digital output → pneumatic valve closes → pipette retracts
+  j. Robot Z retracts FIRST (same XY) → digital output closes → pneumatic
+     retracts SECOND, same order as (e). Only then does any XY travel move.
 
   k. MISSION_COMPLETE received from robot via TCP
 ```
@@ -1107,14 +1145,22 @@ The **Sick safety controller** runs entirely independently in hardware at all ti
     → UI: shows PROTECTIVE STOP banner, "Light curtain tripped — zone clear, then press CONTINUE"
     → ABORT button active immediately
     → CONTINUE button DISABLED until light curtain_clear = TRUE (→ DTM-10)
+      *** CORRECTED (→ DEV-8): ALSO disabled until the physical blue reset
+      button has been pressed — this installation shares one blue button
+      between e-stop and light curtain, contradicting the "no button" text
+      below. Do not revert without re-confirming on hardware. ***
 
     [100ms poll continues]
-    When poll detects light_curtain_state = CLEAR:
-    → light_curtain_clear flag set TRUE → Qt signal → CONTINUE button becomes ENABLED
+    When poll detects light_curtain_state = CLEAR AND the blue button has
+    been pressed (any_fault_active = FALSE — → DEV-8):
+    → CONTINUE button becomes ENABLED
 
-    Operator verifies zone is clear, presses CONTINUE on HMI (button was grayed out until now):
-    → Software confirms light_curtain_clear = TRUE before sending reset
+    Operator verifies zone is clear, presses the blue reset button, then
+    presses CONTINUE on HMI (button was grayed out until now):
+    → Software confirms light_curtain_clear = TRUE AND any_fault_active = FALSE
     → Sends reset-acknowledge WRITE → Sick Flexi controller via ModbusTCP
+      (still a no-op pending OQ-23's register address — the physical button
+      is currently what actually clears the latch, not this write — → DEV-8)
       Sick controller releases latch → circuit closes → contactor closes → robot ready
       → State machine: PROTECTIVE_STOP → RUNNING
       → Logic PLC: SET_STATUS_LIGHT=GREEN
@@ -1360,3 +1406,285 @@ The following are David's original review comments verbatim, as they appeared in
 **Resolution:** Adopted. The CONTINUE button in PROTECTIVE_STOP state is disabled (grayed out) and only becomes enabled when the 100ms safety poll confirms the light curtain is physically clear. The button state is driven by the live `light_curtain_clear` flag propagated from the safety poll to the UI via Qt signal.
 
 **Applied at:** FR-SAF-08 (CONTINUE button behavior), FR-SAF-09 (reinforced), FR-UI-05 (CONTINUE disabled until clear), Section 12 State Machine table (PROTECTIVE_STOP row), Section 10 Concurrency Model, Appendix A.1, Appendix A.10 Scenario A.
+
+---
+
+## Appendix C2 — Development Session Notes (DEV)
+
+**These are NOT David's review comments.** DTM-1 through DTM-10 above are David Mandrell's actual review feedback and are unaffected by anything below. The entries in this section (DEV-1 onward) are decisions made, corrections found, and bugs fixed during implementation/testing sessions (2026-08-18 onward) — a different category, kept separate on purpose so the two are never confused. Same format as the DTM entries: quote (or paraphrased context) → resolution → applied-at.
+
+---
+
+**DEV-1** *(appeared at: Section 8.4 FR-SAF-05/FR-SAF-08, Section 9 NFR-10 — 2026-08-18)*
+
+> "See it is good to re home best practice but what if there was a bug already in transit, I want it to be transferred to well properly, not dropped or not aspirating the next bug when already one is there... that means the aspirating should be aspirating only even with e-stop or safety."
+
+**Resolution:** NFR-10's "resume (re-home + re-detect)" is clarified to mean: the interrupted *cycle* is never literally resumed mid-motion (unsafe to trust a paused-mid-air position after a safety event), but the *run* is never abandoned either. Every pick is tracked step-by-step (imaging → moving → aspirating → in pipette → dispensing → done). If a safety fault interrupts a cycle AFTER a specimen is confirmed aspirated, recovery's first action — before anything else, including any new pick — is to deliver that exact specimen to its already-known intended well. Nothing is lost, and a new pick can never start while one is still physically in the tip. Implemented as an in-memory "pending specimen" gate plus full DB/CSV logging of every pick attempt.
+
+**Applied at:** FR-SAF-05, FR-SAF-08, NFR-10, `cib/core/orchestrator.py` (`_deliver_pending_specimen`, pick-status wiring in `_run_cycle`), `cib/data/database.py`/`storage.py` (now wired in, previously built but unused).
+
+---
+
+**DEV-2** *(appeared at: Section 8.3 FR-PLC-02 — 2026-08-18)*
+
+> Status light scheme requested: connected/ready = green steady; running = green chasing; cycle stop or abort = amber steady; e-stop = red steady; light curtain tripped = red flashing; any connection lost = red chasing; resume after e-stop/curtain clears = green steady again.
+
+**Resolution:** FR-PLC-02's "e.g. green = running, amber = stopped, red = fault" example is superseded by this specific, complete mapping, using the PLC's steady/flash/chase animation modes to visually distinguish fault types (e-stop vs. light curtain vs. connection loss) that previously all looked the same.
+
+**Applied at:** FR-PLC-02, `cib/drivers/base.py` (`StatusLight` — added `RUNNING`, `RED_FLASH`, `RED_CHASE`), `cib/drivers/plc/driver.py` (`_LIGHT_CONFIG`).
+
+---
+
+**DEV-3** *(appeared at: Section 8.10 FR-RUN-05, Section 8.9 FR-UI-04 — 2026-08-18)*
+
+> "What is the best choice... according to you?" — re: whether ABORT should deliver, discard, or leave-hanging a specimen that's still in the pipette tip when the operator chooses ABORT instead of CONTINUE after a safety fault.
+
+**Resolution:** ABORT delivers the in-transit specimen to its intended well first (identical action to what CONTINUE does), then closes the run as ABORTED. Reasoning: the only real difference between CONTINUE and ABORT is whether automated picking resumes afterward — not whether it is safe to finish a delivery that is already in flight. Leaving it hanging or discarding it would only be worse (an orphaned in-progress DB row, and a specimen physically abandoned in the tip with no record of what happened to it).
+
+**Applied at:** FR-RUN-05, FR-UI-04, `cib/core/orchestrator.py` (`OperatorAbortEvent` handler).
+
+---
+
+**DEV-4** *(appeared at: Section 8.3 FR-PLC-02 — 2026-08-18)*
+
+> "As far as the work light, when we click start, work light should turn off and when the cycle stops, work light should turn on."
+
+**Resolution:** Adopted. Work light turns OFF the moment a run starts (state → RUNNING) and ON whenever the system settles back to IDLE (graceful cycle stop, ABORT, or a safety fault clearing). Also fixed in the same pass: the work light's Modbus coil address was already confirmed via `hardware_tests/test_work_light.py`, but the driver's `set_work_light()` was still a stale no-op — it now actually writes coil 0.
+
+**Applied at:** FR-PLC-02, `cib/core/orchestrator.py` (work light calls at START/IDLE transitions), `cib/drivers/plc/driver.py` (`set_work_light`).
+
+---
+
+**DEV-5** *(appeared at: Section 8.4 FR-SAF-06, Section 8.9 FR-UI-06 — 2026-08-18, found during live hardware testing)*
+
+> "The continue button should be disabled until the safety is reset hardware wise, even emergency — it should check if emergency is reset and also safety is reset, then enable continue."
+
+**Resolution:** The CONTINUE button's E_STOP gating was checking only "are we in the E_STOP state," which is true the instant the fault fires — not whether the operator has actually completed the hardware reset sequence yet. It is now gated on the Flexi's live "any fault active" signal, which per the confirmed bit map only clears once the full sequence completes (button released **and** blue reset button pressed — "back to normal," 0x0517). This mirrors how PROTECTIVE_STOP's CONTINUE was already correctly gated on the light curtain beam being physically clear (DTM-10) — the difference is deliberate: light curtain recovery needs no reset-button press (FR-SAF-08), e-stop recovery does (FR-SAF-05/06).
+
+**Applied at:** FR-SAF-06, FR-UI-06, `cib/core/orchestrator.py` (new `hardware_fault_active` property, tracked every 100ms by the safety poll), `cib/ui/main_window.py` (CONTINUE enable logic).
+
+---
+
+**DEV-6** *(appeared at: Section 9 NFR-10 — 2026-08-18, found during live hardware testing)*
+
+> "After I hit continue everything should continue from where it was — including the backlight, robot, EOA light, everything. Please ensure all these are happening properly."
+>
+> Also found live: a fault that interrupts the robot mid-motion can crash the SPEL+ program itself (its own error handling only covers the idle wait between commands, not active motion — see `sort_server.prg` header comment), so the robot may never actually reconnect. Without a check, the system was declaring itself RUNNING anyway and spinning on failed reconnect attempts forever while claiming to be fine.
+
+**Resolution:** Two additions to `_safe_recovery()`, both applying regardless of which fault path (E_STOP or PROTECTIVE_STOP) triggered it:
+1. **Ancillary state restored, not just robot position** — backlight is forced back ON (a fault mid-EoA-capture leaves it briefly off, and every cycle's first step assumes it's already on) and EoA camera exposure is restored to normal (a fault mid-EoA-capture can otherwise leave the shorter backlight-on exposure active for the next classification frame).
+2. **Robot reconnection is verified, not assumed** — `_safe_recovery()` now returns whether homing actually succeeded. If the robot never reconnects (SPEL+ crashed and `sort_server.prg` needs a manual F5 restart in RC+), the system goes to **FAULT** (red, chasing) instead of silently declaring RUNNING/IDLE. Any specimen still tracked as pending stays tracked, not lost, so a later successful recovery can still deliver it.
+
+**Applied at:** NFR-10, `cib/core/orchestrator.py` (`_safe_recovery()` return value + backlight/exposure restoration, `OperatorAcknowledgeEvent` handler checks the return value before resuming).
+
+---
+
+**DEV-7** *(appeared at: Section 8.7 FR-EOA-05, Section 14 Data & Logging — 2026-08-18)*
+
+> "Make sure only if the bug is already picked, only then the robot drops it wherever it was supposed to and starts a fresh overhead image. Say it was taking a backlight image and something stops it — make sure that image is deleted and we start fresh from the overhead camera. Any stage other than transit (pick and drop), make sure the previous data is deleted from the picks table (keep another table with all the logs), and the image filename in the CSV is cleared too. But it should continue from the next assigned well only, not start from the beginning."
+
+**Resolution:** Confirms and extends DEV-1's transit-vs-not-transit split. If a fault interrupts a cycle **before** a specimen is ever aspirated (imaging, moving to the EoA site, or classifying — the RETRY-safe stages), that attempt never actually happened, so on recovery: any images already saved for it are deleted from disk, and if a `picks` row was already created for it (created at the point EoA accepts a candidate), it is snapshotted into a new `pick_attempts_log` audit table — so nothing is silently lost — then deleted from `picks`, rather than lingering there looking like a real (failed) pick. Since a `picks` row is never written to the CSV until a pick actually succeeds, there was never anything to clear there for this case. The well-fill sequence is untouched either way: it only advances at the point a pick is actually committed to, so the next successful pick still goes to the next assigned well, never back to the start. If a specimen **was** already aspirated (the transit case), none of this applies — it is delivered and kept as a real record, per DEV-1.
+
+**Applied at:** FR-EOA-05, Section 14 Data & Logging (new `pick_attempts_log` table), `cib/data/database.py` (`log_interrupted_attempt`, `delete_pick`), `cib/core/orchestrator.py` (`_cleanup_interrupted_attempt`, called from both the CONTINUE and ABORT paths).
+
+---
+
+**DEV-8** *(corrects DTM-10 / Section 8.4 FR-SAF-08 — 2026-08-18, corrected from live hardware testing)*
+
+> "There is one blue button which, when e-stop [trips], we need to make sure the blue button is pressed after it starts blinking — we need to press this to continue from e-stop AND we need to press the same button for the safety curtain to come back. Only then can we continue. If only the [light curtain] safety was tripped, we still need to press that blue button before we can continue."
+
+**Resolution:** Corrects DTM-10. FR-SAF-08 and DTM-10 originally assumed light curtain recovery needed no physical button press (`send_reset_acknowledge()` releasing the latch entirely over ModbusTCP once OQ-23's write register is confirmed). Live testing shows this installation's Sick Flexi has **one physical blue reset button shared by both fault types** — it must be pressed (once it starts blinking, i.e. `reset_available`) for light curtain recovery exactly the same as for e-stop. The CONTINUE button (and the orchestrator's own independent check — never trust the UI's enable state alone for a safety gate) now requires the live "any fault active" signal to be clear for **both** PROTECTIVE_STOP and E_STOP, not just a physically-clear beam. Software's `send_reset_acknowledge()` write (still blocked on OQ-23's register address) may end up redundant with the physical button once wired up, rather than a no-button alternative to it — that should be re-confirmed once OQ-23 closes, not assumed.
+
+**Applied at:** FR-SAF-08 (superseded — flag do-not-revert), DTM-10 (corrected by this entry), `cib/core/orchestrator.py` (`OperatorAcknowledgeEvent` PROTECTIVE_STOP branch now also checks `hardware_fault_active`), `cib/ui/main_window.py` (CONTINUE button gating).
+
+---
+
+**DEV-9** *(found during live hardware testing — 2026-08-18)*
+
+> "There is of course some OpenCV error, memory allocation, with the overhead camera pipeline."
+
+**Resolution:** Confirmed via the actual traceback — real `cv2.error: Insufficient memory` (`OutOfMemoryError`) in the overhead pipeline, recurring every ~10s during a long session, failure sizes shrinking over time (71MB then 17.7MB) — the signature of native-heap fragmentation building up, not a one-off. Root causes found and fixed:
+1. **The dominant one**: the VIEW=True debug preview (`orchestrator.py` `_show_image`/`_show_image_path`) used `os.startfile()` — opening a brand-new external Photos/viewer process every single cycle and never closing any of them, despite the code's own "3s" comment describing a timed auto-closing preview that was never actually implemented. Over a long session that's dozens of full-size (~73MB decoded) viewer windows accumulating indefinitely. Replaced with `cv2.imshow()`/`waitKey(3000)`/`destroyWindow()` — same debug behavior, but genuinely self-closing, in-process, nothing left behind.
+2. `draw_target_highlight()` did a full-frame `.copy()` (~73MB at real resolution) purely to draw one crosshair for that same ephemeral preview — now mutates in place instead (the disk-saved annotated image is already written before this is ever called, so nothing persisted gets corrupted).
+3. `run_overhead_detection()` creates 5-6 full-frame-sized (~24.5MB each) temporary buffers every cycle (threshold/mask/morphology stages) that previously only got released at function-exit scope; now explicitly `del`eted as soon as each is no longer needed, plus a `gc.collect()` on every exit path to help the allocator actually consolidate freed memory rather than leave it fragmented.
+
+**Applied at:** `cib/core/orchestrator.py` (`_show_image`, `_show_image_path`), `cib/vision/pipeline.py` (`draw_target_highlight`, `run_overhead_detection`).
+
+---
+
+**DEV-10** *(the actual root cause of the "CONTINUE never worked" report behind DEV-5/DEV-8 — found via the real traceback, 2026-08-18)*
+
+> "curtain=False raw=0x0517 ... [light curtain trips] ... orchestrator.crashed error='unhandled errors in a TaskGroup (1 sub-exception)' ... transitions.core.MachineError: 'Can't trigger event safety_fault_protective from state IDLE!'"
+
+**Resolution:** This — not the reset-button sequencing (DEV-8) — is the actual reason CONTINUE appeared to do nothing during the reported light-curtain test. The light curtain tripped while the system was sitting **IDLE** (nothing running — e.g. between cycles). The state machine's `safety_fault_protective` transition was never defined as legal from `IDLE` (only `RUNNING`/`CYCLE_STOPPING`), but `_evaluate_safety()`'s own guard incorrectly allowed IDLE through anyway and tried it — raising an unhandled `MachineError` inside the `asyncio.TaskGroup` that runs the entire orchestrator backend. That crash is silent from the operator's point of view: the HMI window survives (it runs on a separate thread), but safety polling, PLC polling, robot keepalive, and event processing are all dead — CONTINUE has nothing left alive to respond to it. Fixed in two parts:
+1. `IDLE` added as a legal source for `safety_fault_protective`, matching `safety_fault_estop` (which already allowed it) — a light curtain trip while idle is entirely real (someone reaches into the cell between cycles) and must be handled, not crash.
+2. Recovery now remembers what state the system was in *before* the fault (`_state_before_fault`, captured the instant the fault is first detected) and uses it to decide the correct landing state: if something was actually running, resume RUNNING as before (FR-SAF-08); if nothing was running (fault hit while IDLE), land back in IDLE via `hardware_reset_complete` instead — auto-resuming RUNNING would otherwise start a picking cycle nobody asked for.
+
+**Applied at:** `cib/core/state_machine.py` (`safety_fault_protective` source list, `hardware_reset_complete` source list), `cib/core/orchestrator.py` (`_evaluate_safety`, `OperatorAcknowledgeEvent` PROTECTIVE_STOP branch).
+
+---
+
+**DEV-11** *(appeared at: Section 8.2 FR-ROB-06, Appendix A.8 — 2026-08-19, mechanical safety concern raised by David Mandrell)*
+
+> "David doesn't want the pipette to drop directly on the bug, because there's no control over the pipette [it's a plain on/off pneumatic solenoid]. He wants the pipette mount raised a little so it can't hit the glass bottom of the tray, and while the robot is positioned over the bug: pipette down first, then robot/EOA Z down to -61 — that should be enough to almost pick the bug. Same for dropping: pipette over the drop position, pipette down, EOA down to -61. Retracting is EOA up first, then pipette retracted. No moving around with the pipette down."
+
+**Resolution:** The pipette's pneumatic stage (Output 4) is a binary on/off actuator with no speed or force control — previously it alone performed the entire final descent to the specimen/well, so any mis-calibration had no controlled stopping point short of the glass. Fixed with a two-stage descent, mirroring the mechanical change (pipette mount raised so full pneumatic extension physically cannot reach the glass dish/well bottom):
+1. Pipette extends first (`On 4`, then `WaitPipetteDown` for Input 22) — now a short, mechanically-limited stroke that cannot itself reach the bottom.
+2. Robot Z then performs the actual controlled final approach — a `Move` at the same XY (never a lateral/XY move while the pipette is down) down to **-62.000** (revised from the initial -61.000 same-day, after real-hardware testing), closing the small remaining gap left by the shorter pneumatic stroke. This move is speed/accel-controlled, unlike the pneumatic.
+3. Aspirate (PICK) or dispense (DROP).
+4. Retraction reverses in the corresponding order: robot Z moves back up (same XY, to -58.660) FIRST, THEN `Off 4` retracts the pneumatic SECOND. Only after `WaitPipetteUp` confirms full retraction does any XY travel move happen (back to -47.700 travel height) — matching the existing "pipette never extended during XY travel" rule, now made explicit for the new Z-only moves added in between.
+Applied identically to PICK/PICK_U and DROP/DROP_U — David's description covered both pick and drop.
+
+**Open items, not yet resolved:** (1) Whether Input 22 ("pipette fully down") still fires reliably at the new, mechanically-shortened stroke length has not been verified against real hardware — needs confirmation on the next hardware test pass. (2) The -58.660 hover/imaging height is unchanged from before this fix (David referenced "around -55" only as approximate context for where imaging happens, not as an instructed value change) — flag if that assumption is wrong.
+
+**Update (same day, after hardware testing):** Descent depth revised -61.000 → **-62.000**. Separately, the operator reported the robot-controlled descent move itself (step 2 above) ran too fast to look like a controlled approach — the entire point of moving this off the pneumatic. Fixed by wrapping just that one `Move` in `Speed 2` / `Accel 2,2` (down from the global `Speed 5` / `Accel 5,5` set at program start), restored to 5/5,5 immediately after — no other move in the program is affected.
+
+**Applied at:** FR-ROB-06, Appendix A.8, `robot_programs/sort_server.prg` (`PICK`, `PICK_U`, `DROP`, `DROP_U` handlers — `-62.000` Z-only descent/retract moves around the existing `On 4`/`Off 4`, descent move wrapped in `Speed 2`/`Accel 2,2`).
+
+---
+
+**DEV-12** *(appeared at: Section 8.6 FR-PUMP-06 — 2026-08-19)*
+
+> "Right now if it was 200k it is verified, let's add 50000 to it. Even while dropping also the same will be dropped. Also if the comment and stuff say otherwise, please update, cause 200000 works well for now. So I need to suck more so add 50000."
+
+**Resolution:** Aspirate/dispense volume is set by step count in the two onboard programs flashed to the linear actuator (`G2`=aspirate, `G1`=drop), not read at runtime — `sort_server.prg` just sends `EX G2`/`EX G1`. Increased both `ASPIRE_STEPS` and `DROP_STEPS` in `hardware_tests/linear_control.py` from 200,000 to **250,000** (kept symmetric, per the request that drop increase by the same amount). Also fixed, found while making this change: the file's own docstring/`_HELP`/`_USAGE` text had been stale since a prior step-count change and additionally had the sign of every value backwards from what the code actually flashes (e.g. docstring claimed `G1 → MR +50000`, but the real constant assigned to G1 was negative) — all corrected to match the real `DROP_STEPS`/`ASPIRE_STEPS` values and signs. Also fixed a display-only bug in `upload_programs()`'s summary print (`f"MR +{DROP_STEPS}"` produced a literal double-sign like `MR +-250000` since `DROP_STEPS` is already negative). `architecture/motor.md`'s step-count table and the "±50,000 confirmed safe" note updated to match — that note was already 4x stale before this change (motor had been running at 200,000 in production); reworded to record 200,000 as the confirmed-working baseline this increase is measured from.
+
+**Update (same day):** Increased further, +100,000 more ("want to draw more liquid") — `ASPIRE_STEPS`/`DROP_STEPS` now **350,000**, still symmetric. Same files re-flashed via `linear_control.py upload`; no new discrepancies found this pass since the prior pass already fixed the stale docs/sign bug.
+
+**Update (same day):** Increased again to **3x the 350,000 value — 1,050,000 steps**, both `ASPIRE_STEPS` and `DROP_STEPS`, per explicit instruction. Flagged before implementing that this is a much larger jump than the two prior increments (over 5x the 200,000 value that was actually hand-jogging-confirmed safe, with lead screw pitch/travel limit still unconfirmed per `architecture/motor.md`) and offered a more gradual path instead; user confirmed going straight to 3x. Implemented as asked — watch the first real run closely for a stall or hard-stop collision.
+
+**Update (same day):** Operator asked whether aspirate speed (not distance) could be increased and what it currently is. Distinct from step count — MCode's `VM`/`VI`/`A`/`D` (velocity/accel/decel registers) govern how fast G1/G2 run, and none of this repo's scripts have ever set them, so the actuator has been running at the motor's factory/flash default velocity the entire time, never explicitly configured or measured. Added a `speed` query sub-command to `linear_control.py` (`PR VM`/`PR VI`/`PR A`/`PR D`, read-only, no motion) so the real current value could actually be read instead of guessed. Queried on real hardware: `VM=768000, VI=1000, A=1000000, D=1000000` — already fairly aggressive, not a neglected slow default; at 1,050,000 steps this profile is accel/decel-dominated (only a short cruise phase, ~2.1s total move), so raising `VM` alone would have given only marginal improvement without also raising `A`/`D`. Presented this tradeoff plus a stall-risk warning (pushing speed and acceleration up together on an already-3x'd travel distance is more likely to cause `ER=86` than the step-count increases were) and offered three options; operator chose the aggressive one. Implemented: `VM=1200000, A=2000000, D=2000000` (`VI` left at 1000, not requested to change), baked into both `G1` and `G2` program bodies (each program must set its own profile explicitly — they're separate onboard programs, not a shared global setting).
+
+**Applied at:** `hardware_tests/linear_control.py` (`print_velocity()`/`speed` sub-command, `VELOCITY_MAX`/`ACCEL`/`DECEL` constants, `upload_programs()` writes `VM=`/`A=`/`D=` into each program body before its `MR`), `architecture/motor.md` (velocity profile documented).
+
+**Open item, not yet resolved:** FR-PUMP-06 calls for aspirate/dispense parameters to be configurable in plate/machine config — today they are hardcoded into the motor's own non-volatile flash program and can only be changed by editing `linear_control.py` and re-running `upload` (a manual, out-of-band step, disconnected from the Python-side config system). Flagging since this is now the second time this session the step count changed by hand; worth a real config-driven path if it keeps happening.
+
+**Applied at:** `hardware_tests/linear_control.py` (`DROP_STEPS`, `ASPIRE_STEPS`, all stale docstring/help text, upload summary sign bug), `architecture/motor.md` (step-count table and safety note).
+
+---
+
+**DEV-13** *(appeared at: Section 8.2 FR-ROB-06, Appendix A.8 — 2026-08-19, found during live hardware testing of DEV-11)*
+
+> "the descent of EOA is still fast, when it goes to pick up bug and drop... also i think i know the issue, so everytime, i see the pipette is little (maybe 1mm or 2mm) offset (up) +ve y, i think this is why it is not picking, so the pipette offset, can you work on this? maybe lets try 1mm making pipette go in -y... please ensure when it descents to pick bug and drop EOA is slowered down... but after it pick the bug from the tray, then the EOA should move fast up, and pipette should come fast up same while dropping as well."
+
+**Resolution — two separate fixes:**
+1. **The DEV-11 descent-speed fix didn't actually work — real bug found.** `Speed`/`Accel` only govern PTP/joint motion commands (`Go`) in SPEL+; every fine-motion command in `sort_server.prg` uses `Move`, which is a linear/CP command controlled by a completely different pair, `SpeedS`/`AccelS` (mm/sec). Wrapping the descent in `Speed 2`/`Accel 2,2` (DEV-11) had no effect on it at all — it was governing a command family nothing in this program's hot path uses. Replaced with `SpeedS 10`/`AccelS 10,10` around the descent `Move` only, restored to a new fast baseline (`SpeedS 100`/`AccelS 100,100`, also set once at program start so the whole file has a deterministic default instead of an implicit system default) immediately after — which automatically carries through the retract-up move and the final travel move, giving exactly the "slow down only, fast up" behavior requested without touching those moves separately.
+2. **Pipette Y offset corrected -1mm.** `TLSet 2`'s Y component: -77.5233 → **-78.5233**, per direct instruction, to compensate for the pipette consistently landing ~1-2mm off in +Y (operator's working theory for the pick failures, not independently measurement-verified by software — this is a physical CAD-offset correction, worth confirming against a few more picks).
+
+**Update (same day):** Operator reported it was also off in X — `TLSet 2`'s X component corrected -1mm the same way: -22.8124 → **-23.8124**. Same caveat as the Y correction: based on the operator's visual read of where the pipette is landing, not an independently measured value — worth confirming against a few more real picks, and revisiting if it's still off by a different amount.
+
+**Update (same day):** The -1mm/-1mm correction above was PICK-only in intent, but `Tool 2` (and its offset) was shared by both PICK and DROP — so DROP inherited the same correction and started hitting the well rims. Split into two calibration slots for the same physical pipette: `Tool 2` keeps the corrected offset (-23.8124, -78.5233) and is used by PICK/PICK_U (and the MOVE_PIPETTE/PIPETTE_DOWN teaching commands, unaffected either way); `Tool 3` was added holding the original, pre-correction offset (-22.8124, -77.5233) and is now used exclusively by DROP/DROP_U, restoring drop behavior to "like before."
+
+**Applied at:** `robot_programs/sort_server.prg` (`TLSet 3` added at program start; `DROP`/`DROP_U` handlers switched from `Tool 2` to `Tool 3`).
+
+**Update (same day) — Tool 3 reverted; single-tool-offset + shifted-config approach adopted instead.** Operator wanted one calibrated pipette offset used for both PICK and DROP (not two competing tool calibrations), with the well *config* absorbing the correction instead. Also requested one more -1mm on Y (total now -2mm Y from the original baseline; X unchanged at -1mm total). Implemented:
+1. `TLSet 2` Y: -78.5233 → **-79.5233** (X unchanged at -23.8124). Total correction from the untouched original values: X -1mm, Y -2mm.
+2. `TLSet 3` removed entirely; `DROP`/`DROP_U` reverted to `Tool 2` — one pipette offset, used everywhere.
+3. **Well X/Y in the plate config shifted to compensate.** First attempt shifted every well by the same delta as the tool offset (-1mm X, -2mm Y) — operator corrected this as backwards; the actual fix applied is the **opposite** sign: **+1mm X, +2mm Y** on every well, restored from the pre-shift backup before re-applying so the correction is measured from the true original values, not compounded on the wrong first attempt. Applied via `hardware_tests/shift_plate_wells.py` (dry-run supported, writes a `.bak` backup before modifying, verified afterward by reloading through the real `cib/config/loader.py` path).
+
+**Update (same day):** `TLSet 2` X corrected another -2mm (X now **-3mm total** from the original -22.8124; Y unchanged at -2mm total). Well config X correspondingly shifted another +2mm (X now **+3mm total** from the original taught values; Y unchanged at +2mm total) — same opposite-sign relationship as before, applied incrementally on top of the already-corrected file rather than re-deriving from scratch.
+
+**Applied at:** `robot_programs/sort_server.prg` (`TLSet 2`/`TLSet 3`, `DROP`/`DROP_U` handlers), `hardware_tests/shift_plate_wells.py` (new), `config/plate_configs/test_96well.xlsx` (all 96 wells shifted +3mm X / +2mm Y total from the original taught values, `.bak` backup kept alongside).
+
+**Open item, not a code fix — needs mechanical/pneumatic attention, not software:** the operator also asked for the pipette itself (not just the EOA) to retract fast after picking/dropping. The pipette's motion is a pure pneumatic solenoid (Output 4 ON/OFF) with no speed control exposed to software at all — SPEL+ can only trigger it, not set how fast the cylinder moves. Any change to pipette retraction speed is a pneumatic regulator/flow-control adjustment on the physical hardware, not something fixable in `sort_server.prg`.
+
+**Not yet investigated — need more information:** the operator also reported the backlight "starting 1-by-1, slow" starting from the 3rd attempt today, after apparently not seeing this on prior days. `cib/drivers/lighting/driver.py` already batches all 3 channel commands into one TCP write specifically to prevent a staggered per-channel switch-on (see its own code comment) — so this isn't the old un-batched bug recurring verbatim. Best working hypothesis, not yet confirmed: the DCS-100E only accepts one TCP session at a time and needs ~15s to clear a stale session left by an unclean disconnect (a prior crash this session could easily have left one); `_connect_sync()`'s reconnect-with-backoff (up to 10 attempts, 3s apart) would look exactly like a slow, seemingly staggered light startup if it fired mid-run on the 3rd cycle. Needs the actual log around that failure (specifically whether `lighting.connect_reset` warnings appear) to confirm rather than guess — flagging as open, not fixed.
+
+**Applied at:** `robot_programs/sort_server.prg` (`SpeedS`/`AccelS` replacing `Speed`/`Accel` around all four PICK/PICK_U/DROP/DROP_U descent moves, `SpeedS 100`/`AccelS 100,100` baseline added at program start, `TLSet 2` Y offset).
+
+---
+
+**DEV-14** *(appeared at: Section 8.7 FR-EOA-05 — 2026-08-19, found while chasing the same symptom as DEV-13)*
+
+> "i think the EOA pixel being sent to pipette is itself off by 1 or 2mm in x direction, so even though i keep changing x, the pipette is always off. is this correct? i think the EOA center should be properly sent and i think there is where we need to tweak."
+
+**Resolution:** Confirmed correct, and root-caused. Key distinguishing fact: DROP doesn't use vision at all (fixed, pre-taught well coordinates), while PICK does (`_compute_eoa_correction()`, using `camera_calibration/output/eoa_pixel_scale.json`). Since DROP was landing correctly with the current `TLSet 2`, the tool offset itself was fine — so PICK's continued X error had to be coming from somewhere upstream of the tool offset, i.e. the vision correction computing its target in the first place.
+
+Root cause: `eoa_pixel_scale.json` was generated by `hardware_tests/eoa_pixel_scale.py`, which moved the robot with plain `MOVE_IMAGE` (no U specified) — silently holding whatever U the robot happened to already be parked at, never recorded. Real PICK operations happen at one of two quadrant angles, `u_top_deg=209.0` / `u_bottom_deg=251.0` (`config/machine_config.yaml`), selected per-specimen by `_select_quadrant_u()`. The EoA camera physically rotates with U, so the pixel→mm calibration is only valid at the U it was measured at — applying one fixed, arbitrary-U calibration uniformly at U=209° or U=251° (42° apart) produces an error that isn't even constant across the dish, which is exactly why no single tool-offset tweak could fully fix it.
+
+**Fix implemented** (calibration itself not yet re-run — needs real hardware time):
+1. `hardware_tests/eoa_pixel_scale.py`: now requires an explicit `--u <degrees>` argument, moves with `MOVE_IMAGE_U` (holding that exact U for every move in the run, never the bare U-blind `MOVE_IMAGE`), and saves to `eoa_pixel_scale_u<U>.json` (e.g. `_u209.json`, `_u251.json`) instead of a single shared file, so both quadrant calibrations can coexist.
+2. `cib/core/orchestrator.py`: new `_load_eoa_pixel_scale(target_u)`, cached per-U in `self._eoa_pixel_scale` (now a dict, was a single dict/None). Loads `eoa_pixel_scale_u<target_u>.json` when quadrant U-selection is configured; falls back to the old un-quadranted `eoa_pixel_scale.json` if no U-specific file exists yet (warns) or if quadrant U-selection isn't configured at all (`target_u=None`, preserves pre-existing behavior). `_compute_eoa_correction()` now takes `target_u` and calls this.
+
+**Remaining action, not done here:** the actual per-quadrant calibration files (`eoa_pixel_scale_u209.json`, `eoa_pixel_scale_u251.json`) still need to be captured on real hardware:
+```
+python hardware_tests/eoa_pixel_scale.py --u 209
+python hardware_tests/eoa_pixel_scale.py --u 251
+```
+Until both exist, PICK falls back to the old single-file behavior (still U-blind) with a warning logged each time.
+
+**Applied at:** FR-EOA-05, `hardware_tests/eoa_pixel_scale.py` (`--u` required, `MOVE_IMAGE_U`, per-U output filename, `u_deg` recorded in the JSON), `cib/core/orchestrator.py` (`_load_eoa_pixel_scale`, `_compute_eoa_correction` now takes `target_u`, `self._eoa_pixel_scale` now a per-U cache dict).
+
+**Update (same day) — two more fixes to the calibration script while getting a clean run:**
+1. Added a labeled overhead preview (`show_labeled_overhead()`) — shows the detected bugs circled and numbered on the actual overhead image before the terminal's numeric selection prompt, so selection isn't a blind guess against X/Y numbers alone.
+2. Added quadrant filtering: bug selection is now restricted to bugs that actually belong to the U angle being calibrated (using `quadrant_split_y_mm` the same way `_select_quadrant_u()` does), so `--u 209` only offers bugs from the top half of the dish and `--u 251` only the bottom half — prevents accidentally calibrating one quadrant's angle against a bug that's really in the other.
+3. **Backlight**: briefly added code to turn the backlight off during EoA capture (to match one interpretation of production's frame 1). Operator confirmed this is wrong — backlight must stay ON throughout, full stop. Reverted; the script does not touch the backlight at all now. Left unresolved: production's own two-frame EoA capture (`_run_cycle` in `orchestrator.py`) captures a backlight-OFF frame first and a backlight-ON frame second, and the code comments say the backlight-ON frame is the one actually classified on — worth reconciling against this instruction at some point, but not changed this session.
+
+**Applied at:** `hardware_tests/eoa_pixel_scale.py` (`show_labeled_overhead()`, quadrant-filtered bug list, backlight control added then fully removed).
+
+---
+
+**DEV-15** *(appeared at: Section 8.2 FR-ROB-06, Section 8.7 FR-EOA-05 — 2026-08-19, architectural cleanup after DEV-13/DEV-14)*
+
+> "lets go back to the previous original offset or tool 2 (pipette)... go back to original and make the wells coordinates also what we had first, but when the camera sends the coordinate to pipette then subtract -y 2mm and -x by 3mm."
+
+**Resolution:** Every X/Y correction applied this session before DEV-14 was found (Tool 2 tweaks, a short-lived DROP-only Tool 3, matching plate-config well shifts) was chasing the wrong root cause — the real bug was `eoa_pixel_scale.json` being calibrated at an unrecorded U angle (DEV-14), not a tool-offset error. With that fixed via per-quadrant calibration files, all of DEV-13's compensating changes were reverted to their true original values, and any remaining fine correction was moved to a single, deliberately narrow location:
+1. `TLSet 2` in `sort_server.prg` reverted to the true original: `XY(-22.8124, -77.5233, 0, 0)`.
+2. `config/plate_configs/test_96well.xlsx` reverted to the true original taught values (undid the cumulative +1mm X / +2mm Y shift from DEV-13 via `hardware_tests/shift_plate_wells.py --dx -1 --dy -2`).
+3. New `PICK_TARGET_CORRECTION_X_MM = -3.0` / `PICK_TARGET_CORRECTION_Y_MM = -2.0` constants in `cib/core/orchestrator.py`, applied only to `corrected_x`/`corrected_y` — the vision-computed PICK target — immediately after `_compute_eoa_correction()` returns, before the robot moves there for the verification capture.
+
+This is a deliberate architecture choice, not just a relocation: living in the PICK-target computation means this correction can only ever affect PICK. It can never again leak into DROP the way both the shared-Tool-2 approach and the plate-config-shift approach kept doing, since DROP doesn't go through `_compute_eoa_correction()` at all. Re-tune or zero out these constants once real picks on both quadrants confirm whether they're still needed now that DEV-14's actual fix is in place — they may turn out to be unnecessary residual guesswork, or a genuine small remaining correction; only real hardware testing will tell.
+
+**Applied at:** FR-ROB-06, FR-EOA-05, `robot_programs/sort_server.prg` (`TLSet 2` reverted), `config/plate_configs/test_96well.xlsx` (reverted), `cib/core/orchestrator.py` (`PICK_TARGET_CORRECTION_X_MM`/`_Y_MM` constants, applied in the Step 7 EoA-correction block).
+
+**Update (same day):** Plate/dish physically shifted since the 2026-08-14 teach — operator re-measured A1/A12/H1 on the real pendant (A1=189.955,287.602; A12=189.955,188.602; H1=252.955,287.602 — a clean, exactly axis-aligned 9.000mm pitch both directions, even cleaner than the 2026-08-14 values). `hardware_tests/plate_from_coords.py`'s reference constants updated (old values kept in a comment) and re-run to regenerate `config/plate_configs/test_96well.xlsx` from scratch — this is a fresh re-teach, not a shift on top of DEV-13's now-reverted values. Old file backed up to `test_96well.xlsx.bak`. Verified: all 3 given points plus the computed H12 corner match expected values, all 96 wells reload correctly through `cib/config/loader.py`.
+
+**Applied at:** `hardware_tests/plate_from_coords.py` (A1/A12/H1 constants), `config/plate_configs/test_96well.xlsx` (fully regenerated).
+
+**Update (same day):** `PICK_TARGET_CORRECTION_X_MM` adjusted -3.0 → **-2.0**. Confirmed with the operator that this correction only affects `corrected_x`/`corrected_y` → `refined_x`/`refined_y` → `execute_pick()`; DROP uses entirely separate variables (`well_x`/`well_y` from `_get_next_well_coords()` → `execute_place()`) and is structurally unreachable by this code path.
+
+**Update (same day):** `PICK_TARGET_CORRECTION_Y_MM` adjusted -2.0 → -1.0 → 0.0 → +1.0 → **+2.0**, based on real-hardware feedback across all steps. Current values: X=-2.0mm, Y=+2.0mm.
+
+---
+
+**DEV-16** *(appeared at: Section 8.2 FR-ROB-06, Section 8.6 FR-PUMP-06 — 2026-08-19)*
+
+> "no because the tip sometimes goes and moves the bug or like puts weight on it so i am not able to aspirate. i am thinking if we start pulling with more steps, like 1.5 times of what we have now and increase speed by 2 times of what we have now. i want to test which config works best for us... also start aspirating while descending."
+
+**Resolution — two changes, both to test against the tip-disturbance problem:**
+1. **Motor tuning**: `ASPIRE_STEPS`/`DROP_STEPS` 1.5x'd → **±1,575,000** (from 1,050,000); `VELOCITY_MAX` 2x'd → **2,400,000** (from 1,200,000; `A`/`D` left at 2,000,000 — operator asked to increase "speed" specifically, not acceleration). `hardware_tests/linear_control.py` updated; needs `upload` re-run to flash.
+2. **Aspirate-while-descending**: initially considered SPEL+ multitasking (`Xqt`) for true concurrency, but no SPEL+ language reference exists in this repo to verify the exact syntax against, and guessing at unfamiliar hardware-command syntax risked wasting a real hardware test cycle. Found a simpler path needing no new syntax at all: the motor communication already runs over its own separate TCP socket (#202), completely independent of the robot's own motion — the existing `MotorAspire` only *looked* sequential because it waited for the motor's "done" response immediately after sending the command. Split into `StartMotorAspire` (opens the socket, sends `EX G2`, returns immediately — does not block) and `WaitMotorComplete` (the polling wait, unchanged, just deferred). `PICK`/`PICK_U` now call `StartMotorAspire` *before* the two-stage descent's Z-move (DEV-11) instead of after it, and `WaitMotorComplete` after that move completes, before retracting. Net effect: aspiration genuinely starts while the tip is still approaching, not only once it fully arrives — real concurrency, achieved by reordering rather than by parallel task execution. `DROP`/`DROP_U` and the old synchronous `MotorAspire` are unchanged (kept, unused, for possible future use) — this was a PICK-specific request.
+
+**Open/flagged, not resolved here:** whether starting suction before contact actually helps (letting airflow pull the bug in before the tip's weight lands) or hurts (blowing air across the specimen before the tip is close enough to capture it, or the aspirate stroke finishing before the tip arrives) is exactly what the operator wants to test on real hardware — this is deliberately an experiment, not a claimed fix.
+
+**Applied at:** FR-ROB-06, FR-PUMP-06, `hardware_tests/linear_control.py` (`ASPIRE_STEPS`/`DROP_STEPS`/`VELOCITY_MAX`), `robot_programs/sort_server.prg` (`StartMotorAspire`/`WaitMotorComplete` new functions, `PICK`/`PICK_U` handlers reordered).
+
+---
+
+## Appendix D — Proposed Plate Well-Position Approach (2026-08-11, PENDING — not yet confirmed)
+
+**Status: NOT YET CONFIRMED.** This is a brainstormed direction for OQ-26, to be discussed with Austin/David. Documented here so it isn't lost, not as a resolved decision. Do not treat anything below as final.
+
+### The gap this addresses
+
+The PRD as written (FR-SETUP-02, FR-UI-12, FR-SETUP-09, OQ-22) assumes plate config files already exist with every well's X/Y filled in, created externally by some unspecified process, and simply selected by the operator at runtime. It never actually specifies **how** those X/Y values get determined. The shipped template (`config/create_plate_template.py`, "Instructions" sheet) currently documents the only concrete method that exists today: jog the robot to every single well by hand, read the position off the RC+ display, and type it into the spreadsheet — once per well, for all 96 (or however many) wells. That is the literal current plan, and it's the thing this appendix proposes replacing.
+
+Also unaddressed in the current PRD: there are 4 physical plate stations at different physical locations, but "one config file per run" (FR-SETUP-02) doesn't describe how one file's absolute X/Y values are supposed to apply correctly across multiple stations.
+
+### Proposed direction
+
+1. **Teach 2 reference points per plate-type-per-station, not all 96 wells.** Standard multi-well plates follow a fixed SBS/ANSI pitch (96-well = exactly 9.00mm between wells in both directions, industry-wide, independent of manufacturer). Teaching 2 wells (e.g. A1 and A12, or two opposite physical corners of the plate body) gives enough information to compute the full grid — including the true row/column direction vectors, which catches any slight fixture rotation rather than assuming perfect alignment.
+2. **Teach via the EoA camera, not the pipette.** Same non-contact method already proven today (`eoa_tool_offset.py` and the overhead/EoA calibration scripts): jog until the camera crosshair visually aligns on the reference point, read X/Y/U off the pendant. Avoids risking the pipette needle against hard plate edges. Since the camera↔pipette (Tool 1 ↔ Tool 2) offset is already measured and confirmed (2026-08-06), converting a camera-taught point into the correct pipette target is the same math already validated for specimen picking.
+3. **Auto-generate the full plate config file** (same Excel format already shipped — `well, x, y, ...` columns) from the 2 taught points + known pitch, instead of manual entry per well.
+4. **Separate "plate geometry" from "station registration"** to avoid needing 4 duplicate files per plate type: plate geometry (relative well layout) is measured once and is reusable across all 4 stations and even across machines; only a station's origin (one point) needs teaching per station.
+
+### Two open questions this proposal depends on, still unresolved
+
+- **Do plate station nests register plates repeatably** (alignment pins, keyed slot, positive-stop edge), or does placement vary per load (loose/friction fit)? This decides whether step 1 above happens **once per plate-type-per-station** (cheap, done rarely) or **every single plate load** (which — per 2026-08-11 discussion with Tejas — is the current working assumption, meaning this becomes a routine **operator** task, not a one-time engineer setup task, with real implications for how much of this needs to be UI-guided and how automatic it needs to be).
+- **Does the overhead or EoA camera have physical line-of-sight to the plate stations?** If yes, the corner-teaching step in #2 above could potentially be fully automatic (vision detects the plate's physical corners, no jogging at all — same corner-detection technique already proven for camera calibration) instead of requiring an operator to jog the robot on every load. If no, camera-assisted manual jogging (as described in #2) is the fallback, which is a heavier operational burden if it must happen on every plate load rather than once per plate type.
+
+**If "re-teach every load" and "camera can't see the stations" both hold**, this needs a new FR describing an operator-facing teach step as part of pre-run setup (not currently in the PRD) — this would be a real addition to FR-SETUP, not just an implementation detail.
+
+### What was built for immediate testing (2026-08-11), independent of the above
+
+While this is pending discussion, a **quick working setup** for the plate physically installed right now was implemented so pick→drop-into-wells could be tested immediately, without waiting on the full auto-generation tooling above. See the codebase for current state — this was explicitly scoped as a test/interim setup, not the final design described above.

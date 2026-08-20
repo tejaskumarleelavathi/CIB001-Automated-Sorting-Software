@@ -92,6 +92,12 @@ class RobotConfig:
     port:               int
     connect_timeout_s:  float
     command_timeout_s:  float
+    # Quadrant-based U (wrist) angle selection — all three optional. If any is
+    # None, quadrant U-selection is disabled (MOVE_IMAGE keeps holding whatever
+    # U the robot is currently at — pre-2026-08-05 behavior).
+    quadrant_split_y_mm: Optional[float] = None
+    u_top_deg:           Optional[float] = None
+    u_bottom_deg:        Optional[float] = None
 
 
 @dataclass
@@ -309,6 +315,15 @@ def _parse_machine_config(raw: dict) -> MachineConfig:
             port=int(r["port"]),
             connect_timeout_s=float(r["connect_timeout_s"]),
             command_timeout_s=float(r["command_timeout_s"]),
+            quadrant_split_y_mm=(
+                float(r["quadrant_split_y_mm"]) if r.get("quadrant_split_y_mm") is not None else None
+            ),
+            u_top_deg=(
+                float(r["u_top_deg"]) if r.get("u_top_deg") is not None else None
+            ),
+            u_bottom_deg=(
+                float(r["u_bottom_deg"]) if r.get("u_bottom_deg") is not None else None
+            ),
         ),
         plc=PLCConfig(
             ip=p["ip"],

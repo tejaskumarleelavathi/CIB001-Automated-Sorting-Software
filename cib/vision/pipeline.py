@@ -404,10 +404,14 @@ def run_overhead_detection(
         mask = _make_interior_mask(gray.shape, cx, cy, radius)
         interior = cv2.bitwise_and(gray, gray, mask=mask)
         thresh = _threshold_bugs(interior, mask)
+        del interior   # ~24.5MB at 4600x5320 — done with it, drop it now rather
+                        # than at function exit (see OOM note at bottom of this fn)
         cleaned = _morph_clean(thresh)
+        del thresh      # same reasoning, another ~24.5MB
 
         # ── Stage 3: Extract centroids ────────────────────────────────────────
         centroids_px, contours = _extract_centroids(cleaned)
+        del cleaned
         log.info(
             "overhead_pipeline.detection_complete",
             specimen_count=len(centroids_px),
@@ -464,6 +468,20 @@ def run_overhead_detection(
             sample_count=0,
         )
 
+    finally:
+        # This pipeline creates 5-6 full-frame-sized (~24.5MB at 4600x5320)
+        # temporary buffers every single cycle, on top of two ~73MB BGR
+        # copies elsewhere (see _annotate_frame / draw_target_highlight,
+        # and the os.startfile() leak fixed in orchestrator.py _show_image).
+        # Found live via a real cv2 OutOfMemoryError after a long session —
+        # repeated large alloc/free of this size fragments the native heap
+        # faster than CPython's own refcounting alone reliably reclaims it.
+        # gc.collect() here is cheap relative to the vision work already
+        # done and gives the allocator a real chance to consolidate before
+        # the next cycle's frame comes in.
+        import gc
+        gc.collect()
+
 
 def draw_target_highlight(
     annotated: np.ndarray,
@@ -476,9 +494,21 @@ def draw_target_highlight(
         target_px:  (x, y) pixel centroid of the selected target bug.
 
     Returns:
-        New BGR image with the target highlighted in cyan.
+        The SAME array passed in, mutated in place, with the target added.
+
+        Deliberately not a copy (was `annotated.copy()` until 2026-08-18):
+        a full-frame BGR copy here is a ~73MB allocation for a 4600x5320
+        overhead frame, made every VIEW-enabled cycle purely for a debug
+        preview window that's discarded immediately after — found via a
+        live OpenCV OutOfMemoryError after a long session (repeated large
+        alloc/free of full-frame buffers fragments the native heap until
+        even much smaller allocations start failing). The disk-saved
+        annotated image was already written before this function is ever
+        called (see run_overhead_detection() Stage 5), so mutating the
+        caller's copy here doesn't corrupt anything already persisted —
+        it's only ever used for this one ephemeral preview afterward.
     """
-    out = annotated.copy()
+    out = annotated
     x, y = int(target_px[0]), int(target_px[1])
 
     # Scale marker size to image dimensions (images can be 5000+ px wide)
