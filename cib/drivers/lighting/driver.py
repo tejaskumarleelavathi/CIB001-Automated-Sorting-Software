@@ -3,7 +3,10 @@ Real lighting controller driver — Advanced Illumination DCS-100E.
 
 Protocol confirmed from hardware_tests/test_lighting.py:
     Commands are semicolon-terminated ASCII, multiple commands batched in one send.
-    Three channels (1, 2, 3) — all turned on/off together for the backlight.
+    Three channels (1, 2, 3). set_backlight() treats all three as one on/off
+    unit (the normal case — overhead capture wants full brightness).
+    set_backlight_channels() (added 2026-08-21) controls a subset
+    independently — used for a reduced-brightness EoA capture.
 
     SET:MODE:CHANNELx,1      → turn channel x ON
     SET:MODE:CHANNELx,0      → turn channel x OFF
@@ -43,6 +46,12 @@ class LightingControllerDriver:
         self._connect_timeout = connect_timeout_s
         self._sock: socket.socket | None = None
         self._backlight_on = False
+        # Per-channel state — the source of truth. _backlight_on above is
+        # derived from it (True only when every channel in CHANNELS is on)
+        # so set_backlight()'s "already in that state, skip" optimization
+        # stays correct even after set_backlight_channels() calls have
+        # changed individual channels independently (2026-08-21).
+        self._channels_on: set[int] = set()
 
     # ------------------------------------------------------------------
     # connect / disconnect
@@ -88,6 +97,7 @@ class LightingControllerDriver:
                     self._send_command(f"SET:LEVEL:CHANNEL{ch},{self._current_ma}")
                     self._send_command(f"SET:MODE:CHANNEL{ch},0")
                 self._backlight_on = False
+                self._channels_on = set()
                 break   # success
             except ConnectionResetError as exc:
                 try:
@@ -139,6 +149,7 @@ class LightingControllerDriver:
                 pass
             self._sock = None
         self._backlight_on = False
+        self._channels_on = set()
         log.info("lighting.disconnected")
 
     # ------------------------------------------------------------------
@@ -162,12 +173,35 @@ class LightingControllerDriver:
         self._send_batch([f"SET:MODE:CHANNEL{ch},{mode}" for ch in CHANNELS])
 
         self._backlight_on = on
+        self._channels_on = set(CHANNELS) if on else set()
         log.debug("lighting.backlight", on=on)
 
     async def set_ring_light(self, on: bool) -> None:
         """Ring light is robot digital output 12 — not controlled by DCS-100E."""
         log.debug("lighting.ring_light_noop", on=on,
                   note="ring light via robot digital output 12")
+
+    async def set_backlight_channels(self, channels: list[int], on: bool) -> None:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._set_backlight_channels_sync, channels, on)
+
+    def _set_backlight_channels_sync(self, channels: list[int], on: bool) -> None:
+        """
+        Turn specific channels on/off, leaving the rest untouched. Unlike
+        _set_backlight_sync, always sends (no "already in that state, skip"
+        check) — partial-channel calls are infrequent enough that the extra
+        round trip doesn't matter, and skipping here would be harder to
+        reason about correctly than just always sending.
+        """
+        mode = 1 if on else 0
+        self._send_batch([f"SET:MODE:CHANNEL{ch},{mode}" for ch in channels])
+        if on:
+            self._channels_on.update(channels)
+        else:
+            self._channels_on.difference_update(channels)
+        self._backlight_on = (self._channels_on == set(CHANNELS))
+        log.debug("lighting.backlight_channels", channels=channels, on=on,
+                  all_channels_on=self._backlight_on)
 
     # ------------------------------------------------------------------
     # internal

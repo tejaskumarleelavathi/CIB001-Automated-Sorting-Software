@@ -13,8 +13,6 @@
 '   PICK_U x,y,u         -> OK PICKED x,y              (Tool 2/pipette, explicit U, aspirates)
 '   DROP x,y             -> OK DROPPED x,y             (Tool 2/pipette, holds current U, dispenses)
 '   DROP_U x,y,u         -> OK DROPPED x,y             (Tool 2/pipette, explicit U, dispenses)
-' DROP/DROP_U pause 3s at travel height above the drop XY before descending —
-' operator E-STOP reaction window in case the drop location is wrong.
 '   RING_ON / RING_OFF
 '   BYE
 '
@@ -49,30 +47,56 @@
 ' condition — a hard mechanical limit, not a calibration value. Because the
 ' pneumatic alone therefore can no longer reach the specimen, the robot's own
 ' Z axis (speed/accel-controlled, unlike the on/off pneumatic) now does the
-' final approach. Both PICK/PICK_U and DROP/DROP_U now sequence as:
+' final approach. Both PICK/PICK_U and DROP/DROP_U sequence steps 1-4 the
+' same way:
 '   1. On 4 (pipette extends — its own now-limited, short stroke)
 '   2. WaitPipetteDown (Input 22 confirms full pneumatic extension)
-'   3. Move Z only, same XY, down to -62.000 (robot/EOA controlled descent —
-'      this is what actually reaches the specimen/well). Runs at SpeedS 10 /
-'      AccelS 10,10 (mm/sec — Move is a linear/CP command, controlled by
-'      SpeedS/AccelS, NOT Speed/Accel, which only affect Go/PTP commands and
-'      do nothing to Move. An earlier attempt at slowing this down used
-'      Speed/Accel and had no effect — found and fixed 2026-08-19.) The
-'      whole point of this being a robot-controlled move instead of the
-'      pneumatic is a controlled approach, so it must run slow. SpeedS/
-'      AccelS are restored to the fast baseline (100 / 100,100) immediately
-'      after this move — that same fast setting then carries through the
-'      retract-up move (step 5) and the final travel move (step 7).
-'   4. Aspirate (PICK) or dispense (DROP). DROP still fires here, after the
-'      descent, via the original synchronous MotorDrop. PICK diverges as of
-'      2026-08-19 (DEV-16): StartMotorAspire fires BEFORE step 3's descent
-'      (aspiration begins while the tip is still approaching, not only
-'      after it fully arrives — see StartMotorAspire/WaitMotorComplete),
-'      with WaitMotorComplete confirming completion right here at step 4
-'      before step 5's retract proceeds.
-'   5. Move Z only, same XY, back up to -58.660 (robot/EOA retracts FIRST,
-'      fast — see step 3)
-'   6. Off 4 (pipette retracts SECOND, only once EOA is already clear)
+'   3. Move Z only, same XY, down toward the aspirate/dispense depth
+'      (robot/EOA controlled descent — this is what actually reaches the
+'      specimen/well). Runs at SpeedS 10 / AccelS 10,10 (mm/sec — Move is a
+'      linear/CP command, controlled by SpeedS/AccelS, NOT Speed/Accel,
+'      which only affect Go/PTP commands and do nothing to Move. An
+'      earlier attempt at slowing this down used Speed/Accel and had no
+'      effect — found and fixed 2026-08-19.) The whole point of this being
+'      a robot-controlled move instead of the pneumatic is a controlled
+'      approach, so it must run slow. SpeedS/AccelS are restored to the
+'      fast baseline (100 / 100,100) once the FULL depth is reached — that
+'      same fast setting then carries through whichever retract-up move
+'      happens first (step 5) and the final travel move (step 7).
+'      DROP/DROP_U: one move straight to -60.000 (2026-08-21 — less
+'      descent needed to reach the well than PICK; was -62.000 like PICK
+'      before this, operator's call), THEN step 4 (MotorDrop) fires.
+'      PICK/PICK_U: split into two moves with step 4 sandwiched between
+'      them (2026-08-21, operator's call, current behavior — history
+'      below): first to -60.000, THEN StartMotorAspire (step 4, does not
+'      block), THEN continue to -62.000 while it runs, THEN
+'      WaitMotorComplete confirms it actually finished before anything
+'      retracts.
+'   4. Aspirate (PICK) or dispense (DROP). DROP: synchronous MotorDrop,
+'      fires after step 3 completes. PICK: StartMotorAspire, fires
+'      partway through step 3 (at -60.000, continuing to -62.000 while it
+'      runs) — see step 3 above. This has moved three times on 2026-08-19/
+'      21 while tuning around one problem (tip contact pushing/disturbing
+'      the specimen before capture): DEV-16 (2026-08-19) started it BEFORE
+'      any descent; a same-day-2026-08-21 revert moved it to AFTER full
+'      descent (matching DROP); the current mid-descent trigger (also
+'      2026-08-21) is a middle ground between those two. StartMotorAspire/
+'      WaitMotorComplete (the non-blocking split) are back in use by PICK/
+'      PICK_U; MotorAspire (synchronous) is unused again for now.
+' Steps 5-6 (the retract order) DIFFER between PICK and DROP as of
+' 2026-08-21:
+'   DROP/DROP_U — unchanged, robot/EOA retracts FIRST (fast, same as step 3),
+'     THEN Off 4 (pipette retracts second, only once EOA is already clear).
+'   PICK/PICK_U — REVERSED: Off 4 (pipette retracts FIRST) THEN robot/EOA Z
+'     retracts. Operator's own hardware observation: the aspirated specimen
+'     was falling back into the liquid during retraction under the old
+'     order. The pneumatic's short stroke clears the tip of the water
+'     surface almost immediately; doing that before the slower, longer
+'     robot Z travel means the tip isn't dragged through/near the surface
+'     for the whole climb. Safe regardless of order — the mount-raise above
+'     means the pneumatic alone can't reach the dish/well bottom at ANY
+'     robot Z, so retracting it first at -62.000 introduces no new
+'     collision risk.
 '   7. WaitPipetteUp, then Move to -47.700 travel height (only XY travel move
 '      happens after the pipette is confirmed fully up)
 ' Steps 3 and 5 are Z-only (no XY change) so they never violate "no XY travel
@@ -123,8 +147,17 @@ Function sort_server
                                              ' well-config approach kept doing.
     Tool 1
     Power High
-    Speed 5
-    Accel 5, 5
+    ' Speed/Accel govern every Go (PTP) move in this whole program — HOME,
+    ' MOVE_IMAGE(_U), and PICK/PICK_U/DROP/DROP_U's initial travel-to move
+    ' all use it, since it's a global interpreter setting, set once, never
+    ' touched elsewhere. Raised from 5/5,5 (5% of max — extremely
+    ' conservative, likely never revisited since early bring-up) to 20/
+    ' 20,20 as a first optimize-speed step (2026-08-21): a 4x jump, not the
+    ' max — watch the first few real cycles closely (E-stop ready) before
+    ' pushing higher. This does NOT touch the controlled final descent
+    ' (SpeedS 10/AccelS 10,10, set separately inside PICK/DROP).
+    Speed 20
+    Accel 20, 20
     ' SpeedS/AccelS govern Move (linear/CP) commands — Speed/Accel above only
     ' govern Go (PTP) commands and have NO effect on Move. Every fine-motion
     ' command in this program uses Move, so this is the real "fast/slow"
@@ -251,30 +284,44 @@ server_start:
             Move XY(rx, ry, -58.660, cur_u)
             On 4
             Call WaitPipetteDown
-            ' Aspirate STARTS here, before the Z-descent — suction begins
-            ' while the tip is still approaching, instead of waiting until
-            ' full contact. Operator report 2026-08-19 (DEV-16): the tip's
-            ' weight/contact was sometimes pushing/disturbing the specimen
-            ' before it could be captured; starting suction early reduces
-            ' reliance on physical contact. Motor runs autonomously over its
-            ' own socket (#202) — StartMotorAspire only sends the command
-            ' and returns immediately, it does not block the Z-descent move
-            ' below. WaitMotorComplete (after that move) confirms the
-            ' aspirate stroke actually finished before anything retracts.
-            Call StartMotorAspire
             ' Slow, controlled final approach — this is the whole point of the
             ' two-stage descent (DEV-11), so it must not run at normal travel
             ' speed. SpeedS/AccelS (not Speed/Accel — Move is a linear/CP
             ' command) restored to the fast baseline right after.
             SpeedS 10
             AccelS 10, 10
+            Move XY(rx, ry, -60.000, cur_u)
+            ' Aspirate triggers HERE, partway down (-60.000) — not before any
+            ' descent (DEV-16, 2026-08-19) and not only after reaching full
+            ' depth (2026-08-21's first revert) but a middle ground, same
+            ' day: give the tip a couple mm of real approach first (unlike
+            ' DEV-16's from-the-top start), then start suction WHILE still
+            ' closing the last 2mm to -62.000 (unlike waiting for full
+            ' depth). StartMotorAspire returns immediately — the Move below
+            ' to -62.000 is NOT blocked by it. WaitMotorComplete (after
+            ' reaching -62.000) confirms the aspirate stroke actually
+            ' finished before anything retracts.
+            Call StartMotorAspire
             Move XY(rx, ry, -62.000, cur_u)
             SpeedS 100
             AccelS 100, 100
             Call WaitMotorComplete
-            Move XY(rx, ry, -58.660, cur_u)
+            ' Pipette (pneumatic) retracts FIRST, THEN robot/EOA Z — reversed
+            ' 2026-08-21 from the original EOA-first order (operator's own
+            ' hardware observation: the aspirated specimen was falling back
+            ' into the liquid during retraction). Off 4 is a short stroke
+            ' that pulls the tip up close to the mount almost immediately;
+            ' doing that before the slower, longer robot Z travel clears the
+            ' tip of the water surface sooner, instead of dragging a still-
+            ' extended tip through/near the surface during the whole Z climb.
+            ' Safe regardless of order: the mount-raise in DEV-11 means the
+            ' pneumatic alone can't reach the dish/well bottom at ANY robot Z,
+            ' so retracting it first at -62.000 introduces no new collision
+            ' risk — same reasoning as it already being safe extended at
+            ' travel height.
             Off 4
             Call WaitPipetteUp
+            Move XY(rx, ry, -58.660, cur_u)
             Move XY(CX(Here), CY(Here), -47.700, CU(Here))
             Tool 1
             Print #201, "OK PICKED " + Str$(rx) + "," + Str$(ry)
@@ -296,24 +343,26 @@ server_start:
             Move XY(rx, ry, -58.660, ru)
             On 4
             Call WaitPipetteDown
-            ' Aspirate STARTS here, before the Z-descent — see the matching
-            ' comment in PICK above (DEV-16). StartMotorAspire returns
-            ' immediately, does not block the Move below; WaitMotorComplete
-            ' after it confirms the aspirate stroke actually finished.
-            Call StartMotorAspire
             ' Slow, controlled final approach — this is the whole point of the
             ' two-stage descent (DEV-11), so it must not run at normal travel
             ' speed. SpeedS/AccelS (not Speed/Accel — Move is a linear/CP
             ' command) restored to the fast baseline right after.
             SpeedS 10
             AccelS 10, 10
+            Move XY(rx, ry, -60.000, ru)
+            ' Aspirate triggers HERE, partway down — see the matching comment
+            ' in PICK above (2026-08-21: mid-descent, not before or after).
+            Call StartMotorAspire
             Move XY(rx, ry, -62.000, ru)
             SpeedS 100
             AccelS 100, 100
             Call WaitMotorComplete
-            Move XY(rx, ry, -58.660, ru)
+            ' Pipette retracts FIRST, then robot/EOA Z — see the matching
+            ' comment in PICK above (2026-08-21: fixes specimen falling back
+            ' into the liquid during retraction).
             Off 4
             Call WaitPipetteUp
+            Move XY(rx, ry, -58.660, ru)
             Move XY(CX(Here), CY(Here), -47.700, CU(Here))
             Tool 1
             Print #201, "OK PICKED " + Str$(rx) + "," + Str$(ry)
@@ -329,10 +378,10 @@ server_start:
             ry = Val(Mid$(cmd$, sp2 + 1))
             cur_u = CU(Here)
             Go XY(rx, ry, -47.700, cur_u)
-            ' Safety pause: arrived above the drop XY at travel height, not yet
-            ' descended. Gives the operator time to hit E-STOP if this is the
-            ' wrong location, before the pipette tip goes anywhere near the plate.
-            Wait 3
+            ' 3s E-stop reaction pause removed 2026-08-21 (optimize-speed pass,
+            ' operator's own call — "we don't need 3 secs there, remove it").
+            ' Was here to give a reaction window before descending near the
+            ' plate; now descends immediately after arriving at travel height.
             Move XY(rx, ry, -58.660, cur_u)
             On 4
             Call WaitPipetteDown
@@ -342,7 +391,9 @@ server_start:
             ' command) restored to the fast baseline right after.
             SpeedS 10
             AccelS 10, 10
-            Move XY(rx, ry, -62.000, cur_u)
+            ' -60.000, not -62.000 (PICK's aspirate depth) — DROP-only, less
+            ' descent needed to reach the well (2026-08-21, operator's call).
+            Move XY(rx, ry, -60.000, cur_u)
             SpeedS 100
             AccelS 100, 100
             Call MotorDrop
@@ -366,10 +417,10 @@ server_start:
             ry = Val(Mid$(coord_str$, comma1 + 1, comma2 - comma1 - 1))
             ru = Val(Mid$(coord_str$, comma2 + 1))
             Go XY(rx, ry, -47.700, ru)
-            ' Safety pause: arrived above the drop XY at travel height, not yet
-            ' descended. Gives the operator time to hit E-STOP if this is the
-            ' wrong location, before the pipette tip goes anywhere near the plate.
-            Wait 3
+            ' 3s E-stop reaction pause removed 2026-08-21 (optimize-speed pass,
+            ' operator's own call — "we don't need 3 secs there, remove it").
+            ' Was here to give a reaction window before descending near the
+            ' plate; now descends immediately after arriving at travel height.
             Move XY(rx, ry, -58.660, ru)
             On 4
             Call WaitPipetteDown
@@ -379,7 +430,9 @@ server_start:
             ' command) restored to the fast baseline right after.
             SpeedS 10
             AccelS 10, 10
-            Move XY(rx, ry, -62.000, ru)
+            ' -60.000, not -62.000 (PICK's aspirate depth) — DROP-only, less
+            ' descent needed to reach the well (2026-08-21, operator's call).
+            Move XY(rx, ry, -60.000, ru)
             SpeedS 100
             AccelS 100, 100
             Call MotorDrop
@@ -470,10 +523,12 @@ Fend
 ' =============================================================================
 ' MotorAspire — connect to the Novanta linear actuator, send EX G2 (draw
 ' back / aspirate), poll for ">" (move complete) or "?" (error), disconnect.
-' No longer called by PICK/PICK_U as of 2026-08-19 (DEV-16) — they now use
-' the split StartMotorAspire/WaitMotorComplete below so aspiration can
-' start before the Z-descent instead of only after it. Kept here, unused,
-' in case a simple synchronous aspirate is needed elsewhere later.
+' Not currently called by PICK/PICK_U (2026-08-21) — they use the
+' non-blocking StartMotorAspire/WaitMotorComplete split below instead, so
+' aspiration can start partway through the descent instead of only after
+' it fully completes. Kept here, unused, in case a simple synchronous
+' aspirate is needed again later — see the sort_server header comment for
+' the full history of this moving around.
 ' =============================================================================
 Function MotorAspire
     String resp$
@@ -504,9 +559,12 @@ Fend
 ' move to complete. The motor executes the aspirate stroke autonomously
 ' over its own socket — nothing here blocks the robot's own motion. Caller
 ' must call WaitMotorComplete afterward (typically after doing other work,
-' like the robot's Z-descent move) before relying on aspiration having
-' actually finished. Added 2026-08-19 (DEV-16) so aspiration can start
-' before/during the descent instead of only after it — see PICK/PICK_U.
+' like the rest of the robot's Z-descent move) before relying on
+' aspiration having actually finished. Added 2026-08-19 (DEV-16); PICK/
+' PICK_U currently call this partway through the descent (at -60.000,
+' continuing to -62.000 while it runs) — see the sort_server header
+' comment for the full history of exactly when this fires, which has
+' moved a few times.
 ' =============================================================================
 Function StartMotorAspire
     SetNet #202, "172.16.9.60", 503, CR, NONE, 0

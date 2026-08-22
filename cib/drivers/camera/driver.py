@@ -479,6 +479,78 @@ class GigECameraDriver:
         self._exposure_us = exposure_us
         log.debug("camera.exposure_set", name=self._name, exposure_us=exposure_us)
 
+    async def lock_white_balance(self) -> bool:
+        """
+        Converge white balance using BalanceWhiteAuto="Once" — the
+        GenICam-standard self-terminating auto function: the camera runs
+        its own convergence algorithm against captured frames and resets
+        BalanceWhiteAuto to "Off" itself once satisfied (or after an
+        internal max-iteration safety cap), then holds those gains fixed
+        for every subsequent frame.
+
+        REWRITTEN 2026-08-21 — the original version ran Continuous for a
+        guessed number of frames, then forcibly flipped it to Off. Real
+        hardware testing showed that can catch a not-yet-converged
+        transient state and freeze it forever, producing badly overexposed
+        captures with no way to self-correct. This version never guesses:
+        it polls the node and only treats it as done when the camera
+        itself reports Off. Must be called while nothing else is
+        capturing (this method grabs and requeues its own frames to drive
+        convergence).
+
+        Returns True if BalanceWhiteAuto confirmed Off within
+        MAX_CONVERGE_FRAMES, False if it never did — on False, this
+        restores BalanceWhiteAuto to Continuous as a safe fallback (the
+        previously-proven-working behavior) rather than leaving it in an
+        uncertain "Once, maybe still running" state. Callers should only
+        treat True as "safe to skip re-converging on future calls."
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._lock_white_balance_sync)
+
+    def _lock_white_balance_sync(self) -> bool:
+        if not self._device:
+            raise RuntimeError(f"Camera '{self._name}' not connected — call connect() first")
+        if self._pixel_format == "Mono8":
+            return True   # no WB nodes on a mono sensor — nothing to converge
+
+        MAX_CONVERGE_FRAMES = 15
+
+        try:
+            self._device.nodemap["BalanceWhiteAuto"].value = "Once"
+        except Exception as e:
+            log.warning("camera.white_balance_once_trigger_failed", name=self._name,
+                        error=str(e)[:80])
+            return False
+
+        for i in range(MAX_CONVERGE_FRAMES):
+            try:
+                buf = self._device.get_buffer(timeout=BUFFER_TIMEOUT_MS)
+                self._device.requeue_buffer(buf)
+            except Exception as e:
+                log.warning("camera.white_balance_converge_frame_failed", name=self._name,
+                            error=str(e)[:80])
+                break
+            try:
+                current = self._device.nodemap["BalanceWhiteAuto"].value
+            except Exception:
+                current = None
+            if current == "Off":
+                log.info("camera.white_balance_converged", name=self._name, frames=i + 1)
+                return True
+
+        # Never confirmed Off — restore Continuous rather than leave it
+        # uncertain. Same behavior as before this method ever existed.
+        try:
+            self._device.nodemap["BalanceWhiteAuto"].value = "Continuous"
+        except Exception:
+            pass
+        log.warning("camera.white_balance_converge_timeout", name=self._name,
+                    frames=MAX_CONVERGE_FRAMES,
+                    note="BalanceWhiteAuto never self-reported Off — restored to "
+                         "Continuous, will retry convergence next time this is called")
+        return False
+
     def _capture_sync(self) -> np.ndarray:
         if not self._device or not self._streaming:
             raise RuntimeError(f"Camera '{self._name}' is not connected or not streaming")

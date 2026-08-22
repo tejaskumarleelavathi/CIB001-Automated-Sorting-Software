@@ -112,7 +112,10 @@ vision:
   detection_max_area_px: 2000
   backlight_lead_time_ms: 50
   # Overhead image save settings
-  overhead_save_images: true          # set false to skip saving overhead frames
+  overhead_save_images: false         # set true to save overhead frames (annotate+
+                                       # save every cycle — even backgrounded, still
+                                       # real disk/CPU cost; off since 2026-08-21
+                                       # optimize-speed pass per operator's own call)
   overhead_save_format: 'png'         # png (debug) or tiff (archival)
   # EoA image settings (save one TIFF per specimen — Austin requires these)
   eoa_save_format: 'tiff'

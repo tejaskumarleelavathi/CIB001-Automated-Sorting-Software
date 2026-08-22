@@ -10,8 +10,8 @@ along a lead screw.  All positions are in raw steps — do NOT assume a
 real-world distance until lead screw pitch is confirmed and measured.
 
 Programs stored on motor flash:
-  G1  →  MR -1575000  (drop / dispense — carriage moves forward)
-  G2  →  MR +1575000  (aspire / draw — carriage moves backward)
+  G1  →  MR -800000  (drop / dispense — carriage moves forward)
+  G2  →  MR +800000  (aspire / draw — carriage moves backward)
 
 Python just sends "EX G1" or "EX G2" to trigger them.  The motor
 executes the move autonomously and signals completion via the ">" prompt.
@@ -23,8 +23,8 @@ Labels G1 / G2 chosen because:
 
 Usage:
   python hardware_tests/linear_control.py upload    # flash G1+G2 to motor (run once)
-  python hardware_tests/linear_control.py drop      # execute G1 (forward 1575000 steps)
-  python hardware_tests/linear_control.py aspire    # execute G2 (reverse 1575000 steps)
+  python hardware_tests/linear_control.py drop      # execute G1 (forward 800000 steps)
+  python hardware_tests/linear_control.py aspire    # execute G2 (reverse 800000 steps)
   python hardware_tests/linear_control.py pos       # print position, no motion
   python hardware_tests/linear_control.py run       # interactive loop
 
@@ -49,12 +49,18 @@ LINEAR_PORT  = 503
 # (all 2026-08-19), then 1.5x -> 1,575,000 same day (operator testing
 # different aspirate configs to reduce the pipette tip disturbing/pushing
 # the specimen before it can be captured — see DEV-16). Drop increased by
-# the same amount every time to stay symmetric. This is now ~7.9x the last
-# value actually confirmed safe by hand-jogging (200,000) and lead screw
-# pitch/travel limit is still unconfirmed — watch closely for a stall or
-# hard-stop collision on the first real run at this value.
-DROP_STEPS   = -1_575_000   # forward / dispense
-ASPIRE_STEPS =  1_575_000   # reverse / draw
+# the same amount every time to stay symmetric.
+# 1,575,000 (above) confirmed overdriving on real hardware 2026-08-21
+# (optimize-speed pass — "it is over driving"). Many values tried since
+# (1,102,500 / 1,350,000 / 1,250,000 / 1,300,000 / 1,540,000 / 1,600,000 /
+# 1,000,000) swinging between "driving less" (not enough suction) and
+# overdriving, none landing cleanly — see git history on this file for the
+# blow-by-blow if it matters later. Currently testing 800,000, still
+# unconfirmed — above the last confirmed-safe hand-jogged baseline
+# (200,000, 4x). Lead screw pitch/travel limit is still unconfirmed.
+# Watch closely on the first real test.
+DROP_STEPS   = -800_000   # forward / dispense
+ASPIRE_STEPS =  800_000   # reverse / draw
 
 # Velocity profile (steps/sec, steps/sec^2) — governs how FAST G1/G2 run,
 # completely separate from DROP_STEPS/ASPIRE_STEPS above (which only govern
@@ -63,12 +69,26 @@ ASPIRE_STEPS =  1_575_000   # reverse / draw
 # A=D=1000000). Increased to VM=1,200,000/A=D=2,000,000 same day, then VM
 # 2x'd -> 2,400,000 (A/D left unchanged — operator asked to increase
 # "speed" specifically, not acceleration) same day, testing configs for the
-# tip-disturbance issue (DEV-16). Baked into each program body (not set
-# once) since G1/G2 are separate onboard programs and each must set its own
-# profile explicitly.
+# tip-disturbance issue (DEV-16). A/D 2x'd -> 4,000,000 on 2026-08-21
+# (optimize-speed pass, operator's own call — "update the acceleration
+# too").
+#
+# 2026-08-21, same day: at A=4,000,000 with the current ASPIRE_STEPS/
+# DROP_STEPS travel distance (800,000), the ramp-up+ramp-down distance
+# needed to reach VM=2,400,000 is 1,440,000 steps — MORE than the travel
+# distance, so this move is "triangular": it never reaches VELOCITY_MAX at
+# all (peak speed only ~1.79M, calculated stroke time ~0.89s) — VM isn't
+# the limiting factor here, ACCEL/DECEL is. A higher-accel profile (A/D
+# 10,000,000, VM 4,000,000) was tried and reverted, untested, same day —
+# see git history on this file if that's worth revisiting once the step
+# count itself is settled.
+#
+# Steeper acceleration draws more torque from the motor and more resistance
+# from the syringe plunger/fluid — watch closely for a stall (ER=86) if
+# these values are raised again; back A/D off if it stalls or skips steps.
 VELOCITY_MAX =  2_400_000   # VM
-ACCEL        =  2_000_000   # A
-DECEL        =  2_000_000   # D
+ACCEL        =  4_000_000   # A
+DECEL        =  4_000_000   # D
 
 # ── Timing ────────────────────────────────────────────────────────────────────
 CMD_TIMEOUT_S   = 5.0    # max wait for a single command response
@@ -411,8 +431,8 @@ def _pgm_or_die(sock: socket.socket, command: str) -> None:
 def upload_programs(sock: socket.socket) -> None:
     """
     Flash two programs to the motor's non-volatile flash memory:
-      G1  →  VM=/A=/D= + MR -1575000   (drop / forward / dispense)
-      G2  →  VM=/A=/D= + MR +1575000   (aspire / reverse / draw)
+      G1  →  VM=/A=/D= + MR -800000   (drop / forward / dispense)
+      G2  →  VM=/A=/D= + MR +800000   (aspire / reverse / draw)
 
     Full sequence:
       1.  Check motor is not moving (Error 73 if CP/PG run while moving)
@@ -514,8 +534,8 @@ def upload_programs(sock: socket.socket) -> None:
 
 _HELP = """
   Commands:
-    drop    → execute G1  (forward  -1575000 steps — dispense/drop)
-    aspire  → execute G2  (reverse  +1575000 steps — draw/aspire)
+    drop    → execute G1  (forward  -800000 steps — dispense/drop)
+    aspire  → execute G2  (reverse  +800000 steps — draw/aspire)
     pos     → print current position (no motion)
     speed   → print VM/VI/A/D — the actual current aspirate/drop velocity
               profile (no motion). Never set in this file, so this is
@@ -562,8 +582,8 @@ def interactive_loop(sock: socket.socket) -> None:
 _USAGE = """
 Usage:
   python hardware_tests/linear_control.py upload    # flash G1+G2 to motor (run once)
-  python hardware_tests/linear_control.py drop      # forward  -1575000 steps
-  python hardware_tests/linear_control.py aspire    # reverse  +1575000 steps
+  python hardware_tests/linear_control.py drop      # forward  -800000 steps
+  python hardware_tests/linear_control.py aspire    # reverse  +800000 steps
   python hardware_tests/linear_control.py pos       # print position, no motion
   python hardware_tests/linear_control.py speed     # print VM/VI/A/D velocity profile, no motion
   python hardware_tests/linear_control.py run       # interactive control loop

@@ -38,7 +38,11 @@ USE_REAL_PLC      = True    # real Logic PLC (status light / work light)
 # Keeps the cycle running so you can test pick-place flow without a full dish.
 # Set False when real bug detection is implemented and tested.
 FORCE_SAMPLE_DETECTION = False
-VIEW = True    # True = show image popups for 3s during testing | False = silent (production)
+VIEW = False   # True = show image popups for 3s during testing | False = silent (production)
+# Set False 2026-08-20 for the optimize-speed pass — each popup blocks the
+# cycle for a hard 3s (cv2.waitKey(3000)), and there are 2 per cycle (~6s of
+# 51s doing nothing but showing a debug window). See cycle.timing_summary's
+# wall_total_s vs steps_total_s gap in cib/core/orchestrator.py.
 
 # Well-drop plate config — TEST-SCOPED (2026-08-11), NOT the final production
 # design. See prd_updated.md Appendix D: the real design (who teaches wells,

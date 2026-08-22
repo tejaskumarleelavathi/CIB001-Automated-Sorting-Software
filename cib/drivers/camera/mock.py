@@ -46,6 +46,10 @@ class MockCameraDriver:
     async def set_exposure(self, exposure_us: float) -> None:
         pass  # no-op for mock
 
+    async def lock_white_balance(self) -> bool:
+        log.info("mock_camera.white_balance_converged", name=self._name)
+        return True
+
     async def capture(self) -> Any:
         """Returns a 1280x1024 grayscale numpy array with synthetic sample spots."""
         await asyncio.sleep(0.05)   # simulate exposure time

@@ -180,6 +180,25 @@ class CameraDriver(Protocol):
         """Change exposure time in µs. Takes effect on the next frame."""
         ...
 
+    async def lock_white_balance(self) -> bool:
+        """
+        Converge white balance via BalanceWhiteAuto="Once" — the
+        GenICam-standard self-terminating auto function — and hold those
+        gains fixed once the camera itself reports convergence (resets the
+        node to "Off" on its own). True/False = confirmed converged or not;
+        on False the camera is left in Continuous mode as a safe fallback,
+        not a half-finished "Once" state. No-op (True) on cameras with no
+        WB nodes (e.g. Mono8).
+
+        Added 2026-08-21 (optimize-speed pass), REWRITTEN same day after
+        the first version (Continuous for a guessed frame count, then
+        forced to Off) produced badly overexposed real captures — see
+        driver.py for the full story. Call once per camera connection,
+        under the real capture lighting; skip re-calling once it returns
+        True (see cib/core/orchestrator.py's self._eoa_wb_locked).
+        """
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Lighting controller
@@ -191,3 +210,18 @@ class LightingDriver(Protocol):
     async def disconnect(self) -> None: ...
     async def set_backlight(self, on: bool) -> None: ...
     async def set_ring_light(self, on: bool) -> None: ...
+
+    async def set_backlight_channels(self, channels: list[int], on: bool) -> None:
+        """
+        Turn specific backlight channels on/off independently, leaving the
+        others untouched. DCS-100E has 3 channels (1-3); set_backlight()
+        treats all of them as one on/off unit, this doesn't.
+
+        Added 2026-08-21 (optimize-speed pass) so the EoA with-backlight
+        capture can run at reduced brightness (fewer than 3 channels) —
+        operator's own observation that the specimen was overexposed with
+        all 3 on. Bring the remaining channels up afterward (still via this
+        method) to reach full brightness for the next cycle's overhead
+        capture, which does need all 3.
+        """
+        ...
