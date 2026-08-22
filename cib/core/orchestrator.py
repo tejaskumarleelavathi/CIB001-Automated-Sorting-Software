@@ -80,6 +80,28 @@ PLC_POLL_INTERVAL          = 0.10   # 100ms
 ROBOT_POLL_INTERVAL        = 0.20   # 200ms
 ROBOT_KEEPALIVE_INTERVAL_S = 0.5    # seconds — Epson TCP idle timer fires at ~1 s; 0.5s keeps well under it
 
+# Max time to wait, after a drop finishes, for the lookahead overhead
+# capture (fired concurrently with that same drop) to produce a target —
+# see _run_cycle()'s "Lookahead" step. In the common case this is ~0s: the
+# lookahead is fired right as the drop starts and drop takes several
+# seconds, so the capture is usually already done by the time we check.
+# This is just a safety cap for the uncommon case (slow camera response) —
+# past this, give up and home normally rather than stall the cycle.
+LOOKAHEAD_TIMEOUT_S = 3.0
+
+# Fixed settle delay after commanding the DCS-100E backlight ON, before the
+# EoA with-backlight capture (2026-08-21). The DCS-100E does not ACK
+# SET:MODE:CHANNELx commands in any way worth waiting on (see
+# RECV_TIMEOUT_S in lighting/driver.py — "SET commands need no ack"), so
+# there is no software confirmation to poll for that all 3 channels are
+# actually on. This is a fixed wait instead. Sized conservatively: the
+# DCS-100E is a strobe controller rated for pulse widths as low as 100us,
+# which implies its LED current itself settles far faster than this value —
+# but that's a datasheet inference, not a measurement on THIS hardware.
+# UNTESTED — tune down if it's pure overhead, or up if with-backlight
+# frames still show inconsistent illumination.
+BACKLIGHT_SETTLE_S = 0.05
+
 # Fine correction applied to the vision-computed PICK target only (2026-08-19,
 # see DEV-15 in prd_updated.md) — deliberately NOT in TLSet 2 (sort_server.prg)
 # and NOT in the plate config, after those approaches spent a full session
@@ -87,7 +109,7 @@ ROBOT_KEEPALIVE_INTERVAL_S = 0.5    # seconds — Epson TCP idle timer fires at 
 # offset one, and kept leaking the "fix" into DROP in the process. Living here
 # means it can only ever affect PICK. Re-tune/zero out once real picks confirm
 # whether it's still needed after the DEV-14 per-quadrant EoA fix.
-PICK_TARGET_CORRECTION_X_MM = -2.0
+PICK_TARGET_CORRECTION_X_MM = -1.0
 PICK_TARGET_CORRECTION_Y_MM = 0.0
 
 
@@ -1082,7 +1104,168 @@ class Orchestrator:
         self._current_run = None
         self._storage = None
 
-    async def _run_cycle(self) -> None:
+    def _select_next_target(
+        self, all_centroids: list[tuple[float, float]],
+    ) -> tuple[float, float] | None:
+        """
+        Pick the next unvisited candidate from an ALREADY-detected overhead
+        centroid list — same bottom-left-first selection as the initial
+        pick in _capture_and_select_target(), but without a fresh overhead
+        capture. Used both by _capture_and_select_target() for its own
+        first selection, and by _run_cycle()'s EoA-reject retry loop
+        (2026-08-21, operator's idea: when EoA rejects a candidate, try
+        the NEXT one from the SAME overhead capture instead of homing and
+        re-running the whole overhead pipeline from scratch).
+
+        Marks the returned candidate visited immediately (same reasoning
+        as always: even if EoA rejects it too, we won't re-try this exact
+        spot). Returns None once every candidate in the list has been
+        tried.
+        """
+        unvisited = [c for c in all_centroids if not self._is_visited(c)]
+        if not unvisited:
+            return None
+        # Sort: y ascending (leftmost), then x descending (bottommost).
+        # First element = bottom-left corner bug.
+        unvisited_sorted = sorted(unvisited, key=lambda c: (c[1], -c[0]))
+        target_x, target_y = unvisited_sorted[0]
+        self._mark_visited(target_x, target_y)
+        return (target_x, target_y)
+
+    async def _capture_and_select_target(
+        self, is_lookahead: bool = False,
+    ) -> tuple[float, float, list[tuple[float, float]]] | None:
+        """
+        Overhead capture + vision + visited-filter + target selection —
+        extracted 2026-08-21 so it can run two ways: normally, at the top
+        of a cycle (is_lookahead=False — updates self._cycle_phase and
+        writes into self._cycle_timings like every other step), and as a
+        background lookahead task fired during the PREVIOUS cycle's drop
+        (is_lookahead=True — see the "Lookahead" step at the end of
+        _run_cycle()). The lookahead runs concurrently with that drop's
+        own robot_drop step, so it must NOT touch self._cycle_phase (would
+        clobber the real phase mid-drop, which _safe_recovery() depends on
+        if a fault hits during that window) or write into
+        self._cycle_timings (would corrupt THAT cycle's own
+        cycle.timing_summary with the NEXT cycle's numbers) — see
+        _time_step()'s docstring for why the `timings` param exists.
+
+        Returns (x, y, all_centroids) — all_centroids is the FULL detected
+        list from this capture (not just unvisited ones), handed back to
+        the caller so a later EoA rejection can try the next candidate
+        from the same capture via _select_next_target() instead of paying
+        for a fresh one. Returns None if the dish has nothing new to try
+        right now.
+        """
+        d = self._drivers
+        timings: dict[str, float] = {} if is_lookahead else self._cycle_timings
+
+        # ── Start overhead stream only ────────────────────────────────
+        # EoA stream starts later, after the robot has moved to the image
+        # site. Running both cameras simultaneously consumes ~980 Mbps on
+        # the shared USB-Ethernet adapter, leaving almost no bandwidth for
+        # robot TCP traffic. By streaming cameras only when they are
+        # actively capturing, each phase has adequate bandwidth:
+        #   Overhead capture:  overhead only  (~392 Mbps, Mono8 @ 2 fps)
+        #   Robot motion:      no streams     (0 Mbps — robot has full 1G)
+        #   EoA capture:       EoA only       (~588 Mbps, BGR8 @ 1 fps)
+        # The lookahead case is the one deliberate exception to "no camera
+        # streaming during robot motion" — it streams overhead WHILE the
+        # robot_drop TCP command is in flight. Watch closely on the first
+        # real test for that command's response getting delayed past
+        # _motion_timeout by adapter contention (see LOOKAHEAD_TIMEOUT_S
+        # and the "Lookahead" step in _run_cycle()).
+        if not is_lookahead:
+            self._cycle_phase = CyclePhase.OVERHEAD_CAPTURE
+        with self._time_step("overhead_capture", timings):
+            await d.camera_overhead.start_streaming()
+            log.debug("cycle.overhead_stream_started")
+
+            # ── Step 1: Overhead image ────────────────────────────────
+            # Backlight already on (turned on at startup / OperatorStartEvent).
+            # Drain stale frames before the keeper.
+            await d.camera_overhead.capture()  # drain stale frame 1
+            await d.camera_overhead.capture()  # drain stale frame 2
+            frame = await d.camera_overhead.capture()  # fresh stable frame
+
+            # Stop overhead stream now — done capturing.
+            # Frees ~392 Mbps on the adapter so robot TCP has full
+            # bandwidth during move_to_image_site.
+            await d.camera_overhead.stop_streaming()
+            log.debug("cycle.overhead_stream_stopped")
+
+        if not self._running:
+            return None
+
+        # ── Step 2: Overhead vision analysis (thread pool — CPU bound) ─
+        if not is_lookahead:
+            self._cycle_phase = CyclePhase.OVERHEAD_VISION
+        loop = asyncio.get_running_loop()
+        with self._time_step("overhead_vision", timings):
+            overhead_result = await loop.run_in_executor(
+                None, self._run_vision_overhead, frame
+            )
+        if is_lookahead:
+            log.info("cycle.lookahead_capture_timing",
+                     **{k: round(v, 3) for k, v in timings.items()})
+        # Archival image save happens in the background, NOT awaited here
+        # (2026-08-21, optimize-speed pass — operator's own observation:
+        # "3-4 secs delay before the robot moves, before the overhead
+        # image is saved"). run_overhead_detection() used to save the
+        # annotated frame inline — cv2.imwrite of a ~24.5MP PNG is a
+        # multi-second blocking disk write, and it was holding up the
+        # robot's next move for a file nothing downstream in THIS cycle
+        # reads (it's a record for later review, not an input to
+        # anything). Detection + centroid math above already completed
+        # by the time we get here; the save now just runs alongside
+        # everything after it (robot travel, EoA capture, etc.) instead
+        # of blocking in front of it.
+        if self._overhead_save_images and overhead_result.annotated_frame is not None:
+            asyncio.create_task(
+                self._save_overhead_frame_background(overhead_result.annotated_frame)
+            )
+
+        # ── Select target: bottom-left first ─────────────────────────
+        all_centroids = overhead_result.centroids_robot_xy
+        target = self._select_next_target(all_centroids)
+        if target is None:
+            if all_centroids:
+                log.info("cycle.all_centroids_visited",
+                         total=len(all_centroids), lookahead=is_lookahead,
+                         note="All detected bugs already attempted this run")
+            else:
+                log.warning("cycle.no_samples_detected", lookahead=is_lookahead)
+            return None
+        target_x, target_y = target
+        log.info("cycle.target_selected",
+                 target_x=target_x, target_y=target_y,
+                 total=len(all_centroids), lookahead=is_lookahead)
+
+        # ── VIEW: show overhead with target highlighted ────────────────
+        # Skipped for the lookahead case even if self._view is ever turned
+        # back on — this runs concurrently with the current cycle's own
+        # drop, and popping a debug window from a background task while
+        # the main cycle might show its own is more confusing than useful.
+        if self._view and not is_lookahead and overhead_result.annotated_frame is not None:
+            from cib.vision.pipeline import draw_target_highlight
+            # Find pixel centroid for selected target
+            try:
+                idx = overhead_result.centroids_robot_xy.index((target_x, target_y))
+                target_px = overhead_result.centroids_px[idx]
+                highlighted = draw_target_highlight(overhead_result.annotated_frame, target_px)
+            except (ValueError, IndexError):
+                highlighted = overhead_result.annotated_frame
+            await loop.run_in_executor(
+                None, self._show_image, highlighted,
+                f"Overhead — {overhead_result.sample_count} bug(s), targeting ({target_x:.1f}, {target_y:.1f})"
+            )
+
+        return (target_x, target_y, all_centroids)
+
+    async def _run_cycle(
+        self,
+        preselected_target: tuple[float, float, list[tuple[float, float]]] | None = None,
+    ) -> None:
         """
         Execute one pick-and-place cycle.
         Matches the operating cycle from PRD Section 12.1.
@@ -1095,6 +1278,22 @@ class Orchestrator:
         Visited centroid tracking: centroids snapped to the same 0.1mm grid cell as a
           previously attempted location are skipped. Cleared at run start (OperatorStartEvent).
           Prevents infinite retry if EoA rejects the same debris each cycle.
+
+        preselected_target: (x, y, all_centroids) already found by a
+          lookahead capture fired during the PREVIOUS cycle's drop (see
+          the "Lookahead" step near the end of this method, 2026-08-21) —
+          skips this cycle's own overhead capture/vision entirely and goes
+          straight to imaging (x, y), instead of homing first.
+          all_centroids is that SAME lookahead capture's full candidate
+          list, so if (x, y) gets EoA-rejected, the retry loop below can
+          still try the rest of that list instead of going straight home
+          (2026-08-22 fix — this used to be a bare (x, y) 2-tuple, which
+          crashed with "too many values to unpack" the moment
+          _capture_and_select_target()'s return shape grew a third
+          element for the retry-loop feature and this call site wasn't
+          updated to match — found on the first real hardware run of the
+          two features together). None (the normal case) runs the full
+          capture as before.
         """
         if not self._sm.is_running():
             return
@@ -1107,270 +1306,252 @@ class Orchestrator:
         self._cycle_timings = {}       # fresh slate — see constructor comment
         self._cycle_t0 = time.monotonic()
         d = self._drivers
-        log.info("cycle.start")
+        log.info("cycle.start", preselected=preselected_target is not None)
 
         try:
-            # ── Start overhead stream only ────────────────────────────────
-            # EoA stream starts later, after the robot has moved to the image
-            # site. Running both cameras simultaneously consumes ~980 Mbps on
-            # the shared USB-Ethernet adapter, leaving almost no bandwidth for
-            # robot TCP traffic. By streaming cameras only when they are
-            # actively capturing, each phase has adequate bandwidth:
-            #   Overhead capture:  overhead only  (~392 Mbps, Mono8 @ 2 fps)
-            #   Robot motion:      no streams     (0 Mbps — robot has full 1G)
-            #   EoA capture:       EoA only       (~588 Mbps, BGR8 @ 1 fps)
-            with self._time_step("overhead_capture"):
-                await d.camera_overhead.start_streaming()
-                log.debug("cycle.overhead_stream_started")
-
-                # ── Step 1: Overhead image ────────────────────────────────
-                # Backlight already on (turned on at startup / OperatorStartEvent).
-                # Drain stale frames before the keeper.
-                await d.camera_overhead.capture()  # drain stale frame 1
-                await d.camera_overhead.capture()  # drain stale frame 2
-                frame = await d.camera_overhead.capture()  # fresh stable frame
-
-                # Stop overhead stream now — done capturing.
-                # Frees ~392 Mbps on the adapter so robot TCP has full
-                # bandwidth during move_to_image_site.
-                await d.camera_overhead.stop_streaming()
-                log.debug("cycle.overhead_stream_stopped")
-
-            if not self._running:
-                return
-
-            # ── Step 2: Overhead vision analysis (thread pool — CPU bound) ─
-            self._cycle_phase = CyclePhase.OVERHEAD_VISION
-            loop = asyncio.get_running_loop()
-            with self._time_step("overhead_vision"):
-                overhead_result = await loop.run_in_executor(
-                    None, self._run_vision_overhead, frame
-                )
-            # Archival image save happens in the background, NOT awaited here
-            # (2026-08-21, optimize-speed pass — operator's own observation:
-            # "3-4 secs delay before the robot moves, before the overhead
-            # image is saved"). run_overhead_detection() used to save the
-            # annotated frame inline — cv2.imwrite of a ~24.5MP PNG is a
-            # multi-second blocking disk write, and it was holding up the
-            # robot's next move for a file nothing downstream in THIS cycle
-            # reads (it's a record for later review, not an input to
-            # anything). Detection + centroid math above already completed
-            # by the time we get here; the save now just runs alongside
-            # everything after it (robot travel, EoA capture, etc.) instead
-            # of blocking in front of it.
-            if self._overhead_save_images and overhead_result.annotated_frame is not None:
-                asyncio.create_task(
-                    self._save_overhead_frame_background(overhead_result.annotated_frame)
-                )
-
-            # ── Filter: skip visited centroids ────────────────────────────
-            all_centroids = overhead_result.centroids_robot_xy
-            unvisited = [c for c in all_centroids if not self._is_visited(c)]
-
-            if not unvisited:
-                if all_centroids:
-                    log.info("cycle.all_centroids_visited",
-                             total=len(all_centroids),
-                             note="All detected bugs already attempted this run")
-                else:
-                    log.warning("cycle.no_samples_detected")
-                self._log_timing_summary("no_bugs")
-
-                if self._sm.current == State.CYCLE_STOPPING:
-                    await self._finish_stop(d)
-                elif self._sm.is_running():
-                    await asyncio.sleep(2.0)
-                    if self._sm.is_running():
-                        asyncio.create_task(self._run_cycle())
-                    elif self._sm.current == State.CYCLE_STOPPING:
+            if preselected_target is not None:
+                target_x, target_y, all_centroids = preselected_target
+                log.info("cycle.using_preselected_target",
+                         target_x=target_x, target_y=target_y,
+                         candidates=len(all_centroids))
+            else:
+                target = await self._capture_and_select_target()
+                if target is None:
+                    self._log_timing_summary("no_bugs")
+                    if self._sm.current == State.CYCLE_STOPPING:
                         await self._finish_stop(d)
-                return
-
-            # ── Select target: bottom-left first ─────────────────────────
-            # Sort: y ascending (leftmost), then x descending (bottommost).
-            # First element = bottom-left corner bug.
-            unvisited_sorted = sorted(unvisited, key=lambda c: (c[1], -c[0]))
-            target_x, target_y = unvisited_sorted[0]
-            log.info("cycle.target_selected",
-                     target_x=target_x, target_y=target_y,
-                     unvisited=len(unvisited), total=len(all_centroids))
-
-            # Mark visited immediately — even if EoA rejects it, we won't retry
-            # this exact spot in subsequent cycles (avoids infinite debris loop).
-            self._mark_visited(target_x, target_y)
-
-            # ── VIEW: show overhead with target highlighted ────────────────
-            if self._view and overhead_result.annotated_frame is not None:
-                from cib.vision.pipeline import draw_target_highlight
-                # Find pixel centroid for selected target
-                try:
-                    idx = overhead_result.centroids_robot_xy.index((target_x, target_y))
-                    target_px = overhead_result.centroids_px[idx]
-                    highlighted = draw_target_highlight(overhead_result.annotated_frame, target_px)
-                except (ValueError, IndexError):
-                    highlighted = overhead_result.annotated_frame
-                await loop.run_in_executor(
-                    None, self._show_image, highlighted,
-                    f"Overhead — {overhead_result.sample_count} bug(s), targeting ({target_x:.1f}, {target_y:.1f})"
-                )
+                    elif self._sm.is_running():
+                        await asyncio.sleep(2.0)
+                        if self._sm.is_running():
+                            asyncio.create_task(self._run_cycle())
+                        elif self._sm.current == State.CYCLE_STOPPING:
+                            await self._finish_stop(d)
+                    return
+                target_x, target_y, all_centroids = target
 
             if not self._running:
                 return
 
-            # ── Steps 3–4: Robot moves to image site + backlight off ───────
-            # No camera is streaming during robot motion — the adapter is
-            # fully free for TCP so keepalive and the motion command itself
-            # have the full 1 Gbps link with zero contention.
-            # Start backlight OFF and robot motion simultaneously — backlight
-            # settles in <1s while robot travels (30–60s at 5% speed).
-            # Quadrant U selection: pick once here, reuse for the Step 7
-            # correction move below (that move is a tiny EoA-derived delta —
-            # always the same quadrant — so recomputing would be redundant
-            # and risks flip-flopping right at the quadrant boundary).
-            target_u = self._select_quadrant_u(target_y)
-            self._cycle_phase = CyclePhase.ROBOT_MOVING
-            with self._time_step("robot_to_bug"):
-                await asyncio.gather(
-                    d.lighting.set_backlight(False),
-                    d.robot.move_to_image_site(target_x, target_y, u=target_u),
+            loop = asyncio.get_running_loop()
+
+            # ── Steps 3–6: retry loop ───────────────────────────────────────
+            # Image + classify candidates from the SAME overhead capture
+            # (all_centroids) until one passes EoA, or the list runs out.
+            # Added 2026-08-21 (operator's idea): an EoA rejection used to
+            # always go home and let the NEXT cycle pay for a fresh overhead
+            # capture — wasteful when the current capture already found
+            # other untried candidates sitting right there. Now a rejection
+            # just tries the next one from _select_next_target(), reusing
+            # the same detection pass, and only goes home once that list is
+            # actually exhausted. `break` below (only reached once
+            # eoa_result.proceed_with_pick is True) exits to Step 7/8
+            # (pick + drop), which stays outside this loop — a rejection
+            # inside the loop never falls through to picking.
+            eoa_retries = 0
+            while True:
+                # ── Steps 3–4: Robot moves to image site + backlight off ───
+                # No camera is streaming during robot motion — the adapter is
+                # fully free for TCP so keepalive and the motion command itself
+                # have the full 1 Gbps link with zero contention.
+                # Start backlight OFF and robot motion simultaneously — backlight
+                # settles in <1s while robot travels (30–60s at 5% speed).
+                # Quadrant U selection: pick once here, reuse for the Step 7
+                # correction move below (that move is a tiny EoA-derived delta —
+                # always the same quadrant — so recomputing would be redundant
+                # and risks flip-flopping right at the quadrant boundary).
+                target_u = self._select_quadrant_u(target_y)
+                self._cycle_phase = CyclePhase.ROBOT_MOVING
+                with self._time_step("robot_to_bug"):
+                    await asyncio.gather(
+                        d.lighting.set_backlight(False),
+                        d.robot.move_to_image_site(target_x, target_y, u=target_u),
+                    )
+                log.info("orchestrator.backlight_off_for_eoa")
+
+                # Ring light ON — robot DO 12 illuminates specimen for EoA camera.
+                # Backlight is already off. Ring light must be on before capturing.
+                # Wrapped in try/except: if RC+ digital output 12 is not yet
+                # configured the command will fail but we log a warning instead of
+                # faulting the whole cycle (image will be dark but system continues).
+                with self._time_step("eoa_capture_no_backlight"):
+                    try:
+                        await d.robot.ring_light_on()
+                        log.info("cycle.ring_light_on")
+                    except Exception as exc:
+                        log.warning("cycle.ring_light_on_failed", error=str(exc),
+                                    note="EoA image will be dark — configure RC+ output 12 and re-run")
+
+                    # Robot is now stationary at imaging height — start EoA stream.
+                    self._cycle_phase = CyclePhase.EOA_CAPTURE
+                    await d.camera_eoa.start_streaming()
+                    log.debug("cycle.eoa_stream_started")
+
+                    # Frame 1: backlight OFF, ring light ON — full exposure for classification
+                    eoa_frame_no_backlight = await d.camera_eoa.capture()
+                    log.debug("cycle.eoa_captured_no_backlight")
+
+                # Frame 2: backlight ON, ring light OFF — the two are mutually exclusive
+                # (2026-08-21, operator's explicit call: ring light off whenever backlight
+                # is on). This is now the frame Step 5 actually classifies on (see below) —
+                # the no_backlight frame proved too dark for reliable segmentation on this
+                # hardware (2026-08-11 diagnosis: Otsu called 70-100% of it "foreground",
+                # tripping the coverage guard before real classification even ran).
+                #
+                # NOTE: _eoa_backlight_on_exposure_us (machine_config.yaml) was originally
+                # tuned with ring light ALSO on (comment used to say "reduced exposure to
+                # avoid overexposure" from both lights combined). With ring light now off
+                # for this frame, that same exposure value is very likely too dark —
+                # re-tune it against real hardware before trusting classification results.
+                #
+                # Switch to shorter exposure BEFORE turning the backlight on, then
+                # drain a couple buffer frames — exposure settle + letting
+                # Continuous auto-white-balance readjust to the new backlight+
+                # ring-light colour mix. REVERTED 2026-08-21 back to plain
+                # Continuous every cycle (no lock, no "Once", no phase-relocation
+                # trick) after those approaches all produced bad real-hardware
+                # results one way or another — see git history for the full
+                # saga. Testing a smaller drain count (2, not the original 6)
+                # to see if that's enough margin; the 2026-08-11 diagnosis note
+                # that "draining only 2 left a yellow cast" was measured under a
+                # different lighting recipe (ring light ALSO on during this
+                # frame) — that's since changed (ring light is now off here), so
+                # worth re-testing rather than assuming the old finding still
+                # holds. Tune DRAIN_FRAMES up if 2 isn't enough.
+                # Tried dropping 2 -> 1 (2026-08-21 speed pass) to claw back
+                # the wall-clock cost now that the max_fps cap no longer makes
+                # drain frames "free". REVERTED back to 2 (2026-08-21, same
+                # day) — real hardware showed the exact old yellow-cast/
+                # overexposed symptom again (chroma=201 vs the normal ~8
+                # baseline), a real specimen misclassified as DEBRIS at
+                # DRAIN_FRAMES=1. 2 was confirmed OK.
+                # Tried 0 (2026-08-21, operator request) — take the very
+                # first frame after the exposure+backlight switch with no
+                # drain at all. REVERTED back to 2 (2026-08-21, same day) —
+                # real hardware came back almost entirely DARK, not just
+                # colour-cast. Root cause is different from the chroma-201
+                # failure at DRAIN_FRAMES=1: with 0 drain, capture() can
+                # return whatever frame was ALREADY sitting in the stream's
+                # buffer queue (start_stream(2) keeps 2 buffers rotating)
+                # from before backlight/exposure were even changed — a fixed
+                # settle delay (BACKLIGHT_SETTLE_S, above) doesn't fix this,
+                # since it delays WHEN we ask for a frame but doesn't flush
+                # what's already queued. Only an actual capture() call
+                # advances the buffer. So DRAIN_FRAMES needs to be >=1 purely
+                # to guarantee a POST-reconfiguration frame, on top of >=2
+                # being needed for AWB reconvergence (see above). 2 is the
+                # only value confirmed clean on real hardware so far — don't
+                # drop below it without a chroma AND brightness check.
+                DRAIN_FRAMES = 2
+                with self._time_step("eoa_capture_with_backlight"):
+                    try:
+                        await d.robot.ring_light_off()
+                        log.info("cycle.ring_light_off_for_backlight")
+                    except Exception as exc:
+                        log.warning("cycle.ring_light_off_failed", error=str(exc))
+
+                    # Backlight ON, THEN wait for it to actually be lit, THEN
+                    # switch to the backlight-on exposure, THEN capture — in
+                    # that order (2026-08-21, operator request: "make sure
+                    # all three channels are on and then only take the image
+                    # with the exposure for the backlight on"). See
+                    # BACKLIGHT_SETTLE_S above for why this is a fixed delay
+                    # rather than a polled confirmation.
+                    await d.lighting.set_backlight(True)
+                    await asyncio.sleep(BACKLIGHT_SETTLE_S)
+                    log.debug("cycle.backlight_settled", settle_s=BACKLIGHT_SETTLE_S)
+
+                    if self._eoa_backlight_on_exposure_us is not None:
+                        await d.camera_eoa.set_exposure(self._eoa_backlight_on_exposure_us)
+                        log.debug("cycle.eoa_exposure_switched",
+                                  exposure_us=self._eoa_backlight_on_exposure_us)
+
+                    for _ in range(DRAIN_FRAMES):
+                        await d.camera_eoa.capture()   # drain — exposure settle + WB readjust
+                    eoa_frame_with_backlight = await d.camera_eoa.capture()
+                    log.debug("cycle.eoa_captured_with_backlight", drain_frames=DRAIN_FRAMES)
+                    # Leave backlight ON — overhead camera needs it for the next cycle.
+
+                with self._time_step("eoa_cleanup"):
+                    # Restore full exposure for the next cycle's no-backlight capture.
+                    if self._eoa_normal_exposure_us is not None:
+                        await d.camera_eoa.set_exposure(self._eoa_normal_exposure_us)
+                        log.debug("cycle.eoa_exposure_restored",
+                                  exposure_us=self._eoa_normal_exposure_us)
+
+                    # Done capturing — stop EoA stream and ring light.
+                    await d.camera_eoa.stop_streaming()
+                    log.debug("cycle.eoa_stream_stopped")
+
+                    # Ring light is already off (turned off right before backlight
+                    # went on, above) — this is just a safety-net no-op in case
+                    # that earlier call failed, so we don't leave the run
+                    # believing ring light is off when it might not be.
+                    try:
+                        await d.robot.ring_light_off()
+                        log.info("cycle.ring_light_off")
+                    except Exception as exc:
+                        log.warning("cycle.ring_light_off_failed", error=str(exc))
+
+                # ── Step 5: EoA vision analysis ───────────────────────────
+                # Run on the WITH-backlight frame — see the capture comment above for
+                # why (no_backlight is too dark on this hardware). Its residual colour
+                # cast doesn't trip the chroma gate for dark bug bodies (validated
+                # against real captures — see software_tests/diagnose_eoa_20260811.py).
+                self._cycle_phase = CyclePhase.EOA_VISION
+                with self._time_step("eoa_vision"):
+                    eoa_result = await loop.run_in_executor(
+                        None, self._run_vision_eoa, eoa_frame_with_backlight, target_x, target_y
+                    )
+
+                # Save both frames — done AFTER analysis so with_backlight is annotated
+                # with a green + crosshair (tool centre) and cyan dot (body centre).
+                # Comparing those two markers tells you if the robot is on the bug.
+                saved_paths = await loop.run_in_executor(
+                    None, self._save_eoa_frames,
+                    eoa_frame_no_backlight, eoa_frame_with_backlight,
+                    eoa_result.body_center_px or None,
                 )
-            log.info("orchestrator.backlight_off_for_eoa")
+                if saved_paths is not None:
+                    self._cycle_image_paths.extend(saved_paths)
 
-            # Ring light ON — robot DO 12 illuminates specimen for EoA camera.
-            # Backlight is already off. Ring light must be on before capturing.
-            # Wrapped in try/except: if RC+ digital output 12 is not yet
-            # configured the command will fail but we log a warning instead of
-            # faulting the whole cycle (image will be dark but system continues).
-            with self._time_step("eoa_capture_no_backlight"):
-                try:
-                    await d.robot.ring_light_on()
-                    log.info("cycle.ring_light_on")
-                except Exception as exc:
-                    log.warning("cycle.ring_light_on_failed", error=str(exc),
-                                note="EoA image will be dark — configure RC+ output 12 and re-run")
+                # ── VIEW: show EoA annotated image ────────────────────────
+                if self._view and eoa_result.frame_path:
+                    await loop.run_in_executor(
+                        None, self._show_image_path, eoa_result.frame_path, "EoA Analysis"
+                    )
 
-                # Robot is now stationary at imaging height — start EoA stream.
-                self._cycle_phase = CyclePhase.EOA_CAPTURE
-                await d.camera_eoa.start_streaming()
-                log.debug("cycle.eoa_stream_started")
+                # ── Step 6: Go / no-go decision ────────────────────────────
+                log.info("cycle.eoa_classification",
+                         label=eoa_result.label,
+                         proceed=eoa_result.proceed_with_pick,
+                         reason=eoa_result.reason,
+                         body_center_px=eoa_result.body_center_px or "n/a",
+                         offset_from_center_px=eoa_result.offset_from_center_px or "n/a",
+                         annotated_image=eoa_result.frame_path or "not saved")
+                if eoa_result.proceed_with_pick:
+                    break
 
-                # Frame 1: backlight OFF, ring light ON — full exposure for classification
-                eoa_frame_no_backlight = await d.camera_eoa.capture()
-                log.debug("cycle.eoa_captured_no_backlight")
-
-            # Frame 2: backlight ON, ring light OFF — the two are mutually exclusive
-            # (2026-08-21, operator's explicit call: ring light off whenever backlight
-            # is on). This is now the frame Step 5 actually classifies on (see below) —
-            # the no_backlight frame proved too dark for reliable segmentation on this
-            # hardware (2026-08-11 diagnosis: Otsu called 70-100% of it "foreground",
-            # tripping the coverage guard before real classification even ran).
-            #
-            # NOTE: _eoa_backlight_on_exposure_us (machine_config.yaml) was originally
-            # tuned with ring light ALSO on (comment used to say "reduced exposure to
-            # avoid overexposure" from both lights combined). With ring light now off
-            # for this frame, that same exposure value is very likely too dark —
-            # re-tune it against real hardware before trusting classification results.
-            #
-            # Switch to shorter exposure BEFORE turning the backlight on, then
-            # drain a couple buffer frames — exposure settle + letting
-            # Continuous auto-white-balance readjust to the new backlight+
-            # ring-light colour mix. REVERTED 2026-08-21 back to plain
-            # Continuous every cycle (no lock, no "Once", no phase-relocation
-            # trick) after those approaches all produced bad real-hardware
-            # results one way or another — see git history for the full
-            # saga. Testing a smaller drain count (2, not the original 6)
-            # to see if that's enough margin; the 2026-08-11 diagnosis note
-            # that "draining only 2 left a yellow cast" was measured under a
-            # different lighting recipe (ring light ALSO on during this
-            # frame) — that's since changed (ring light is now off here), so
-            # worth re-testing rather than assuming the old finding still
-            # holds. Tune DRAIN_FRAMES up if 2 isn't enough.
-            DRAIN_FRAMES = 2
-            with self._time_step("eoa_capture_with_backlight"):
-                if self._eoa_backlight_on_exposure_us is not None:
-                    await d.camera_eoa.set_exposure(self._eoa_backlight_on_exposure_us)
-                    log.debug("cycle.eoa_exposure_switched",
-                              exposure_us=self._eoa_backlight_on_exposure_us)
-                try:
-                    await d.robot.ring_light_off()
-                    log.info("cycle.ring_light_off_for_backlight")
-                except Exception as exc:
-                    log.warning("cycle.ring_light_off_failed", error=str(exc))
-                await d.lighting.set_backlight(True)
-                for _ in range(DRAIN_FRAMES):
-                    await d.camera_eoa.capture()   # drain — exposure settle + WB readjust
-                eoa_frame_with_backlight = await d.camera_eoa.capture()
-                log.debug("cycle.eoa_captured_with_backlight", drain_frames=DRAIN_FRAMES)
-                # Leave backlight ON — overhead camera needs it for the next cycle.
-
-            with self._time_step("eoa_cleanup"):
-                # Restore full exposure for the next cycle's no-backlight capture.
-                if self._eoa_normal_exposure_us is not None:
-                    await d.camera_eoa.set_exposure(self._eoa_normal_exposure_us)
-                    log.debug("cycle.eoa_exposure_restored",
-                              exposure_us=self._eoa_normal_exposure_us)
-
-                # Done capturing — stop EoA stream and ring light.
-                await d.camera_eoa.stop_streaming()
-                log.debug("cycle.eoa_stream_stopped")
-
-                # Ring light is already off (turned off right before backlight
-                # went on, above) — this is just a safety-net no-op in case
-                # that earlier call failed, so we don't leave the run
-                # believing ring light is off when it might not be.
-                try:
-                    await d.robot.ring_light_off()
-                    log.info("cycle.ring_light_off")
-                except Exception as exc:
-                    log.warning("cycle.ring_light_off_failed", error=str(exc))
-
-            # ── Step 5: EoA vision analysis ───────────────────────────────
-            # Run on the WITH-backlight frame — see the capture comment above for
-            # why (no_backlight is too dark on this hardware). Its residual colour
-            # cast doesn't trip the chroma gate for dark bug bodies (validated
-            # against real captures — see software_tests/diagnose_eoa_20260811.py).
-            self._cycle_phase = CyclePhase.EOA_VISION
-            with self._time_step("eoa_vision"):
-                eoa_result = await loop.run_in_executor(
-                    None, self._run_vision_eoa, eoa_frame_with_backlight, target_x, target_y
-                )
-
-            # Save both frames — done AFTER analysis so with_backlight is annotated
-            # with a green + crosshair (tool centre) and cyan dot (body centre).
-            # Comparing those two markers tells you if the robot is on the bug.
-            saved_paths = await loop.run_in_executor(
-                None, self._save_eoa_frames,
-                eoa_frame_no_backlight, eoa_frame_with_backlight,
-                eoa_result.body_center_px or None,
-            )
-            if saved_paths is not None:
-                self._cycle_image_paths.extend(saved_paths)
-
-            # ── VIEW: show EoA annotated image ────────────────────────────
-            if self._view and eoa_result.frame_path:
-                await loop.run_in_executor(
-                    None, self._show_image_path, eoa_result.frame_path, "EoA Analysis"
-                )
-
-            # ── Step 6: Go / no-go decision ───────────────────────────────
-            log.info("cycle.eoa_classification",
-                     label=eoa_result.label,
-                     proceed=eoa_result.proceed_with_pick,
-                     reason=eoa_result.reason,
-                     body_center_px=eoa_result.body_center_px or "n/a",
-                     offset_from_center_px=eoa_result.offset_from_center_px or "n/a",
-                     annotated_image=eoa_result.frame_path or "not saved")
-            if not eoa_result.proceed_with_pick:
+                eoa_retries += 1
                 log.info("cycle.eoa_no_pick",
                          label=eoa_result.label,
                          reason=eoa_result.reason,
-                         note="EoA rejected — going home, will try next bug")
+                         retries=eoa_retries,
+                         note="EoA rejected — trying next candidate from this "
+                              "capture instead of homing")
+                stopping = self._sm.current == State.CYCLE_STOPPING
+                next_candidate = None if stopping else self._select_next_target(all_centroids)
+                if next_candidate is not None:
+                    target_x, target_y = next_candidate
+                    continue   # same overhead capture, no fresh detection needed
+
+                # Exhausted every candidate from this capture (or stopping) —
+                # go home, same as the original single-candidate reject path.
                 self._cycle_phase = CyclePhase.ROBOT_PARKING
                 with self._time_step("robot_park"):
                     await d.robot.move_to_safe_park()
                 log.info("orchestrator.robot_returning_backlight_already_on")
                 self._log_timing_summary("eoa_reject")
-                if self._sm.current == State.CYCLE_STOPPING:
+                if stopping:
                     await self._finish_stop(d)
                 elif self._sm.is_running():
                     asyncio.create_task(self._run_cycle())
@@ -1487,6 +1668,17 @@ class Orchestrator:
             self._cycle_phase = CyclePhase.ROBOT_TO_WELL
             await self._db_update_pick_status(pick.pick_id, PickStatus.DISPENSING)
             self._cycle_phase = CyclePhase.PUMP_DISPENSING
+            # Lookahead: fire the NEXT cycle's overhead capture concurrently
+            # with THIS drop (2026-08-21, operator's idea — "while the robot
+            # reaches to drop the next bug, trigger the next overhead camera
+            # capture"). is_lookahead=True keeps it from touching
+            # self._cycle_phase / self._cycle_timings (see
+            # _capture_and_select_target's docstring). Awaited (with a
+            # timeout, not blocking indefinitely) right after the drop
+            # finishes — see below.
+            lookahead_task = asyncio.create_task(
+                self._capture_and_select_target(is_lookahead=True)
+            )
             with self._time_step("robot_drop"):
                 await d.robot.execute_place(well_x, well_y, self._plate_u)
             log.info("cycle.pick_place_complete", refined_x=refined_x, refined_y=refined_y,
@@ -1501,17 +1693,42 @@ class Orchestrator:
             self._pending_well = None
             self._current_pick = None
 
-            self._cycle_phase = CyclePhase.ROBOT_PARKING
-            with self._time_step("robot_park"):
-                await d.robot.move_to_safe_park()
-            log.info("orchestrator.robot_returning_backlight_already_on")
-            self._log_timing_summary("success")
+            # ── Lookahead: skip homing if the concurrent capture above
+            # already found the next target ──────────────────────────────
+            # Bounded wait — in the common case robot_drop takes several
+            # seconds and the lookahead capture takes ~1-2s, so this
+            # resolves near-instantly; LOOKAHEAD_TIMEOUT_S is just a cap
+            # for the uncommon case (slow camera response) so a stuck
+            # lookahead can't stall the cycle. Any exception here (camera
+            # hiccup, etc.) is treated the same as "no target" — this is a
+            # speed optimization, never something that should be able to
+            # fault the cycle.
+            next_target: tuple[float, float, list[tuple[float, float]]] | None = None
+            try:
+                next_target = await asyncio.wait_for(lookahead_task, timeout=LOOKAHEAD_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                log.info("cycle.lookahead_timeout", timeout_s=LOOKAHEAD_TIMEOUT_S)
+            except Exception as exc:
+                log.warning("cycle.lookahead_failed", error=str(exc))
 
-            # ── Step 9: Queue next cycle or finish stop ───────────────────
-            if self._sm.current == State.CYCLE_STOPPING:
-                await self._finish_stop(d)
-            elif self._sm.is_running():
-                asyncio.create_task(self._run_cycle())
+            stopping = self._sm.current == State.CYCLE_STOPPING
+            if next_target is not None and self._sm.is_running() and not stopping:
+                log.info("orchestrator.lookahead_skip_home",
+                         target_x=next_target[0], target_y=next_target[1])
+                self._log_timing_summary("success")
+                asyncio.create_task(self._run_cycle(preselected_target=next_target))
+            else:
+                self._cycle_phase = CyclePhase.ROBOT_PARKING
+                with self._time_step("robot_park"):
+                    await d.robot.move_to_safe_park()
+                log.info("orchestrator.robot_returning_backlight_already_on")
+                self._log_timing_summary("success")
+
+                # ── Step 9: Queue next cycle or finish stop ───────────────
+                if stopping:
+                    await self._finish_stop(d)
+                elif self._sm.is_running():
+                    asyncio.create_task(self._run_cycle())
 
         except Exception as exc:
             err_str = str(exc)
@@ -1786,13 +2003,22 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     @contextmanager
-    def _time_step(self, name: str):
+    def _time_step(self, name: str, timings: dict[str, float] | None = None):
         """
         Times one cycle phase and logs it immediately as cycle.step_timing,
-        plus records it into self._cycle_timings for the end-of-cycle
-        cycle.timing_summary line. Wrap every phase worth optimizing —
-        camera captures, vision analysis, robot moves — so where cycle time
-        actually goes is visible straight from the logs, not guessed at.
+        plus records it into `timings` (self._cycle_timings by default) for
+        the end-of-cycle cycle.timing_summary line. Wrap every phase worth
+        optimizing — camera captures, vision analysis, robot moves — so
+        where cycle time actually goes is visible straight from the logs,
+        not guessed at.
+
+        timings: pass a throwaway dict instead of the default when timing
+        something that ISN'T the current cycle's own progress — e.g. the
+        lookahead capture in _capture_and_select_target(is_lookahead=True)
+        runs concurrently with THIS cycle's drop, and must not write into
+        self._cycle_timings (that dict is about to be read by THIS cycle's
+        own cycle.timing_summary — writing into it from a background task
+        would corrupt that summary with the next cycle's numbers).
 
         A plain (non-async) context manager is enough here: the `with`
         block's body still runs its `await`s normally, this just measures
@@ -1803,7 +2029,7 @@ class Orchestrator:
             yield
         finally:
             dt = time.monotonic() - t0
-            self._cycle_timings[name] = dt
+            (timings if timings is not None else self._cycle_timings)[name] = dt
             log.info("cycle.step_timing", step=name, duration_s=round(dt, 3))
 
     def _log_timing_summary(self, outcome: str) -> None:

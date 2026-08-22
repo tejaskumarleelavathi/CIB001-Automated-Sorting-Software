@@ -74,7 +74,17 @@ eoa_camera:
   backlight_on_exposure_us: 5000  # backlight-ON verification frame — shorter exposure, AWB corrects ring-light colour cast
   gain_db: 0.0
   pixel_format: "BGR8"    # color for EoA archival images
-  max_fps: 1.0             # EoA frame is 70MB (BGR8 full-res) — limit to 1fps to spare bandwidth
+  # EoA frame is ~70MB (BGR8 full-res) — at ~1Gbps effective wire speed that's
+  # already a natural ~0.7s/frame floor, so a 1.0fps cap (was: 1.0) was adding
+  # an extra ~0.3s of pure artificial wait PER FRAME on top of that, and this
+  # block captures 4 frames/cycle (no_backlight archival + 2 drain + keeper).
+  # The 1.0 value was sized to avoid contention with the overhead camera on
+  # the shared USB-C adapter, but the two cameras never actually stream
+  # concurrently (each does start_streaming()->capture->stop_streaming() in
+  # its own window — confirmed 2026-08-21) so that contention doesn't occur
+  # in practice. Raised to unblock the wire-speed floor; if a future change
+  # ever does overlap the two streams, drop this back down.
+  max_fps: 15.0
 
 backlight:
   # Advanced Illumination DCS-100E

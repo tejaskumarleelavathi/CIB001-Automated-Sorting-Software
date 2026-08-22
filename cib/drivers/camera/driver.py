@@ -327,6 +327,28 @@ class GigECameraDriver:
             log.warning("camera.packet_resend_enable_failed", name=self._name,
                         error=str(e)[:80])
 
+        # Buffer handling mode: Arena SDK defaults to "OldestFirst" (FIFO —
+        # get_buffer() returns the OLDEST queued frame). That's the real
+        # cause of a 2026-08-21 bug where an EoA capture taken right after
+        # switching exposure/backlight came back stale (still reflecting
+        # the state from BEFORE the switch) when nothing had drained the
+        # queue first. "NewestOnly" makes each new frame overwrite the
+        # last one in the queue, so get_buffer() always returns the most
+        # recently captured frame — this is a documented Arena SDK/GenICam
+        # mechanism for exactly this situation, not a guess. Does not
+        # remove the need to discard >=1 frame after an exposure change
+        # (a frame already integrating when ExposureTime changes finishes
+        # with the OLD value — that's real sensor/GenICam behavior, not
+        # buffer staleness) or the separate, still-empirically-tuned need
+        # for BalanceWhiteAuto to reconverge.
+        try:
+            tl_stream["StreamBufferHandlingMode"].value = "NewestOnly"
+            log.debug("camera.buffer_handling_mode_set", name=self._name,
+                      mode="NewestOnly")
+        except Exception as e:
+            log.warning("camera.buffer_handling_mode_failed", name=self._name,
+                        error=str(e)[:80])
+
     def _start_stream_with_retry(self) -> None:
         """Start streaming with retries. Cleans up partial state between attempts.
 
