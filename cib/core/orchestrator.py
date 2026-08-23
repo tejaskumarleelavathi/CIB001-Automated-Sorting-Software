@@ -1398,23 +1398,25 @@ class Orchestrator:
                 # wire-speed floor per frame, confirmed by matching
                 # eoa_capture_with_backlight/no_backlight step timings almost
                 # exactly against frame-count x this figure).
-                # Dropping WITH_BACKLIGHT to 1 now (2026-08-22, operator
-                # request) — NOT symmetric with NO_BACKLIGHT (staying at 3)
-                # anymore, on purpose. This is specifically testing whether
-                # the exposure pre-set added on the accept path just above
-                # (set_exposure(backlight_on) right when we decide to pick,
-                # while the stream is already stopped) was enough to remove
-                # the need for extra AWB-reconvergence margin on THIS
-                # capture, not just the exposure-latency frame. UNTESTED —
-                # if with-backlight comes back oscillating/yellow again at 1,
-                # that tells us AWB reconvergence still needs real drain
-                # frames regardless of the pre-set trick, and this should go
-                # back up (to 3, not necessarily all the way to 4 — check
-                # colour on both the lookahead-chained cycles, where the
-                # pre-set applies, AND cold-start/reject cycles, where it
-                # doesn't, since those two cases may now genuinely need
-                # different counts).
-                DRAIN_FRAMES_WITH_BACKLIGHT = 1
+                # Tried WITH_BACKLIGHT at 1 (2026-08-22, operator request) to
+                # see if the exposure pre-set on the accept path (above) was
+                # enough to remove the need for AWB-reconvergence margin on
+                # this capture too, not just the exposure-latency frame.
+                # REVERTED back to 2 same day — real hardware showed two
+                # distinct failures at 1: a blown-white frame (AWB not
+                # reconverged — the pre-set trick only helps chained/
+                # post-pick cycles, not cold-start or retry-loop-after-reject
+                # cycles, which still hit drain=1 with zero head start) and,
+                # separately, a motion-blurred frame (the whole frame soft,
+                # not just the specimen — the robot arm hadn't finished
+                # settling from the arrival move when the keeper was grabbed,
+                # plausibly worse now after the Speed 25/SpeedS 120 bump in
+                # sort_server.prg). More drain frames cost real wall time,
+                # which incidentally gives the arm's vibration time to settle
+                # too, so this one number was masking two different root
+                # causes. NO_BACKLIGHT untouched (stays at 3) — this change
+                # is WITH_BACKLIGHT only, per operator's explicit request.
+                DRAIN_FRAMES_WITH_BACKLIGHT = 2
                 DRAIN_FRAMES_NO_BACKLIGHT = 3
                 self._cycle_phase = CyclePhase.EOA_CAPTURE
                 with self._time_step("eoa_capture_with_backlight"):
