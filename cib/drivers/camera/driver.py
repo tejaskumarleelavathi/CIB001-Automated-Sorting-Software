@@ -328,19 +328,32 @@ class GigECameraDriver:
                         error=str(e)[:80])
 
         # Buffer handling mode: Arena SDK defaults to "OldestFirst" (FIFO —
-        # get_buffer() returns the OLDEST queued frame). That's the real
+        # get_buffer() returns the OLDEST queued frame). That was the real
         # cause of a 2026-08-21 bug where an EoA capture taken right after
-        # switching exposure/backlight came back stale (still reflecting
-        # the state from BEFORE the switch) when nothing had drained the
-        # queue first. "NewestOnly" makes each new frame overwrite the
-        # last one in the queue, so get_buffer() always returns the most
-        # recently captured frame — this is a documented Arena SDK/GenICam
-        # mechanism for exactly this situation, not a guess. Does not
-        # remove the need to discard >=1 frame after an exposure change
-        # (a frame already integrating when ExposureTime changes finishes
-        # with the OLD value — that's real sensor/GenICam behavior, not
-        # buffer staleness) or the separate, still-empirically-tuned need
-        # for BalanceWhiteAuto to reconverge.
+        # switching exposure/backlight came back stale. "NewestOnly" (each
+        # new frame overwrites the last one in the queue, so get_buffer()
+        # always returns the most recent) is the documented Arena SDK/
+        # GenICam fix for that.
+        # SUSPECT, not confirmed, in a 2026-08-22 hardware stall: a run
+        # froze mid-cycle for 30+ seconds with the cycle task blocked
+        # (background safety/PLC/keepalive loops kept running fine — only
+        # the cycle task itself froze), consistent with get_buffer()
+        # hanging until its 60s timeout (BUFFER_TIMEOUT_MS). Briefly
+        # reverted to OldestFirst same day, then put back to NewestOnly on
+        # operator's explicit request — the log evidence for THIS specific
+        # setting being the cause wasn't conclusive (self._view may have
+        # been True on the running machine, which would route through the
+        # separate eoa_verification_capture capture() calls in
+        # orchestrator.py instead — same get_buffer() risk, unrelated to
+        # this setting). Operator is deliberately re-testing with this on
+        # to gather more evidence. This architecture restarts the EoA
+        # stream on every retry-loop iteration — exactly the kind of
+        # repeated stop_stream()/start_stream() cycling that could expose
+        # an undocumented interaction between NewestOnly's overwrite
+        # semantics and buffer-ready signaling in a 2-buffer pool
+        # (start_stream(2)) — if a hang recurs specifically after this was
+        # restored, that's real evidence this setting is the cause, not
+        # just correlation.
         try:
             tl_stream["StreamBufferHandlingMode"].value = "NewestOnly"
             log.debug("camera.buffer_handling_mode_set", name=self._name,

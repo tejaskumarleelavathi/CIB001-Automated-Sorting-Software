@@ -103,6 +103,22 @@
 ' with the pipette down" — only step 7's travel move does, and it only runs
 ' after WaitPipetteUp confirms the pipette is clear.
 '
+' CP (continuous path) blending, pipette-UP moves only (2026-08-22, operator
+' request — "add blending... when pipette is up only"): PICK/PICK_U's step 7
+' lift (the two Z-only moves from -62.000/-60.000 up to -47.700) runs inside
+' CP On / CP Off. CP is matched with CP Off in the SAME command handler
+' before it returns — CP is not auto-reset between TCP commands (only at
+' controller startup/motor-on/task end), so leaving it set would silently
+' affect whatever command runs next.
+' Also tried this on DROP/DROP_U's initial travel-to + approach-to -58.660,
+' converting the travel move from Go (PTP) to Move (CP) so it could blend
+' with the descent. REVERTED same day — real hardware showed robot_drop got
+' SLOWER (~6.2-6.4s baseline -> 8.5s): Move is capped by SpeedS (a straight-
+' line mm/sec limit), while Go uses Speed (% of max joint speed) — for this
+' SCARA's large pick-to-drop lateral hop, PTP's per-joint profile beat the
+' 120mm/s linear cap by more than the blended corner saved. DROP/DROP_U's
+' travel move is back to Go, unblended.
+'
 ' Motor: Novanta LMDAE572C linear actuator at 172.16.9.60:503
 '   EX G2 -> aspirate / draw back  (PICK/PICK_U)
 '   EX G1 -> drop / push forward   (DROP/DROP_U)
@@ -152,20 +168,26 @@ Function sort_server
     ' all use it, since it's a global interpreter setting, set once, never
     ' touched elsewhere. Raised from 5/5,5 (5% of max — extremely
     ' conservative, likely never revisited since early bring-up) to 20/
-    ' 20,20 as a first optimize-speed step (2026-08-21): a 4x jump, not the
-    ' max — watch the first few real cycles closely (E-stop ready) before
-    ' pushing higher. This does NOT touch the controlled final descent
-    ' (SpeedS 10/AccelS 10,10, set separately inside PICK/DROP).
-    Speed 20
-    Accel 20, 20
+    ' 20,20 as a first optimize-speed step (2026-08-21), then to 25/25,25
+    ' (2026-08-22, operator request — "increase the robot speed just a
+    ' bit"): another modest step, not the max — watch the first few real
+    ' cycles closely (E-stop ready) before pushing higher. This does NOT
+    ' touch the controlled final descent (SpeedS 10/AccelS 10,10, set
+    ' separately inside PICK/DROP).
+    Speed 25
+    Accel 25, 25
     ' SpeedS/AccelS govern Move (linear/CP) commands — Speed/Accel above only
     ' govern Go (PTP) commands and have NO effect on Move. Every fine-motion
     ' command in this program uses Move, so this is the real "fast/slow"
     ' knob. Set once here as the default "fast" baseline; PICK/PICK_U/
     ' DROP/DROP_U temporarily drop to a slow SpeedS/AccelS for the
     ' controlled final descent only, then restore these same fast values.
-    SpeedS 100
-    AccelS 100, 100
+    ' Raised 100 -> 120 mm/sec (2026-08-22, operator request, same "just a
+    ' bit" ask as above) — also now the speed for DROP/DROP_U's travel-to
+    ' move, converted from Go to Move below to enable CP blending into the
+    ' approach descent.
+    SpeedS 120
+    AccelS 120, 120
 
 server_start:
     OpenNet #201 As Server
@@ -303,8 +325,8 @@ server_start:
             ' finished before anything retracts.
             Call StartMotorAspire
             Move XY(rx, ry, -62.000, cur_u)
-            SpeedS 100
-            AccelS 100, 100
+            SpeedS 120
+            AccelS 120, 120
             Call WaitMotorComplete
             ' Pipette (pneumatic) retracts FIRST, THEN robot/EOA Z — reversed
             ' 2026-08-21 from the original EOA-first order (operator's own
@@ -321,8 +343,20 @@ server_start:
             ' travel height.
             Off 4
             Call WaitPipetteUp
+            ' Blended (CP On) — 2026-08-22, operator request: only while the
+            ' pipette is UP, never during the controlled descent above. CP
+            ' Off before Tool 1/Print so the setting never leaks into
+            ' whatever command runs next (CP is NOT auto-reset between TCP
+            ' commands — only at controller startup/motor-on/task end, per
+            ' Epson SPEL+ Language Reference). Rewrote the final lift to
+            ' explicit XY/U instead of CX(Here)/CY(Here)/CU(Here) — motion
+            ' commands referencing Here bypass CP path synthesis entirely
+            ' regardless of CP state, so the old Here-based move could never
+            ' have blended anyway.
+            CP On
             Move XY(rx, ry, -58.660, cur_u)
-            Move XY(CX(Here), CY(Here), -47.700, CU(Here))
+            Move XY(rx, ry, -47.700, cur_u)
+            CP Off
             Tool 1
             Print #201, "OK PICKED " + Str$(rx) + "," + Str$(ry)
 
@@ -354,16 +388,22 @@ server_start:
             ' in PICK above (2026-08-21: mid-descent, not before or after).
             Call StartMotorAspire
             Move XY(rx, ry, -62.000, ru)
-            SpeedS 100
-            AccelS 100, 100
+            SpeedS 120
+            AccelS 120, 120
             Call WaitMotorComplete
             ' Pipette retracts FIRST, then robot/EOA Z — see the matching
             ' comment in PICK above (2026-08-21: fixes specimen falling back
             ' into the liquid during retraction).
             Off 4
             Call WaitPipetteUp
+            ' Blended (CP On) — see the matching comment in PICK above
+            ' (2026-08-22: only while pipette is UP, CP Off before Print so
+            ' it never leaks into the next command, Here-based moves
+            ' rewritten to explicit XY/U since Here bypasses CP entirely).
+            CP On
             Move XY(rx, ry, -58.660, ru)
-            Move XY(CX(Here), CY(Here), -47.700, CU(Here))
+            Move XY(rx, ry, -47.700, ru)
+            CP Off
             Tool 1
             Print #201, "OK PICKED " + Str$(rx) + "," + Str$(ry)
 
@@ -377,6 +417,17 @@ server_start:
             rx = Val(Mid$(cmd$, sp1 + 1, sp2 - sp1 - 1))
             ry = Val(Mid$(cmd$, sp2 + 1))
             cur_u = CU(Here)
+            ' Tried CP-blending this travel+approach 2026-08-22 by converting
+            ' this move from Go (PTP) to Move (CP), so it could blend with
+            ' the descent below. REVERTED same day — real hardware showed
+            ' robot_drop got SLOWER (~6.2-6.4s baseline -> 8.5s), confirming
+            ' the exact risk flagged when this was added: Move is capped by
+            ' SpeedS (a straight-line mm/sec limit, 120), while Go uses
+            ' Speed (% of max joint speed, 25) — for this SCARA's large
+            ' lateral hop, PTP's per-joint profile is evidently faster than
+            ' the 120mm/s linear cap, and that cost more than the blended
+            ' corner saved. Back to Go — no CP wrap here (a lone Move with
+            ' nothing to blend into is pointless anyway once this reverts).
             Go XY(rx, ry, -47.700, cur_u)
             ' 3s E-stop reaction pause removed 2026-08-21 (optimize-speed pass,
             ' operator's own call — "we don't need 3 secs there, remove it").
@@ -394,8 +445,8 @@ server_start:
             ' -60.000, not -62.000 (PICK's aspirate depth) — DROP-only, less
             ' descent needed to reach the well (2026-08-21, operator's call).
             Move XY(rx, ry, -60.000, cur_u)
-            SpeedS 100
-            AccelS 100, 100
+            SpeedS 120
+            AccelS 120, 120
             Call MotorDrop
             Move XY(rx, ry, -58.660, cur_u)
             Off 4
@@ -416,6 +467,11 @@ server_start:
             rx = Val(Left$(coord_str$, comma1 - 1))
             ry = Val(Mid$(coord_str$, comma1 + 1, comma2 - comma1 - 1))
             ru = Val(Mid$(coord_str$, comma2 + 1))
+            ' Reverted the CP-blended Go->Move travel conversion here too —
+            ' see the matching comment in DROP above (2026-08-22: real
+            ' hardware showed robot_drop got slower, not faster, once this
+            ' travel move was capped by SpeedS instead of using Go's PTP
+            ' joint-speed profile).
             Go XY(rx, ry, -47.700, ru)
             ' 3s E-stop reaction pause removed 2026-08-21 (optimize-speed pass,
             ' operator's own call — "we don't need 3 secs there, remove it").
@@ -433,8 +489,8 @@ server_start:
             ' -60.000, not -62.000 (PICK's aspirate depth) — DROP-only, less
             ' descent needed to reach the well (2026-08-21, operator's call).
             Move XY(rx, ry, -60.000, ru)
-            SpeedS 100
-            AccelS 100, 100
+            SpeedS 120
+            AccelS 120, 120
             Call MotorDrop
             Move XY(rx, ry, -58.660, ru)
             Off 4

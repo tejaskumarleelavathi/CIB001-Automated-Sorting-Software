@@ -89,19 +89,6 @@ ROBOT_KEEPALIVE_INTERVAL_S = 0.5    # seconds — Epson TCP idle timer fires at 
 # past this, give up and home normally rather than stall the cycle.
 LOOKAHEAD_TIMEOUT_S = 3.0
 
-# Fixed settle delay after commanding the DCS-100E backlight ON, before the
-# EoA with-backlight capture (2026-08-21). The DCS-100E does not ACK
-# SET:MODE:CHANNELx commands in any way worth waiting on (see
-# RECV_TIMEOUT_S in lighting/driver.py — "SET commands need no ack"), so
-# there is no software confirmation to poll for that all 3 channels are
-# actually on. This is a fixed wait instead. Sized conservatively: the
-# DCS-100E is a strobe controller rated for pulse widths as low as 100us,
-# which implies its LED current itself settles far faster than this value —
-# but that's a datasheet inference, not a measurement on THIS hardware.
-# UNTESTED — tune down if it's pure overhead, or up if with-backlight
-# frames still show inconsistent illumination.
-BACKLIGHT_SETTLE_S = 0.05
-
 # Fine correction applied to the vision-computed PICK target only (2026-08-19,
 # see DEV-15 in prd_updated.md) — deliberately NOT in TLSet 2 (sort_server.prg)
 # and NOT in the plate config, after those approaches spent a full session
@@ -1349,12 +1336,18 @@ class Orchestrator:
             # inside the loop never falls through to picking.
             eoa_retries = 0
             while True:
-                # ── Steps 3–4: Robot moves to image site + backlight off ───
-                # No camera is streaming during robot motion — the adapter is
-                # fully free for TCP so keepalive and the motion command itself
-                # have the full 1 Gbps link with zero contention.
-                # Start backlight OFF and robot motion simultaneously — backlight
-                # settles in <1s while robot travels (30–60s at 5% speed).
+                # ── Steps 3–4: Robot moves to image site, backlight stays ON ─
+                # Reordered 2026-08-22 (operator's idea): capture the
+                # with-backlight (classifier) frame FIRST, run vision on it
+                # in the background, and only THEN capture the no-backlight
+                # (archival-only) frame concurrently with that vision call —
+                # instead of capturing both serially before vision ever
+                # starts. Backlight is left on for the move (it's already on
+                # from the previous cycle/iteration's cleanup below) since
+                # the very first thing we need at the destination is a
+                # with-backlight frame — no off/on/settle round trip to pay
+                # for it. Stream start is folded into the same gather since
+                # it doesn't depend on the robot being there yet.
                 # Quadrant U selection: pick once here, reuse for the Step 7
                 # correction move below (that move is a tiny EoA-derived delta —
                 # always the same quadrant — so recomputing would be redundant
@@ -1363,156 +1356,173 @@ class Orchestrator:
                 self._cycle_phase = CyclePhase.ROBOT_MOVING
                 with self._time_step("robot_to_bug"):
                     await asyncio.gather(
-                        d.lighting.set_backlight(False),
+                        d.camera_eoa.start_streaming(),
                         d.robot.move_to_image_site(target_x, target_y, u=target_u),
                     )
-                log.info("orchestrator.backlight_off_for_eoa")
+                log.debug("cycle.eoa_stream_started")
 
-                # Ring light ON — robot DO 12 illuminates specimen for EoA camera.
-                # Backlight is already off. Ring light must be on before capturing.
-                # Wrapped in try/except: if RC+ digital output 12 is not yet
-                # configured the command will fail but we log a warning instead of
-                # faulting the whole cycle (image will be dark but system continues).
+                # ── Step 4: With-backlight capture — this is the frame Step 5
+                # actually classifies on (the no-backlight frame proved too
+                # dark for reliable segmentation on this hardware — 2026-08-11
+                # diagnosis: Otsu called 70-100% of it "foreground", tripping
+                # the coverage guard before real classification even ran).
+                # Ring light stays off here (mutually exclusive with backlight,
+                # 2026-08-21) — it's already off from the previous iteration's
+                # cleanup, nothing to do.
+                #
+                # DRAIN_FRAMES_WITH_BACKLIGHT / DRAIN_FRAMES_NO_BACKLIGHT:
+                # 2026-08-21 testing found >=2 drains needed after an exposure
+                # change (see git history — tried 1 and 0 first, both failed:
+                # yellow cast at 1, near-black stale-buffer frame at 0).
+                # StreamBufferHandlingMode=NewestOnly (camera/driver.py) should
+                # now prevent the stale-buffer failure specifically, but the
+                # AWB-reconvergence reason still applies.
+                # Bumped 2 -> 4 on BOTH captures (2026-08-22, operator request)
+                # after the 2026-08-22 reorder made each capture the FIRST
+                # frame off a freshly-restarted stream for its own lighting
+                # condition (previously the no-backlight capture went first
+                # every iteration and incidentally gave AWB one "primer" frame
+                # under the current stream session before the with-backlight
+                # keeper — now each capture starts AWB from whatever state
+                # survived the OTHER capture's very different scene, with only
+                # 2 frames to readjust). Real hardware showed this as the
+                # with-backlight frame oscillating good/yellow/blown-white/
+                # yellow across consecutive attempts, and the no-backlight
+                # frame coming back consistently dark and blue-shifted.
+                # 4 CONFIRMED CLEAN on real hardware (2026-08-22) — both
+                # captures came back correct (no oscillation, no dark/blue
+                # cast). Bisected to 3 next — also clean. But each drain
+                # frame costs a real ~0.6-0.7s of wall time regardless of
+                # drain count (this camera is ~23MP/70MB per BGR8 frame — at
+                # ~100MB/s effective USB-Ethernet throughput that's a
+                # wire-speed floor per frame, confirmed by matching
+                # eoa_capture_with_backlight/no_backlight step timings almost
+                # exactly against frame-count x this figure).
+                # Dropping WITH_BACKLIGHT to 1 now (2026-08-22, operator
+                # request) — NOT symmetric with NO_BACKLIGHT (staying at 3)
+                # anymore, on purpose. This is specifically testing whether
+                # the exposure pre-set added on the accept path just above
+                # (set_exposure(backlight_on) right when we decide to pick,
+                # while the stream is already stopped) was enough to remove
+                # the need for extra AWB-reconvergence margin on THIS
+                # capture, not just the exposure-latency frame. UNTESTED —
+                # if with-backlight comes back oscillating/yellow again at 1,
+                # that tells us AWB reconvergence still needs real drain
+                # frames regardless of the pre-set trick, and this should go
+                # back up (to 3, not necessarily all the way to 4 — check
+                # colour on both the lookahead-chained cycles, where the
+                # pre-set applies, AND cold-start/reject cycles, where it
+                # doesn't, since those two cases may now genuinely need
+                # different counts).
+                DRAIN_FRAMES_WITH_BACKLIGHT = 1
+                DRAIN_FRAMES_NO_BACKLIGHT = 3
+                self._cycle_phase = CyclePhase.EOA_CAPTURE
+                with self._time_step("eoa_capture_with_backlight"):
+                    if self._eoa_backlight_on_exposure_us is not None:
+                        await d.camera_eoa.set_exposure(self._eoa_backlight_on_exposure_us)
+                        log.debug("cycle.eoa_exposure_switched",
+                                  exposure_us=self._eoa_backlight_on_exposure_us)
+                    for _ in range(DRAIN_FRAMES_WITH_BACKLIGHT):
+                        await d.camera_eoa.capture()   # drain — exposure settle + WB readjust
+                    eoa_frame_with_backlight = await d.camera_eoa.capture()
+                    log.debug("cycle.eoa_captured_with_backlight",
+                              drain_frames=DRAIN_FRAMES_WITH_BACKLIGHT)
+
+                # ── Step 5: Fire vision in the background ─────────────────
+                # _run_vision_eoa operates on the numpy array already copied
+                # out of the camera buffer (GigECameraDriver._capture_sync) —
+                # it never touches the camera device, so it's safe to run
+                # concurrently with the no-backlight capture below rather
+                # than waiting for it to finish first.
+                # loop.run_in_executor() already returns an awaitable Future
+                # and starts running immediately — it must NOT be wrapped in
+                # asyncio.create_task() (that requires an actual coroutine,
+                # not a Future; doing it anyway throws "a coroutine was
+                # expected, got <Future ...>" — caught by a mock smoke test
+                # 2026-08-22 before this ever reached real hardware).
+                self._cycle_phase = CyclePhase.EOA_VISION
+                vision_t0 = time.monotonic()
+                vision_task = loop.run_in_executor(
+                    None, self._run_vision_eoa, eoa_frame_with_backlight, target_x, target_y
+                )
+
+                # ── Steps 3b–4b: No-backlight capture, concurrent with vision ─
+                # Archival-only frame (see Step 5 above) — ring light ON,
+                # backlight OFF, full/normal exposure. Wrapped in try/except:
+                # if RC+ digital output 12 isn't configured yet, the image
+                # will just be dark, not fatal to the cycle.
                 with self._time_step("eoa_capture_no_backlight"):
+                    if self._eoa_normal_exposure_us is not None:
+                        await d.camera_eoa.set_exposure(self._eoa_normal_exposure_us)
+                        log.debug("cycle.eoa_exposure_restored",
+                                  exposure_us=self._eoa_normal_exposure_us)
+                    await d.lighting.set_backlight(False)
                     try:
                         await d.robot.ring_light_on()
                         log.info("cycle.ring_light_on")
                     except Exception as exc:
                         log.warning("cycle.ring_light_on_failed", error=str(exc),
                                     note="EoA image will be dark — configure RC+ output 12 and re-run")
-
-                    # Robot is now stationary at imaging height — start EoA stream.
-                    self._cycle_phase = CyclePhase.EOA_CAPTURE
-                    await d.camera_eoa.start_streaming()
-                    log.debug("cycle.eoa_stream_started")
-
-                    # Frame 1: backlight OFF, ring light ON — full exposure for classification
+                    for _ in range(DRAIN_FRAMES_NO_BACKLIGHT):
+                        await d.camera_eoa.capture()   # same exposure-change + buffer reasons as above
                     eoa_frame_no_backlight = await d.camera_eoa.capture()
-                    log.debug("cycle.eoa_captured_no_backlight")
-
-                # Frame 2: backlight ON, ring light OFF — the two are mutually exclusive
-                # (2026-08-21, operator's explicit call: ring light off whenever backlight
-                # is on). This is now the frame Step 5 actually classifies on (see below) —
-                # the no_backlight frame proved too dark for reliable segmentation on this
-                # hardware (2026-08-11 diagnosis: Otsu called 70-100% of it "foreground",
-                # tripping the coverage guard before real classification even ran).
-                #
-                # NOTE: _eoa_backlight_on_exposure_us (machine_config.yaml) was originally
-                # tuned with ring light ALSO on (comment used to say "reduced exposure to
-                # avoid overexposure" from both lights combined). With ring light now off
-                # for this frame, that same exposure value is very likely too dark —
-                # re-tune it against real hardware before trusting classification results.
-                #
-                # Switch to shorter exposure BEFORE turning the backlight on, then
-                # drain a couple buffer frames — exposure settle + letting
-                # Continuous auto-white-balance readjust to the new backlight+
-                # ring-light colour mix. REVERTED 2026-08-21 back to plain
-                # Continuous every cycle (no lock, no "Once", no phase-relocation
-                # trick) after those approaches all produced bad real-hardware
-                # results one way or another — see git history for the full
-                # saga. Testing a smaller drain count (2, not the original 6)
-                # to see if that's enough margin; the 2026-08-11 diagnosis note
-                # that "draining only 2 left a yellow cast" was measured under a
-                # different lighting recipe (ring light ALSO on during this
-                # frame) — that's since changed (ring light is now off here), so
-                # worth re-testing rather than assuming the old finding still
-                # holds. Tune DRAIN_FRAMES up if 2 isn't enough.
-                # Tried dropping 2 -> 1 (2026-08-21 speed pass) to claw back
-                # the wall-clock cost now that the max_fps cap no longer makes
-                # drain frames "free". REVERTED back to 2 (2026-08-21, same
-                # day) — real hardware showed the exact old yellow-cast/
-                # overexposed symptom again (chroma=201 vs the normal ~8
-                # baseline), a real specimen misclassified as DEBRIS at
-                # DRAIN_FRAMES=1. 2 was confirmed OK.
-                # Tried 0 (2026-08-21, operator request) — take the very
-                # first frame after the exposure+backlight switch with no
-                # drain at all. REVERTED back to 2 (2026-08-21, same day) —
-                # real hardware came back almost entirely DARK, not just
-                # colour-cast. Root cause is different from the chroma-201
-                # failure at DRAIN_FRAMES=1: with 0 drain, capture() can
-                # return whatever frame was ALREADY sitting in the stream's
-                # buffer queue (start_stream(2) keeps 2 buffers rotating)
-                # from before backlight/exposure were even changed — a fixed
-                # settle delay (BACKLIGHT_SETTLE_S, above) doesn't fix this,
-                # since it delays WHEN we ask for a frame but doesn't flush
-                # what's already queued. Only an actual capture() call
-                # advances the buffer. So DRAIN_FRAMES needs to be >=1 purely
-                # to guarantee a POST-reconfiguration frame, on top of >=2
-                # being needed for AWB reconvergence (see above). 2 is the
-                # only value confirmed clean on real hardware so far — don't
-                # drop below it without a chroma AND brightness check.
-                DRAIN_FRAMES = 2
-                with self._time_step("eoa_capture_with_backlight"):
-                    try:
-                        await d.robot.ring_light_off()
-                        log.info("cycle.ring_light_off_for_backlight")
-                    except Exception as exc:
-                        log.warning("cycle.ring_light_off_failed", error=str(exc))
-
-                    # Backlight ON, THEN wait for it to actually be lit, THEN
-                    # switch to the backlight-on exposure, THEN capture — in
-                    # that order (2026-08-21, operator request: "make sure
-                    # all three channels are on and then only take the image
-                    # with the exposure for the backlight on"). See
-                    # BACKLIGHT_SETTLE_S above for why this is a fixed delay
-                    # rather than a polled confirmation.
-                    await d.lighting.set_backlight(True)
-                    await asyncio.sleep(BACKLIGHT_SETTLE_S)
-                    log.debug("cycle.backlight_settled", settle_s=BACKLIGHT_SETTLE_S)
-
-                    if self._eoa_backlight_on_exposure_us is not None:
-                        await d.camera_eoa.set_exposure(self._eoa_backlight_on_exposure_us)
-                        log.debug("cycle.eoa_exposure_switched",
-                                  exposure_us=self._eoa_backlight_on_exposure_us)
-
-                    for _ in range(DRAIN_FRAMES):
-                        await d.camera_eoa.capture()   # drain — exposure settle + WB readjust
-                    eoa_frame_with_backlight = await d.camera_eoa.capture()
-                    log.debug("cycle.eoa_captured_with_backlight", drain_frames=DRAIN_FRAMES)
-                    # Leave backlight ON — overhead camera needs it for the next cycle.
+                    log.debug("cycle.eoa_captured_no_backlight",
+                              drain_frames=DRAIN_FRAMES_NO_BACKLIGHT)
 
                 with self._time_step("eoa_cleanup"):
-                    # Restore full exposure for the next cycle's no-backlight capture.
-                    if self._eoa_normal_exposure_us is not None:
-                        await d.camera_eoa.set_exposure(self._eoa_normal_exposure_us)
-                        log.debug("cycle.eoa_exposure_restored",
-                                  exposure_us=self._eoa_normal_exposure_us)
-
-                    # Done capturing — stop EoA stream and ring light.
-                    await d.camera_eoa.stop_streaming()
-                    log.debug("cycle.eoa_stream_stopped")
-
-                    # Ring light is already off (turned off right before backlight
-                    # went on, above) — this is just a safety-net no-op in case
-                    # that earlier call failed, so we don't leave the run
-                    # believing ring light is off when it might not be.
                     try:
                         await d.robot.ring_light_off()
                         log.info("cycle.ring_light_off")
                     except Exception as exc:
                         log.warning("cycle.ring_light_off_failed", error=str(exc))
+                    # Backlight back ON immediately — needed again for
+                    # whatever happens next (this loop's next retry
+                    # candidate, or the next cycle's overhead capture), and
+                    # the sooner it's commanded, the more free settle time
+                    # it accumulates before anything actually needs it lit
+                    # (robot travel + drain/capture on the next iteration is
+                    # comfortably more than BACKLIGHT_SETTLE_S ever was).
+                    await d.lighting.set_backlight(True)
+                    await d.camera_eoa.stop_streaming()
+                    log.debug("cycle.eoa_stream_stopped")
 
-                # ── Step 5: EoA vision analysis ───────────────────────────
-                # Run on the WITH-backlight frame — see the capture comment above for
-                # why (no_backlight is too dark on this hardware). Its residual colour
-                # cast doesn't trip the chroma gate for dark bug bodies (validated
-                # against real captures — see software_tests/diagnose_eoa_20260811.py).
-                self._cycle_phase = CyclePhase.EOA_VISION
-                with self._time_step("eoa_vision"):
-                    eoa_result = await loop.run_in_executor(
-                        None, self._run_vision_eoa, eoa_frame_with_backlight, target_x, target_y
-                    )
+                # ── Step 5b: Join the background vision result ────────────
+                # eoa_vision's stored duration is the EXTRA wait incurred
+                # after the concurrent no-backlight capture + cleanup already
+                # finished — not vision's total runtime since it was fired.
+                # Fixed 2026-08-22: originally measured from fire time, which
+                # double-counted the overlapped window against
+                # eoa_capture_no_backlight/eoa_cleanup in steps_total_s (that
+                # sum assumes each named step is serial wall time — true for
+                # everything except this one, now that vision runs
+                # concurrently with the capture below it). vision_total_s is
+                # still logged separately for genuine vision-compute
+                # diagnostics; it's just not part of the additive total.
+                join_t0 = time.monotonic()
+                eoa_result = await vision_task
+                vision_extra_wait_s = time.monotonic() - join_t0
+                vision_total_s = time.monotonic() - vision_t0
+                self._cycle_timings["eoa_vision"] = vision_extra_wait_s
+                log.info("cycle.step_timing", step="eoa_vision",
+                         duration_s=round(vision_extra_wait_s, 3),
+                         vision_total_s=round(vision_total_s, 3))
 
-                # Save both frames — done AFTER analysis so with_backlight is annotated
-                # with a green + crosshair (tool centre) and cyan dot (body centre).
-                # Comparing those two markers tells you if the robot is on the bug.
+                # Save — the no-backlight (backlight_off/) archival frame only
+                # for a CONFIRMED pick (2026-08-22, operator's call: "we need
+                # the images of confirmed pics only for backlight off ...
+                # because that has been picked, or else why would we need
+                # it"). The annotated with-backlight debug image (tool centre
+                # vs body centre markers) is still saved on every attempt,
+                # accepted or not — it's the record of WHY something was
+                # rejected, separate from the Austin-facing archival frame.
                 saved_paths = await loop.run_in_executor(
                     None, self._save_eoa_frames,
                     eoa_frame_no_backlight, eoa_frame_with_backlight,
                     eoa_result.body_center_px or None,
+                    eoa_result.proceed_with_pick,
                 )
                 if saved_paths is not None:
-                    self._cycle_image_paths.extend(saved_paths)
+                    self._cycle_image_paths.extend(p for p in saved_paths if p is not None)
 
                 # ── VIEW: show EoA annotated image ────────────────────────
                 if self._view and eoa_result.frame_path:
@@ -1529,6 +1539,29 @@ class Orchestrator:
                          offset_from_center_px=eoa_result.offset_from_center_px or "n/a",
                          annotated_image=eoa_result.frame_path or "not saved")
                 if eoa_result.proceed_with_pick:
+                    # Pre-set exposure back to the backlight-on value now,
+                    # while the stream is already stopped (eoa_cleanup ran
+                    # above) — not right before the NEXT with-backlight
+                    # capture like every other cycle (2026-08-22, operator's
+                    # idea). Real pick+drop time elapses before that next
+                    # capture, so when its stream restarts, this exposure is
+                    # already the active register value with no in-flight
+                    # frame from an old value to catch stale — the "GenICam
+                    # exposure change takes one frame to apply" latency only
+                    # occurs when you change exposure WHILE actively
+                    # streaming; there is no in-flight frame to be stale
+                    # when the stream hasn't started yet.
+                    # This does NOT get AWB reconvergence for free the same
+                    # way — Continuous AWB only adapts by processing live
+                    # frames, and none flow while the stream is stopped, so
+                    # the next with-backlight capture still needs its own
+                    # drain frames for that. Only the exposure-latency
+                    # portion of the requirement is removed here, not the
+                    # (larger, per real hardware testing) AWB portion.
+                    if self._eoa_backlight_on_exposure_us is not None:
+                        await d.camera_eoa.set_exposure(self._eoa_backlight_on_exposure_us)
+                        log.debug("cycle.eoa_exposure_preset_for_next",
+                                  exposure_us=self._eoa_backlight_on_exposure_us)
                     break
 
                 eoa_retries += 1
@@ -1879,9 +1912,10 @@ class Orchestrator:
         frame_no_backlight,
         frame_with_backlight,
         body_center_px: tuple | None = None,
-    ) -> tuple[str, str] | None:
+        save_no_backlight: bool = True,
+    ) -> tuple[str | None, str] | None:
         """
-        Save both EoA frames with visual overlays on the with_backlight image:
+        Save EoA frames with visual overlays on the with_backlight image:
 
         backlight_off/  — raw no_backlight frame (ring light only — archival record
                           only; too dark for reliable classification on this hardware,
@@ -1894,9 +1928,19 @@ class Orchestrator:
         If the green + and cyan dot coincide after the correction move,
         the robot is positioned correctly over the bug body.
 
-        Returns (path_no_backlight, path_with_backlight) as strings, or None
-        if saving is disabled — callers track these to delete them if this
-        cycle attempt ends up interrupted before ever aspirating a specimen.
+        save_no_backlight: write the backlight_off/ archival frame only when
+          True (default). Pass False for an EoA-rejected candidate
+          (2026-08-22, operator's call) — that frame is only the archival
+          record of a CONFIRMED pick, so there's no reason to pay the disk
+          write on every rejection in the retry loop. The with_backlight
+          debug image is always saved regardless — it's the visual record
+          of WHY a candidate was accepted or rejected.
+
+        Returns (path_no_backlight, path_with_backlight) as strings — the
+        first is None when save_no_backlight is False — or None entirely
+        if saving is disabled. Callers track non-None paths to delete them
+        if this cycle attempt ends up interrupted before ever aspirating
+        a specimen.
         """
         import cv2
         import numpy as np
@@ -1907,14 +1951,17 @@ class Orchestrator:
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
 
-        dir_no_bl   = self._eoa_save_dir / "backlight_off"
         dir_with_bl = self._eoa_save_dir / "backlight_on"
-        dir_no_bl.mkdir(parents=True, exist_ok=True)
         dir_with_bl.mkdir(parents=True, exist_ok=True)
 
-        # No-backlight: save raw (classifier already saves its own annotated copy)
-        path_no_bl = dir_no_bl / f"eoa_no_backlight_{ts}.jpg"
-        cv2.imwrite(str(path_no_bl), frame_no_backlight)
+        # No-backlight: save raw (classifier already saves its own annotated
+        # copy) — only for a confirmed pick, see save_no_backlight above.
+        path_no_bl: str | None = None
+        if save_no_backlight:
+            dir_no_bl = self._eoa_save_dir / "backlight_off"
+            dir_no_bl.mkdir(parents=True, exist_ok=True)
+            path_no_bl = str(dir_no_bl / f"eoa_no_backlight_{ts}.jpg")
+            cv2.imwrite(path_no_bl, frame_no_backlight)
 
         # With-backlight: draw overlays for visual positioning verification
         h, w = frame_with_backlight.shape[:2]
@@ -1948,13 +1995,13 @@ class Orchestrator:
                 lw,
             )
 
-        path_with_bl = dir_with_bl / f"eoa_with_backlight_{ts}.jpg"
-        cv2.imwrite(str(path_with_bl), vis)
+        path_with_bl = str(dir_with_bl / f"eoa_with_backlight_{ts}.jpg")
+        cv2.imwrite(path_with_bl, vis)
         log.info("cycle.eoa_frames_saved",
-                 no_backlight=str(path_no_bl),
-                 with_backlight=str(path_with_bl),
+                 no_backlight=path_no_bl or "skipped (not a confirmed pick)",
+                 with_backlight=path_with_bl,
                  body_center_px=body_center_px or "n/a")
-        return (str(path_no_bl), str(path_with_bl))
+        return (path_no_bl, path_with_bl)
 
     def _save_corrected_frame(self, frame) -> str | None:
         """
