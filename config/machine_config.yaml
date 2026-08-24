@@ -24,6 +24,28 @@ robot:
   u_top_deg: 209.0             # wrist U angle (deg) for top-2 quadrants (TL/TR)
   u_bottom_deg: 251.0          # wrist U angle (deg) for bottom-2 quadrants (BL/BR)
 
+robot_remote:
+  # Epson RC+ 7.0 Remote Ethernet — controller-level lifecycle control
+  # (Login/GetStatus/Reset/SetMotorsOn/SetMotorsOff/Start/Stop). Separate
+  # port from `robot:` above — that one is sort_server.prg's own custom
+  # PICK/DROP protocol; this one is the controller's built-in supervisory
+  # channel, no license required (unlike the paid RC+ API option).
+  #
+  # NOT YET CONFIGURED on the controller as of 2026-08-24 — requires a
+  # one-time setup in RC+ first:
+  #   1. [Setup] -> System Configuration -> Controller -> Configuration ->
+  #      set "Control Device" to "Remote Ethernet"
+  #   2. [Setup] -> System Configuration -> Remote Control -> Ethernet ->
+  #      set the port and password used below
+  # enabled stays false, and nothing will attempt to connect, until both
+  # of those are done AND the real port/password are filled in here.
+  enabled: false
+  ip: "172.16.9.15"          # same controller as robot: above
+  port: 5000                 # PLACEHOLDER — must match step 2 above
+  password: ""                # PLACEHOLDER — must match step 2 above
+  connect_timeout_s: 5.0
+  command_timeout_s: 10.0
+
 plc:
   ip: "172.16.9.11"
   port: 502

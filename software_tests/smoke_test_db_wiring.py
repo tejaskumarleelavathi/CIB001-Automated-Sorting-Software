@@ -27,6 +27,7 @@ from cib.drivers.lighting.mock import MockLightingDriver
 from cib.drivers.plc.mock import MockPLCDriver
 from cib.drivers.pump.mock import MockPumpDriver
 from cib.drivers.robot.mock import MockRobotDriver
+from cib.drivers.robot_remote.mock import MockRemoteEthernetDriver
 from cib.drivers.safety.mock import MockSafetyDriver
 
 # Short path OUTSIDE the repo — this repo's own path is already ~140 chars
@@ -41,6 +42,7 @@ async def main() -> None:
 
     drivers = DriverSet(
         robot=MockRobotDriver(),
+        robot_remote=MockRemoteEthernetDriver(),
         safety=MockSafetyDriver(),
         plc=MockPLCDriver(),
         pump=MockPumpDriver(),

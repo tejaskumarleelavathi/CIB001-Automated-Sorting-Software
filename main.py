@@ -101,6 +101,17 @@ def build_drivers(
             if use_real_robot
             else __import__("cib.drivers.robot.mock", fromlist=["MockRobotDriver"]).MockRobotDriver()
         )
+        # robot_remote (Remote Ethernet) — same real/mock split as robot
+        # above. Actually connecting it still requires cfg.robot_remote.enabled
+        # to be True (the one-time RC+ setup: Control Device = Remote
+        # Ethernet + port/password) — the orchestrator gates every call on
+        # that flag regardless of which driver object is here, so building
+        # the real one before that setup exists is harmless (never used).
+        robot_remote = (
+            _make_real_robot_remote(cfg)
+            if use_real_robot
+            else __import__("cib.drivers.robot_remote.mock", fromlist=["MockRemoteEthernetDriver"]).MockRemoteEthernetDriver()
+        )
         camera_overhead = (
             _make_real_camera(cfg, "overhead")
             if use_real_camera_overhead
@@ -120,6 +131,7 @@ def build_drivers(
         plc    = _make_real_plc(cfg)    if use_real_plc    else MockPLCDriver()
         return DriverSet(
             robot           = robot,
+            robot_remote    = robot_remote,
             safety          = safety,
             plc             = plc,
             pump            = MockPumpDriver(),
@@ -133,6 +145,7 @@ def build_drivers(
         from cib.drivers.pump.driver     import MDriveDriver
         return DriverSet(
             robot           = _make_real_robot(cfg),
+            robot_remote    = _make_real_robot_remote(cfg),
             safety          = _make_real_safety(cfg),
             plc             = _make_real_plc(cfg),
             pump            = MDriveDriver(),
@@ -150,6 +163,18 @@ def _make_real_robot(cfg):
         port=r.port,
         connect_timeout_s=r.connect_timeout_s,
         motion_timeout_s=getattr(r, "motion_timeout_s", 120.0),
+    )
+
+
+def _make_real_robot_remote(cfg):
+    from cib.drivers.robot_remote.driver import RemoteEthernetDriver
+    rr = cfg.robot_remote
+    return RemoteEthernetDriver(
+        ip=rr.ip,
+        port=rr.port,
+        password=rr.password,
+        connect_timeout_s=rr.connect_timeout_s,
+        command_timeout_s=rr.command_timeout_s,
     )
 
 
@@ -270,6 +295,7 @@ def main() -> None:
         runs_base_dir=runs_base_dir,
         field_code=DEV_FIELD_CODE,
         default_plate_id=DEV_PLATE_ID,
+        robot_remote_enabled=cfg.robot_remote.enabled,
     )
 
     # ── Start asyncio in a background daemon thread ───────────────────────────

@@ -35,6 +35,7 @@ from cib.drivers.lighting.mock import MockLightingDriver
 from cib.drivers.plc.mock import MockPLCDriver
 from cib.drivers.pump.mock import MockPumpDriver
 from cib.drivers.robot.mock import MockRobotDriver
+from cib.drivers.robot_remote.mock import MockRemoteEthernetDriver
 from cib.drivers.safety.mock import MockSafetyDriver
 
 
@@ -42,6 +43,7 @@ from cib.drivers.safety.mock import MockSafetyDriver
 def drivers() -> DriverSet:
     return DriverSet(
         robot=MockRobotDriver(),
+        robot_remote=MockRemoteEthernetDriver(),
         safety=MockSafetyDriver(),
         plc=MockPLCDriver(),
         pump=MockPumpDriver(),
@@ -267,6 +269,51 @@ class TestSpecimenInTransitRecovery:
         assert orch.state == State.FAULT
         assert orch._drivers.plc.status_light == StatusLight.RED_CHASE
         assert orch._pending_well is not None   # never delivered — still tracked
+
+    async def test_remote_ethernet_recovery_avoids_fault_when_enabled(
+        self, drivers: DriverSet, tmp_path: Path,
+    ) -> None:
+        """
+        Companion to test_robot_stays_unreachable_goes_to_fault_not_running
+        (2026-08-24): same wedged-task scenario, but with
+        robot_remote_enabled=True and move_to_safe_park() failing only on
+        the FIRST call (simulating a SPEL+ task that's dead until Remote
+        Ethernet restarts it, then reachable). Recovery should retry via
+        _try_remote_ethernet_recovery() and succeed on the second attempt —
+        landing in IDLE, not FAULT — and the mock Remote Ethernet driver
+        should show reset()/start() were actually called.
+        """
+        orch = Orchestrator(
+            drivers=drivers,
+            db_path=tmp_path / "picks.db",
+            runs_base_dir=tmp_path / "runs",
+            robot_remote_enabled=True,
+        )
+        await _to_running(orch)
+        await orch._drivers.robot.halt()
+        orch._sm.safety_fault_estop()
+        # Pre-set a fault on the mock Remote Ethernet driver so asserting it's
+        # clear afterward actually proves reset() ran, rather than just
+        # checking a value that was already False by default.
+        orch._drivers.robot_remote._fault = True
+
+        attempts = {"count": 0}
+        real_park = orch._drivers.robot.move_to_safe_park
+
+        async def _park_fails_once() -> None:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise ConnectionError("Cannot connect to robot — target machine actively refused it")
+            await real_park()
+        orch._drivers.robot.move_to_safe_park = _park_fails_once
+
+        await orch._handle_event(OperatorAcknowledgeEvent())
+
+        assert orch.state == State.IDLE
+        assert attempts["count"] == 2   # first failed, remote recovery ran, retry succeeded
+        remote = orch._drivers.robot_remote
+        assert remote._running is True    # start(0) was called
+        assert remote._fault is False     # reset() was called
 
     async def test_no_pending_specimen_skips_delivery_cleanly(
         self, orch: Orchestrator,

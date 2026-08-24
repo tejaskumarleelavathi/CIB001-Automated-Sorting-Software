@@ -104,6 +104,9 @@ PICK_TARGET_CORRECTION_Y_MM = 0.0
 class DriverSet:
     """All hardware drivers injected into the orchestrator."""
     robot:            RobotDriver
+    robot_remote:     Any   # RemoteEthernetDriver | MockRemoteEthernetDriver — controller
+                             # lifecycle control (Reset/Start/SetMotorsOn), separate from
+                             # robot's own PICK/DROP protocol. See cib/drivers/robot_remote/.
     safety:           SafetyDriver
     plc:              PLCDriver
     pump:             PumpDriver
@@ -158,6 +161,7 @@ class Orchestrator:
         runs_base_dir: Path | None = None,
         field_code: str = "DEV",
         default_plate_id: str = "DEV-PLATE",
+        robot_remote_enabled: bool = False,
     ) -> None:
         self._drivers = drivers
         self._queue: asyncio.Queue[SystemEvent] = asyncio.Queue()
@@ -277,6 +281,15 @@ class Orchestrator:
         # defined + CameraDriver.lock_white_balance() left implemented in
         # case this is revisited.
         self._eoa_wb_locked: bool = False
+        # Remote Ethernet (controller-level Reset/Start/SetMotorsOn) — off
+        # by default because it requires a one-time RC+ setup (Control
+        # Device = Remote Ethernet + port/password) that doesn't exist on
+        # every controller yet. See cib/drivers/robot_remote/driver.py and
+        # config/machine_config.yaml's robot_remote section. When False,
+        # _try_remote_ethernet_recovery() is a no-op and recovery behaves
+        # exactly as before this existed.
+        self._robot_remote_enabled = robot_remote_enabled
+        self._robot_remote_logged_in = False
 
     # ------------------------------------------------------------------
     # Public API — called by UI via bridge (thread-safe)
@@ -905,10 +918,82 @@ class Orchestrator:
                 note="Robot did not home — check sort_server.prg is still running in "
                      "RC+ (F5 to restart it), then press CONTINUE again.",
             )
+            # sort_server.prg has no error handler active during motion (see
+            # this method's docstring), so a safety fault mid-move can wedge
+            # the whole SPEL+ task — the only real fix is restarting it on
+            # the controller. Try that ourselves via Remote Ethernet before
+            # giving up on the operator; this is what replaces "go into RC+
+            # and click Run again" (2026-08-24). No-op (returns False
+            # immediately) if robot_remote isn't configured/enabled — see
+            # _try_remote_ethernet_recovery().
+            if await self._try_remote_ethernet_recovery():
+                try:
+                    await d.robot.move_to_safe_park()
+                    homed = True
+                    log.info("orchestrator.safe_recovery_homed_after_remote_restart",
+                             from_phase=phase.name)
+                except Exception as exc2:
+                    log.error(
+                        "orchestrator.safe_recovery_home_failed_after_remote_restart",
+                        error=str(exc2),
+                        note="Remote Ethernet restarted the task but the robot still "
+                             "didn't home — this needs a human to look at RC+ directly.",
+                    )
 
         self._cycle_phase = CyclePhase.IDLE
         log.info("orchestrator.safe_recovery_complete", robot_reconnected=homed)
         return homed
+
+    async def _try_remote_ethernet_recovery(self) -> bool:
+        """
+        Best-effort attempt to get sort_server.prg running again via Epson
+        RC+ Remote Ethernet, when the robot's own PICK/DROP connection
+        (port 2000) has stopped responding — almost always because the
+        SPEL+ task itself crashed/wedged, not because the controller is
+        unreachable. Sequence: connect+login (if not already), Reset
+        (clears any latched E-stop/error on the controller), wait for the
+        Auto flag, SetMotorsOn, Start(0) (relaunches sort_server's Main
+        function — the exact thing a human does by clicking Run in RC+).
+
+        Returns True if this sequence completed without error — NOT a
+        guarantee the robot is actually usable again, just that the
+        controller accepted the restart sequence. The caller always
+        re-verifies by retrying the real operation (move_to_safe_park())
+        afterward and must not assume success from this return value alone.
+
+        Returns False immediately, doing nothing, if robot_remote_enabled
+        is False (the default — see machine_config.yaml's robot_remote
+        section for the one-time RC+ setup this requires) or if any step
+        raises. Never raises itself — a failure here must fall through to
+        the existing "ask a human" path unchanged, not crash recovery.
+        """
+        if not self._robot_remote_enabled:
+            return False
+        d = self._drivers
+        try:
+            if not self._robot_remote_logged_in:
+                await d.robot_remote.connect()
+                self._robot_remote_logged_in = True
+            await d.robot_remote.reset()
+            ready = await d.robot_remote.wait_until_ready(timeout_s=10.0)
+            if not ready:
+                log.warning("orchestrator.remote_ethernet_recovery_not_ready")
+                return False
+            await d.robot_remote.set_motors_on()
+            await d.robot_remote.start(0)
+            # sort_server.prg needs real time to (re)start and re-open its
+            # own port-2000 listener (OpenNet #201 As Server) before the
+            # existing robot driver's reconnect can succeed against it.
+            # Not polled/confirmed — just a fixed margin. UNTESTED on real
+            # hardware; adjust if move_to_safe_park() still fails
+            # immediately after this returns True.
+            await asyncio.sleep(3.0)
+            log.info("orchestrator.remote_ethernet_recovery_sent")
+            return True
+        except Exception as exc:
+            log.warning("orchestrator.remote_ethernet_recovery_failed", error=str(exc))
+            self._robot_remote_logged_in = False
+            return False
 
     async def _deliver_pending_specimen(self) -> None:
         """
