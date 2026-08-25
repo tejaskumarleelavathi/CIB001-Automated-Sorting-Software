@@ -90,9 +90,14 @@ server_start:
             ry = Val(Mid$(coord_str$, comma1 + 1, comma2 - comma1 - 1))
             ru = Val(Mid$(coord_str$, comma2 + 1, comma3 - comma2 - 1))
             hand$ = Mid$(coord_str$, comma3 + 1)
+            ' Left$(hand$, 1) not hand$= -- every other comparison in this
+            ' file is a Left$ prefix match specifically because that's
+            ' immune to any trailing terminator garbage; an exact-string
+            ' compare here would NOT be, and could silently fall through
+            ' to the Righty Else branch even when "L" was actually sent.
             ' Explicit /L or /R -- an unreachable/wrong coordinate for the
             ' requested hand throws here instead of silently re-flipping.
-            If hand$ = "L" Then
+            If Left$(hand$, 1) = "L" Then
                 Go XY(rx, ry, -47.700, ru) /L
                 Move XY(rx, ry, -58.660, ru) /L
             Else
