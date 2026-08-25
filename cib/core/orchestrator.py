@@ -1526,6 +1526,17 @@ class Orchestrator:
                 if saved_paths is not None:
                     self._cycle_image_paths.extend(p for p in saved_paths if p is not None)
 
+                # Halcon-comparison research export (2026-08-25, operator
+                # request) — raw with-backlight frame, no overlays, plus an
+                # Excel log of the OpenCV-detected bug-center pixel
+                # coordinates (image-relative, top-left origin — NOT robot
+                # coordinates), saved on every attempt regardless of pick
+                # outcome. Separate from the production archival save above.
+                await loop.run_in_executor(
+                    None, self._save_eoa_unprocessed_for_halcon,
+                    eoa_frame_with_backlight, eoa_result.body_center_px or None,
+                )
+
                 # ── VIEW: show EoA annotated image ────────────────────────
                 if self._view and eoa_result.frame_path:
                     await loop.run_in_executor(
@@ -2004,6 +2015,58 @@ class Orchestrator:
                  with_backlight=path_with_bl,
                  body_center_px=body_center_px or "n/a")
         return (path_no_bl, path_with_bl)
+
+    def _save_eoa_unprocessed_for_halcon(
+        self,
+        frame_with_backlight,
+        body_center_px: tuple | None,
+    ) -> None:
+        """
+        Research export (2026-08-25, operator request) — for comparing
+        OpenCV's detection against Halcon on the exact same frames.
+
+        Saves the raw with-backlight EoA frame to
+        EOA_backlight_on_unprocessed/ with NO overlays (no crosshair, no
+        markers — just what the camera captured), and appends one row to
+        EOA_backlight_on_unprocessed/detections.xlsx recording the
+        OpenCV-detected bug-center pixel coordinates, relative to the
+        image's own top-left corner (row 0, col 0) — image pixel space,
+        NOT robot/world coordinates. x_px/y_px are blank when nothing was
+        detected. Saved on every attempt, confirmed pick or not — this is
+        a comparison dataset, not a production archival record.
+        """
+        import cv2
+        from datetime import datetime
+        from openpyxl import Workbook, load_workbook
+
+        if self._eoa_save_dir is None:
+            return
+
+        out_dir = self._eoa_save_dir / "EOA_backlight_on_unprocessed"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        image_filename = f"eoa_unprocessed_{ts}.jpg"
+        cv2.imwrite(str(out_dir / image_filename), frame_with_backlight)
+
+        x_px = round(body_center_px[0], 1) if body_center_px else None
+        y_px = round(body_center_px[1], 1) if body_center_px else None
+
+        xlsx_path = out_dir / "detections.xlsx"
+        if xlsx_path.exists():
+            wb = load_workbook(xlsx_path)
+            ws = wb.active
+        else:
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "detections"
+            ws.append(["image_filename", "x_px", "y_px"])
+
+        ws.append([image_filename, x_px, y_px])
+        wb.save(xlsx_path)
+
+        log.info("cycle.eoa_unprocessed_saved_for_halcon",
+                 image=str(out_dir / image_filename), x_px=x_px, y_px=y_px)
 
     def _save_corrected_frame(self, frame) -> str | None:
         """
