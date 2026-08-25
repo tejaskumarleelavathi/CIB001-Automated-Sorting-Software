@@ -190,6 +190,19 @@ Function sort_server
     AccelS 120, 120
 
 server_start:
+    ' OnErr set here too (not just inside the loop below), so a failed/stuck
+    ' OpenNet or WaitNet also recovers via client_gone instead of crashing
+    ' the task with no handler. Added 2026-08-24 alongside enabling TCP/IP
+    ' port 201's SetNet Timeout (Setup -> Remote Control... no, Setup ->
+    ' Controller -> TCP/IP -> Port 201 -> Timeout, was 0 = never times out).
+    ' Root cause found via hardware_tests/diagnose_start_dropout.py: a client
+    ' that connects and then goes silent (no clean FIN/RST reaching the
+    ' robot -- e.g. a network blip, or a crashed client) left Line Input
+    ' below blocked forever, since portNumber Timeout=0 meant no timeout
+    ' and OnErr wasn't covering this earlier OpenNet/WaitNet stage anyway.
+    ' This is very likely the same root cause as the "RC+ disconnects for
+    ' no reason" / "robot stuck" reports.
+    OnErr GoTo client_gone
     OpenNet #201 As Server
     WaitNet #201
 

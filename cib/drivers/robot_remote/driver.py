@@ -216,6 +216,30 @@ class RemoteEthernetDriver:
         log.warning("robot_remote.wait_until_ready_timeout", timeout_s=timeout_s)
         return False
 
+    async def wait_until_error_cleared(self, timeout_s: float = 8.0, poll_interval_s: float = 0.2) -> bool:
+        """
+        Poll GetStatus until the Error flag turns OFF (error_code == '0000')
+        — found necessary on real hardware 2026-08-24, via a step-by-step
+        GetStatus trace (hardware_tests/diagnose_start_not_ready.py): Reset
+        returns "#Reset" success immediately, but the actual alarm (e.g.
+        error_code 1504) stayed latched for a further ~2 REAL seconds
+        afterward before error_code actually dropped to 0000. Start called
+        while error is still True reliably fails with "error 20 (Controller
+        is not ready)", even though the Ready flag is True the entire time
+        -- Ready is NOT the right signal to wait on here, it was already
+        True before, during, and after the ~2s the error was still latched.
+        Call this after reset(), before set_motors_on()/start(). Returns
+        False on timeout rather than raising.
+        """
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            status = await self.get_status()
+            if not status.error:
+                return True
+            await asyncio.sleep(poll_interval_s)
+        log.warning("robot_remote.wait_until_error_cleared_timeout", timeout_s=timeout_s)
+        return False
+
     # ------------------------------------------------------------------
     # Control commands
     # ------------------------------------------------------------------

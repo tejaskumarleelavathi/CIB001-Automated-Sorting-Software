@@ -24,6 +24,7 @@ from cib.core.events import (
     AllDevicesReadyEvent,
     OperatorAbortEvent,
     OperatorAcknowledgeEvent,
+    OperatorShutdownEvent,
     OperatorStartEvent,
 )
 from cib.core.orchestrator import DriverSet, Orchestrator
@@ -315,6 +316,51 @@ class TestSpecimenInTransitRecovery:
         assert remote._running is True    # start(0) was called
         assert remote._fault is False     # reset() was called
 
+    async def test_startup_tries_remote_ethernet_when_robot_connect_fails(
+        self, drivers: DriverSet, tmp_path: Path,
+    ) -> None:
+        """
+        2026-08-24: _startup() should not require a human to have already
+        started sort_server.prg in RC+ — if d.robot.connect() fails (e.g.
+        fresh controller boot, nobody clicked Run yet) and robot_remote is
+        enabled, _startup() should try _try_remote_ethernet_recovery() and
+        retry the connect once, rather than just failing startup outright.
+
+        2026-08-25: _startup() now retries the plain connect 3x (with a 2s
+        backoff) before falling to Remote Ethernet at all — a real-hardware
+        finding that this lab's network has transient multi-second blips
+        unrelated to whether sort_server.prg is even running. This mock
+        must fail all 3 of those retries (not just once) so the test still
+        actually exercises the Remote Ethernet fallback path, not just the
+        cheap retry loop succeeding on its own.
+        """
+        orch = Orchestrator(
+            drivers=drivers,
+            db_path=tmp_path / "picks.db",
+            runs_base_dir=tmp_path / "runs",
+            robot_remote_enabled=True,
+        )
+
+        attempts = {"count": 0}
+        real_connect = orch._drivers.robot.connect
+
+        async def _connect_fails_thrice() -> None:
+            attempts["count"] += 1
+            if attempts["count"] <= 3:
+                raise RuntimeError(
+                    "Cannot connect to robot at 172.16.9.15:2000 — refused\n"
+                    "Check: robot powered on, sort_server.prg running in RC+ (F5)."
+                )
+            await real_connect()
+        orch._drivers.robot.connect = _connect_fails_thrice
+
+        await orch._startup()
+
+        assert orch._startup_complete is True
+        assert attempts["count"] == 4   # 3 retries failed, remote start ran, 4th succeeded
+        remote = orch._drivers.robot_remote
+        assert remote._running is True   # start(0) was called
+
     async def test_no_pending_specimen_skips_delivery_cleanly(
         self, orch: Orchestrator,
     ) -> None:
@@ -505,3 +551,49 @@ class TestSafetyFaultDoesNotBounceToFault:
 
         assert in_safety_stop is True
         assert orch.state == State.E_STOP   # fault() was never called by this test
+
+
+class TestShutdownStopsMotor:
+    """
+    2026-08-24, per operator spec: shutdown must turn the motor off "for
+    sure". BYE (sort_server.prg's own protocol) does NOT do this -- its BYE
+    handler is CloseNet + GoTo server_start (loops back to accept a new
+    connection), not a task stop; the `Motor Off` near the end of the file
+    is after an infinite Do...Loop and unreachable. Remote Ethernet
+    Stop()+SetMotorsOff() is what actually accomplishes it.
+    """
+
+    async def test_shutdown_stops_and_turns_off_motors_when_enabled(
+        self, drivers: DriverSet, tmp_path: Path,
+    ) -> None:
+        orch = Orchestrator(
+            drivers=drivers,
+            db_path=tmp_path / "picks.db",
+            runs_base_dir=tmp_path / "runs",
+            robot_remote_enabled=True,
+        )
+        await _to_running(orch)
+        remote = orch._drivers.robot_remote
+        remote._running = True
+        remote._motors_on = True
+
+        await orch._handle_event(OperatorShutdownEvent())
+
+        assert remote._running is False
+        assert remote._motors_on is False
+
+    async def test_shutdown_skips_remote_ethernet_when_disabled(
+        self, orch: Orchestrator,
+    ) -> None:
+        """robot_remote_enabled defaults to False -- shutdown must not touch it."""
+        await _to_running(orch)
+        remote = orch._drivers.robot_remote
+        remote._running = True
+        remote._motors_on = True
+
+        await orch._handle_event(OperatorShutdownEvent())
+
+        # Untouched -- proves the gate on self._robot_remote_enabled works,
+        # not just that stop()/set_motors_off() happen to be no-ops.
+        assert remote._running is True
+        assert remote._motors_on is True

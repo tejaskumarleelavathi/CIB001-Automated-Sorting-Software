@@ -39,10 +39,18 @@ robot_remote:
   #      set the port and password used below
   # enabled stays false, and nothing will attempt to connect, until both
   # of those are done AND the real port/password are filled in here.
-  enabled: false
+  enabled: true               # confirmed 2026-08-24: Control Device set to
+                              # Remote Ethernet, and port/terminator/timeout/
+                              # password confirmed matching on the Remote
+                              # Control -> Ethernet page
   ip: "172.16.9.15"          # same controller as robot: above
-  port: 5000                 # PLACEHOLDER — must match step 2 above
-  password: ""                # PLACEHOLDER — must match step 2 above
+  port: 5000                 # confirmed matches the Remote Control -> Ethernet page
+  password: ""      # CONFIRMED 2026-08-24 via hardware_tests/test_remote_ethernet_connect.py —
+                     # login succeeds with blank password. Two attempts to set a real password
+                     # via RC+'s Remote Control -> Ethernet -> Change... dialog did not take
+                     # effect (Apply was clicked, pendant rebooted, RC+ fully restarted — still
+                     # blank). Worth revisiting: a blank password means anyone on this network
+                     # segment can control the robot via Remote Ethernet.
   connect_timeout_s: 5.0
   command_timeout_s: 10.0
 

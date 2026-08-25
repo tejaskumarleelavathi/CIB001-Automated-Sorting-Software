@@ -380,17 +380,72 @@ class Orchestrator:
             # discovery takes ~6 seconds. Robot is connected AFTER so it is
             # never left idle on the TCP socket while we wait for cameras.
             # The Epson controller resets idle connections after a few seconds.
-            await asyncio.gather(
-                d.safety.connect(),
-                d.plc.connect(),
-                d.pump.connect(),
-                d.camera_overhead.connect(),
-                d.camera_eoa.connect(),
-                d.lighting.connect(),
-            )
+            #
+            # Serialized, not asyncio.gather() (2026-08-25 experiment, per
+            # operator request): every driver's connect() does blocking I/O
+            # via run_in_executor on the shared default thread pool, and the
+            # safety/PLC poll loops are ALSO already running concurrently
+            # (see run() — they start in the same TaskGroup as _startup()).
+            # Real-hardware logs showed the Flexi Modbus poll going quiet for
+            # ~3.5s during exactly this kind of concurrent-connect window,
+            # right when up to 6 blocking connects (2 of them ~6s camera
+            # discovery calls) were all competing for executor threads at
+            # once. This is unconfirmed as THE root cause (independent lab-
+            # network flakiness is also real and already demonstrated
+            # tonight — see hardware_tests/baseline_flexi_poll.py), but
+            # cutting peak concurrent thread-pool load during startup is a
+            # cheap, safe thing to try. Revert to asyncio.gather(...) of the
+            # same six calls if this doesn't actually help.
+            await d.safety.connect()
+            await d.plc.connect()
+            await d.pump.connect()
+            await d.camera_overhead.connect()
+            await d.camera_eoa.connect()
+            await d.lighting.connect()
             # Connect robot now — cameras are ready so we immediately follow
             # up with motion commands and keep the connection active.
-            await d.robot.connect()
+            #
+            # Retry with backoff first (2026-08-25, real-hardware finding):
+            # this lab's 172.16.9.x network segment has intermittent multi-
+            # second blips (confirmed via hardware_tests/baseline_flexi_poll.py
+            # and test_robot_connect_vs_flexi.py — NOT caused by opening the
+            # robot connection itself, a controlled test showed 20 back-to-
+            # back robot connects with zero effect on the Flexi controller;
+            # this is a shared-network-path issue, the robot's longer 5s
+            # timeout just surfaces it first). A plain retry absorbs a
+            # transient blip cheaply, without the heavier Stop/Reset/
+            # SetMotorsOn/Start sequence below, which should stay reserved
+            # for when sort_server.prg genuinely isn't running.
+            last_exc: RuntimeError | None = None
+            for attempt in range(3):
+                try:
+                    await d.robot.connect()
+                    last_exc = None
+                    break
+                except RuntimeError as exc:
+                    last_exc = exc
+                    if attempt < 2:
+                        log.warning("orchestrator.robot_connect_retry",
+                                    attempt=attempt + 1, error=str(exc))
+                        await asyncio.sleep(2.0)
+            if last_exc is not None:
+                # Most likely sort_server.prg isn't running yet (e.g. fresh
+                # controller boot, nobody has clicked Run in RC+). If Remote
+                # Ethernet is configured, try to start it ourselves before
+                # giving up — this is what makes "just launch main.py" true
+                # without a human going into RC+ first. Only attempted on an
+                # actual connect failure, never unconditionally — see the
+                # real-hardware finding in _try_remote_ethernet_recovery's
+                # docstring: a fresh Remote Ethernet Login while Main is
+                # ALREADY running stops it, so we must not touch this path
+                # when d.robot.connect() would have succeeded on its own.
+                if not self._robot_remote_enabled:
+                    raise last_exc
+                log.warning("orchestrator.robot_connect_failed_trying_remote_start",
+                            error=str(last_exc))
+                if not await self._try_remote_ethernet_recovery():
+                    raise last_exc
+                await d.robot.connect()
             # Send robot to safe park position immediately after connecting.
             # This lifts Z if the arm was left at imaging height by a previous
             # run, then moves to P0 (taught in RC+ Jog & Teach).
@@ -710,13 +765,33 @@ class Orchestrator:
                     await d.robot.ring_light_off()
                 except Exception as exc:
                     log.warning("orchestrator.shutdown_ring_light_error", error=str(exc))
-                # Send BYE to robot — sort_server.prg does CloseNet + Exit Do cleanly.
-                # Without this, Python dropping the socket causes a SPEL+ runtime error
-                # which leaves the motor On and trips the Flexi safety system.
+                # Send BYE to robot — closes THIS TCP connection cleanly (avoids
+                # the SPEL+ runtime error/Flexi trip a raw socket drop causes).
+                # NOTE: BYE does NOT stop sort_server.prg's Main task or turn the
+                # motor off — sort_server.prg's BYE handler is CloseNet #201 then
+                # GoTo server_start (loops back to accept a new connection); the
+                # `Motor Off` near the end of the file is after the infinite
+                # Do...Loop and is unreachable. Confirmed by reading the file
+                # 2026-08-24 — motor-off-for-sure below is what actually does it.
                 try:
                     await d.robot.disconnect()
                 except Exception as exc:
                     log.warning("orchestrator.shutdown_robot_error", error=str(exc))
+                # Stop the program and cut motor power for sure, via Remote
+                # Ethernet — per operator spec (2026-08-24): shutdown must
+                # definitely turn the motor off, which BYE above does not do.
+                # Best-effort — shutdown must complete even if this fails.
+                if self._robot_remote_enabled:
+                    try:
+                        if not self._robot_remote_logged_in:
+                            await d.robot_remote.connect()
+                            self._robot_remote_logged_in = True
+                        await d.robot_remote.stop()
+                        await d.robot_remote.set_motors_off()
+                        await d.robot_remote.disconnect()
+                        self._robot_remote_logged_in = False
+                    except Exception as exc:
+                        log.warning("orchestrator.shutdown_robot_remote_error", error=str(exc))
                 # Turn backlight off and send DISCONNECT to lighting controller.
                 # This is the clean path — avoids WinError 10054 on next startup.
                 try:
@@ -905,6 +980,17 @@ class Orchestrator:
             except Exception:
                 pass
 
+        # Motor is guaranteed OFF after an e-stop or light-curtain trip on
+        # this hardware (2026-08-24, operator's own hardware knowledge —
+        # not something to detect/branch on, just always true for these two
+        # trigger types) — so always run the Remote Ethernet restart
+        # (Stop -> Reset -> SetMotorsOn -> Start) up front here, not only as
+        # a fallback after move_to_safe_park() fails below. Best-effort: if
+        # this isn't enabled, or fails, fall through to the plain
+        # reconnect+retry logic unchanged, same as before.
+        if self._robot_remote_enabled:
+            await self._try_remote_ethernet_recovery()
+
         # Home the robot — Z retracts before XY, so always safe
         homed = False
         try:
@@ -966,6 +1052,18 @@ class Orchestrator:
         section for the one-time RC+ setup this requires) or if any step
         raises. Never raises itself — a failure here must fall through to
         the existing "ask a human" path unchanged, not crash recovery.
+
+        IMPORTANT (confirmed on real hardware 2026-08-24): a fresh Remote
+        Ethernet Login while Main is already running STOPS the task, even
+        with zero other traffic involved — this is real controller behavior,
+        not a bug in sort_server.prg or in this driver. That is exactly why
+        _robot_remote_logged_in is cached and connect() is called at most
+        once per session here — do not "simplify" this by reconnecting on
+        every call, that would kill a healthy Main every time recovery runs.
+        It also means this method should only ever be invoked when Main is
+        already believed dead/wedged (the whole reason it's called from
+        _safe_recovery()'s failure path) — calling it speculatively while
+        the robot might still be fine would itself be the thing that kills it.
         """
         if not self._robot_remote_enabled:
             return False
@@ -974,7 +1072,35 @@ class Orchestrator:
             if not self._robot_remote_logged_in:
                 await d.robot_remote.connect()
                 self._robot_remote_logged_in = True
+            # Stop first (2026-08-24, per operator spec) — whatever is on the
+            # controller right now may be a wedged Main (no error handler
+            # covers mid-motion faults, see sort_server.prg header) rather
+            # than a clean idle task. Stopping unconditionally before
+            # Reset/Start gives Start(0) a known-clean slate instead of
+            # possibly no-op'ing against an already-"running" (but stuck)
+            # task. Best-effort: Stop against an already-stopped task is a
+            # harmless no-op (confirmed on real hardware), so a failure here
+            # shouldn't abort the whole recovery attempt.
+            try:
+                await d.robot_remote.stop()
+            except Exception as exc:
+                log.warning("orchestrator.remote_ethernet_recovery_stop_failed", error=str(exc))
             await d.robot_remote.reset()
+            # Real-hardware finding (2026-08-24, via a step-by-step GetStatus
+            # trace — hardware_tests/diagnose_start_not_ready.py): Reset
+            # returns success immediately, but the actual alarm stays
+            # latched (error=True) for a further ~2 REAL seconds afterward.
+            # Start called while error is still True reliably fails with
+            # "error 20 (Controller is not ready)" — and the Ready flag is
+            # NOT a useful signal for this: it was already True the entire
+            # time the error was still latched, so an earlier version of
+            # this code that waited on Ready instead of Error hit the exact
+            # same failure. Must wait for error to actually clear here, not
+            # just for auto/ready.
+            error_cleared = await d.robot_remote.wait_until_error_cleared(timeout_s=8.0)
+            if not error_cleared:
+                log.warning("orchestrator.remote_ethernet_recovery_error_not_cleared")
+                return False
             ready = await d.robot_remote.wait_until_ready(timeout_s=10.0)
             if not ready:
                 log.warning("orchestrator.remote_ethernet_recovery_not_ready")
@@ -1606,7 +1732,12 @@ class Orchestrator:
                     None, self._save_eoa_frames,
                     eoa_frame_no_backlight, eoa_frame_with_backlight,
                     eoa_result.body_center_px or None,
-                    eoa_result.proceed_with_pick,
+                    True,   # DEBUG (2026-08-25, operator request): save the
+                            # no-backlight archival frame on EVERY attempt,
+                            # not just confirmed picks, to inspect why
+                            # candidates are being rejected. Revert to
+                            # eoa_result.proceed_with_pick once done —
+                            # this reintroduces a disk write per rejection.
                 )
                 if saved_paths is not None:
                     self._cycle_image_paths.extend(p for p in saved_paths if p is not None)
@@ -1867,7 +1998,20 @@ class Orchestrator:
 
             # Camera start_stream failures on USB-Ethernet adapters are
             # transient — don't FAULT, just retry the cycle after a delay.
-            if "start_stream" in err_str or "GC_ERR_TIMEOUT" in err_str or "get_buffer" in err_str.lower():
+            # Broadened 2026-08-24 from "GC_ERR_TIMEOUT" to "GC_ERR" (catches
+            # the whole GenTL error family, e.g. GC_ERR_ACCESS_DENIED from a
+            # stale/conflicting camera control-channel lock) plus
+            # "AccessException" — found on real hardware: this exact error
+            # was falling through to the generic "else" branch below, which
+            # then wrongly assumed the ROBOT was dead and called Stop() on
+            # a robot that was perfectly healthy, actually killing it. A
+            # camera-only failure must never reach that branch.
+            if (
+                "start_stream" in err_str
+                or "GC_ERR" in err_str
+                or "AccessException" in err_str
+                or "get_buffer" in err_str.lower()
+            ):
                 log.warning("cycle.camera_error_retrying", error=err_str[:120])
                 if self._sm.current == State.CYCLE_STOPPING:
                     await self._finish_stop(d)
@@ -1888,12 +2032,68 @@ class Orchestrator:
                 log.info("cycle.exited_on_safety_fault", state=self._sm.current.value)
             else:
                 log.error("cycle.error", error=str(exc))
-                self._sm.fault()
-                await d.plc.set_status_light(StatusLight.RED_CHASE)
-                try:
-                    await d.lighting.set_backlight(False)
-                except Exception:
-                    pass
+                # Not a safety trip (in_safety_stop already handled that
+                # above) — an unexplained robot disconnection, most likely
+                # the SPEL+ task itself dying (no error handler covers
+                # mid-motion faults). 2026-08-24, per operator spec: the
+                # system should try to self-heal this on its own — Remote
+                # Ethernet Stop/Reset/SetMotorsOn/Start, same restart
+                # sequence _safe_recovery() uses for e-stop/curtain — rather
+                # than always dropping into FAULT and waiting for a human.
+                # Deliberately does NOT auto-resume RUNNING even on success:
+                # same philosophy as e-stop recovery (FR-SAF-06) — an
+                # unattended, unexplained fault landing back in IDLE still
+                # requires an explicit operator START before picking
+                # resumes, it just doesn't need an ABORT to get there.
+                #
+                # GATE ON err_str actually looking robot-related — added
+                # 2026-08-24 after a real-hardware incident: a camera-only
+                # error (GC_ERR_ACCESS_DENIED, now caught by the branch
+                # above, but ANY future unclassified non-robot error has the
+                # same risk) reached this branch and _try_remote_ethernet_
+                # recovery() called Stop() on a robot that was perfectly
+                # healthy and running fine — stopping it is EXACTLY the
+                # thing that must never happen to a healthy task (see this
+                # method's own docstring). Every robot-driver-raised
+                # exception in cib/drivers/robot/driver.py either contains
+                # "robot" (case-insensitive) or is one of these exact
+                # "<COMMAND> failed" strings — nothing else should ever
+                # match this gate.
+                looks_robot_related = "robot" in err_str.lower() or any(
+                    p in err_str for p in (
+                        "PICK failed", "DROP failed", "MOVE_IMAGE failed",
+                        "HOME failed", "RING_ON failed", "RING_OFF failed",
+                    )
+                )
+                recovered = False
+                if looks_robot_related and self._robot_remote_enabled and await self._try_remote_ethernet_recovery():
+                    try:
+                        await d.robot.move_to_safe_park()
+                        recovered = True
+                    except Exception as exc2:
+                        log.error("cycle.remote_recovery_home_failed", error=str(exc2))
+                if recovered:
+                    self._sm.fault()
+                    self._sm.fault_cleared()
+                    try:
+                        await d.lighting.set_backlight(True)
+                    except Exception:
+                        pass
+                    await d.plc.set_status_light(StatusLight.GREEN)
+                    await d.plc.set_work_light(True)
+                    log.info(
+                        "cycle.self_healed_after_remote_restart",
+                        note="Robot reconnected via Remote Ethernet after an unexpected "
+                             "disconnection — landed in IDLE; operator must press START "
+                             "again to resume picking.",
+                    )
+                else:
+                    self._sm.fault()
+                    await d.plc.set_status_light(StatusLight.RED_CHASE)
+                    try:
+                        await d.lighting.set_backlight(False)
+                    except Exception:
+                        pass
         finally:
             self._cycle_active = False
             self._cycle_phase = CyclePhase.IDLE

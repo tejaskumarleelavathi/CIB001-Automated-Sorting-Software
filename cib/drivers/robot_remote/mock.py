@@ -46,6 +46,9 @@ class MockRemoteEthernetDriver:
     async def wait_until_ready(self, timeout_s: float = 30.0, poll_interval_s: float = 0.2) -> bool:
         return True
 
+    async def wait_until_error_cleared(self, timeout_s: float = 8.0, poll_interval_s: float = 0.2) -> bool:
+        return True
+
     async def reset(self, robot_number: int = 0) -> None:
         self._fault = False
         log.info("mock_robot_remote.reset", robot_number=robot_number)
