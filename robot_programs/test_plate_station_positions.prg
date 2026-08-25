@@ -14,7 +14,15 @@
 '   STATUS            -> OK READY
 '   GO_HOME_RIGHT      -> OK HOME_RIGHT      (Go right_home, Righty)
 '   GO_HOME_LEFT       -> OK HOME_LEFT       (Go left_home, Lefty)
-'   MOVE_WELL x,y,u    -> OK WELL_POSITION x,y   (Tool 2, explicit U, NO actuation)
+'   MOVE_WELL x,y,u,hand -> OK WELL_POSITION x,y (Tool 2, explicit U, NO actuation.
+'                        hand is "L" or "R" -- appended as an explicit /L or /R
+'                        qualifier on the Go/Move, so an unreachable/wrong
+'                        coordinate throws a real SPEL+ error instead of
+'                        silently auto-flipping to the other hand -- found on
+'                        real hardware 2026-08-25: without this, a bad Station
+'                        3/4 coordinate could make the arm silently swing back
+'                        toward Righty mid-move, right back into camera view,
+'                        defeating the whole point of having gone to left_home.)
 '   DROP               -> OK DROPPED         (On 4 / confirm / Off 4 / confirm — no motor)
 '   BYE
 '
@@ -30,8 +38,9 @@ Fend
 Function test_plate_station_positions
     String cmd$
     String coord_str$
+    String hand$
     Real rx, ry, ru
-    Integer sp1, comma1, comma2
+    Integer sp1, comma1, comma2, comma3
 
     Motor On
     Off 4
@@ -76,11 +85,20 @@ server_start:
             coord_str$ = Mid$(cmd$, sp1 + 1)
             comma1 = InStr(coord_str$, ",")
             comma2 = InStr(Mid$(coord_str$, comma1 + 1), ",") + comma1
+            comma3 = InStr(Mid$(coord_str$, comma2 + 1), ",") + comma2
             rx = Val(Left$(coord_str$, comma1 - 1))
             ry = Val(Mid$(coord_str$, comma1 + 1, comma2 - comma1 - 1))
-            ru = Val(Mid$(coord_str$, comma2 + 1))
-            Go XY(rx, ry, -47.700, ru)
-            Move XY(rx, ry, -58.660, ru)
+            ru = Val(Mid$(coord_str$, comma2 + 1, comma3 - comma2 - 1))
+            hand$ = Mid$(coord_str$, comma3 + 1)
+            ' Explicit /L or /R -- an unreachable/wrong coordinate for the
+            ' requested hand throws here instead of silently re-flipping.
+            If hand$ = "L" Then
+                Go XY(rx, ry, -47.700, ru) /L
+                Move XY(rx, ry, -58.660, ru) /L
+            Else
+                Go XY(rx, ry, -47.700, ru) /R
+                Move XY(rx, ry, -58.660, ru) /R
+            EndIf
             Print #201, "OK WELL_POSITION " + Str$(rx) + "," + Str$(ry)
 
         ElseIf Left$(cmd$, 4) = "DROP" Then

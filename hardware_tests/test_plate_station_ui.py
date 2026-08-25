@@ -129,6 +129,7 @@ class TestWorker(QThread):
                     continue
                 side = STATION_SIDE[station]
                 u = self._station_u[side]
+                hand = "L" if side == "left" else "R"
 
                 self.log.emit(f"--- Station {station} ({side} side) ---")
                 self.log.emit(f"Moving to {side}_home ...")
@@ -140,7 +141,7 @@ class TestWorker(QThread):
                     ("last", wells[-1]),
                 ):
                     self.log.emit(f"Moving to {well_label} ({label} well) at ({x}, {y})...")
-                    resp = client.send(f"MOVE_WELL {x},{y},{u}")
+                    resp = client.send(f"MOVE_WELL {x},{y},{u},{hand}")
                     self.log.emit(resp)
                     self.log.emit(f"Dropping at {well_label}...")
                     resp = client.send("DROP")
