@@ -2042,12 +2042,32 @@ class Orchestrator:
         if self._eoa_save_dir is None:
             return
 
-        out_dir = self._eoa_save_dir / "EOA_backlight_on_unprocessed"
+        # Short folder/file names deliberately (2026-08-25) -- this
+        # project's own directory is already deeply nested (~140+ chars
+        # before even reaching cib/output/eoa_images/), and a longer name
+        # here pushed real paths past Windows' 260-char MAX_PATH. cv2.imwrite
+        # can be forced past that with a \\?\ prefix, but plain Windows APIs
+        # (Explorer, os.stat, etc.) still can't see files above the limit
+        # unless long-path support is enabled system-wide -- staying well
+        # under 260 chars works everywhere with no OS configuration needed.
+        out_dir = self._eoa_save_dir / "eoa_unprocessed"
         out_dir.mkdir(parents=True, exist_ok=True)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         image_filename = f"eoa_unprocessed_{ts}.jpg"
-        cv2.imwrite(str(out_dir / image_filename), frame_with_backlight)
+        image_path = out_dir / image_filename
+        # cv2.imwrite silently returns False (no exception) on Windows
+        # paths over the classic 260-char MAX_PATH — confirmed hit here
+        # 2026-08-25: this project's own directory is already deeply
+        # nested, and EOA_backlight_on_unprocessed/<timestamp filename>
+        # pushed a real path to 269 chars, so nothing was ever written
+        # even though the Excel log (a separate, unaffected write) kept
+        # succeeding right next to it. \\?\ is the standard Windows
+        # extended-length-path prefix that bypasses the limit.
+        long_path = "\\\\?\\" + str(image_path.resolve())
+        ok = cv2.imwrite(long_path, frame_with_backlight)
+        if not ok:
+            log.error("cycle.eoa_unprocessed_save_failed", path=str(image_path))
 
         x_px = round(body_center_px[0], 1) if body_center_px else None
         y_px = round(body_center_px[1], 1) if body_center_px else None
