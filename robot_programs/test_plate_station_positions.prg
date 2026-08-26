@@ -97,11 +97,23 @@ server_start:
             ' to the Righty Else branch even when "L" was actually sent.
             ' Explicit /L or /R -- an unreachable/wrong coordinate for the
             ' requested hand throws here instead of silently re-flipping.
+            '
+            ' Both steps are Move (CP/linear), not Go (PTP) -- 2026-08-26,
+            ' operator request: only the home-to-home transitions
+            ' (GO_HOME_RIGHT/LEFT above) should be PTP. PTP interpolates
+            ' each joint independently along its own speed profile to
+            ' arrive simultaneously -- it does NOT take a straight
+            ' Cartesian path, so even with the exact right destination
+            ' (confirmed correct via the echoed coordinate and no error)
+            ' a PTP travel move from right_home to a farther-out target
+            ' could sweep through an unexpected, alarming-looking arc on
+            ' the way there. Move interpolates linearly in Cartesian
+            ' space, so the path itself is predictable.
             If Left$(hand$, 1) = "L" Then
-                Go XY(rx, ry, -47.700, ru) /L
+                Move XY(rx, ry, -47.700, ru) /L
                 Move XY(rx, ry, -58.660, ru) /L
             Else
-                Go XY(rx, ry, -47.700, ru) /R
+                Move XY(rx, ry, -47.700, ru) /R
                 Move XY(rx, ry, -58.660, ru) /R
             EndIf
             Print #201, "OK WELL_POSITION " + Str$(rx) + "," + Str$(ry)
