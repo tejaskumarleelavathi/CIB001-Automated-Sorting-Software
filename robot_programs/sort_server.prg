@@ -11,16 +11,30 @@
 '                                                  camera_calibration/calibration_v3_tooloffset_server.prg
 '                                                  and robot_programs/test_plate_station_positions.prg,
 '                                                  both already using them.)
-'   MOVE_IMAGE x,y       -> OK IMAGE_POSITION x,y      (Tool 1/camera, holds current U)
-'   MOVE_IMAGE_U x,y,u   -> OK IMAGE_POSITION x,y      (Tool 1/camera, explicit U — quadrant selection)
+'   GO_HOME_LEFT          -> OK GO_HOME_LEFT       (mirrors HOME, but always ends Lefty
+'                                                  at left_home -- if currently Righty,
+'                                                  settles at P0/right_home first, then
+'                                                  one continuous Go crosses to left_home.)
+'   MOVE_IMAGE x,y       -> OK IMAGE_POSITION x,y      (Tool 1/camera, holds current U/hand)
+'   MOVE_IMAGE_U x,y,u,hand -> OK IMAGE_POSITION x,y   (Tool 1/camera, explicit U + hand --
+'                                                  quadrant selection. hand is "L" or "R",
+'                                                  breaking change from the old 3-field
+'                                                  x,y,u form -- 2026-08-26.)
 '   MOVE_PIPETTE x,y     -> OK PIPETTE_POSITION x,y    (Tool 2/pipette, holds current U, NO actuation — teaching)
 '   MOVE_PIPETTE_U x,y,u -> OK PIPETTE_POSITION x,y    (Tool 2/pipette, explicit U, NO actuation — teaching)
 '   PIPETTE_DOWN          -> OK PIPETTE_DOWN            (extend pipette at current XY, no motor — teaching)
 '   PIPETTE_UP            -> OK PIPETTE_UP              (retract pipette, no motor — teaching)
 '   PICK x,y             -> OK PICKED x,y              (Tool 2/pipette, holds current U, aspirates)
-'   PICK_U x,y,u         -> OK PICKED x,y              (Tool 2/pipette, explicit U, aspirates)
+'   PICK_U x,y,u,hand     -> OK PICKED x,y              (Tool 2/pipette, explicit U + hand,
+'                                                  aspirates. Breaking change, same as
+'                                                  MOVE_IMAGE_U above -- 2026-08-26.)
 '   DROP x,y             -> OK DROPPED x,y             (Tool 2/pipette, holds current U, dispenses)
-'   DROP_U x,y,u         -> OK DROPPED x,y             (Tool 2/pipette, explicit U, dispenses)
+'   DROP_U x,y,u,hand     -> OK DROPPED x,y             (Tool 2/pipette, explicit U + hand,
+'                                                  dispenses. Caller must always pass the
+'                                                  current side's HOME U here, never a
+'                                                  quadrant-pick U -- hard safety rule, see
+'                                                  cib/core/orchestrator.py. Breaking
+'                                                  change, same as MOVE_IMAGE_U -- 2026-08-26.)
 '   RING_ON / RING_OFF
 '   BYE
 '
@@ -144,9 +158,10 @@ Fend
 Function sort_server
     String cmd$
     String coord_str$
+    String hand$
     Real rx, ry, cur_u, ru
     Integer sp1, sp2
-    Integer comma1, comma2
+    Integer comma1, comma2, comma3
 
     Motor On
     ' CP does NOT auto-reset except at controller startup/motor-on/task end,
@@ -262,6 +277,33 @@ server_start:
             Accel 25, 25
             Print #201, "OK HOME"
 
+        ElseIf Left$(cmd$, 12) = "GO_HOME_LEFT" Then
+            ' Mirrors HOME above, but the target is left_home/Lefty instead
+            ' of P0/Righty. Same findings apply, mirrored: Go not Move
+            ' (Move has no Hand parameter), explicit /L or /R on any Z-lift
+            ' instead of assuming a bare Go preserves current hand, and a
+            ' single bare Go with nothing in between for the actual
+            ' crossing. Slowed the same way as HOME (operator feedback).
+            Call EnsurePipetteUp
+            Tool 1
+            Speed 5
+            Accel 5, 5
+            If Hand = Righty Then
+                If CZ(Here) < -47.700 Then
+                    Go XY(CX(Here), CY(Here), -47.700, CU(Here)) /R
+                EndIf
+                Go P0
+                Go left_home
+            Else
+                If CZ(Here) < -47.700 Then
+                    Go XY(CX(Here), CY(Here), -47.700, CU(Here)) /L
+                EndIf
+                Go left_home
+            EndIf
+            Speed 25
+            Accel 25, 25
+            Print #201, "OK GO_HOME_LEFT"
+
         ElseIf Left$(cmd$, 11) = "MOVE_IMAGE " Then
             Tool 1
             sp1 = InStr(cmd$, " ")
@@ -274,18 +316,31 @@ server_start:
             Print #201, "OK IMAGE_POSITION " + Str$(CX(Here)) + "," + Str$(CY(Here))
 
         ElseIf Left$(cmd$, 13) = "MOVE_IMAGE_U " Then
-            ' MOVE_IMAGE_U x,y,u — same as MOVE_IMAGE but with an explicit U
-            ' angle instead of holding whatever U the arm currently has.
-            ' Used for quadrant-based U selection (see cib/core/orchestrator.py).
+            ' MOVE_IMAGE_U x,y,u,hand — same as MOVE_IMAGE but with an
+            ' explicit U angle AND hand (2026-08-26, multi-station
+            ' integration) instead of holding whatever U/hand the arm
+            ' currently has. Used for quadrant-based U selection (see
+            ' cib/core/orchestrator.py). Only this initial travel-height Go
+            ' needs /L//R -- the descent below is Z-only, same XY/hand,
+            ' safe unqualified (Move has no Hand parameter anyway --
+            ' confirmed real-hardware finding, see HOME above).
             Tool 1
             sp1 = InStr(cmd$, " ")
             coord_str$ = Mid$(cmd$, sp1 + 1)
             comma1 = InStr(coord_str$, ",")
             comma2 = InStr(Mid$(coord_str$, comma1 + 1), ",") + comma1
+            comma3 = InStr(Mid$(coord_str$, comma2 + 1), ",") + comma2
             rx = Val(Left$(coord_str$, comma1 - 1))
             ry = Val(Mid$(coord_str$, comma1 + 1, comma2 - comma1 - 1))
-            ru = Val(Mid$(coord_str$, comma2 + 1))
-            Go XY(rx, ry, -47.700, ru)
+            ru = Val(Mid$(coord_str$, comma2 + 1, comma3 - comma2 - 1))
+            hand$ = Mid$(coord_str$, comma3 + 1)
+            ' Left$(hand$,1) not hand$= -- immune to trailing terminator
+            ' garbage, same reasoning as test_plate_station_positions.prg.
+            If Left$(hand$, 1) = "L" Then
+                Go XY(rx, ry, -47.700, ru) /L
+            Else
+                Go XY(rx, ry, -47.700, ru) /R
+            EndIf
             Move XY(rx, ry, -58.660, ru)
             Print #201, "OK IMAGE_POSITION " + Str$(CX(Here)) + "," + Str$(CY(Here))
 
@@ -410,8 +465,13 @@ server_start:
             Print #201, "OK PICKED " + Str$(rx) + "," + Str$(ry)
 
         ElseIf Left$(cmd$, 7) = "PICK_U " Then
-            ' PICK_U x,y,u — pipette (Tool 2) to (x,y) at explicit U, aspirates.
-            ' Uses the SAME quadrant U as the EoA move that found this specimen.
+            ' PICK_U x,y,u,hand — pipette (Tool 2) to (x,y) at explicit U
+            ' AND hand (2026-08-26, multi-station integration), aspirates.
+            ' Uses the SAME quadrant U/hand as the EoA move that found this
+            ' specimen. Only this initial travel-height Go needs /L//R --
+            ' every step after (descent, CP-blended lift) is Z-only at the
+            ' same XY/hand, safe unqualified (Move has no Hand parameter
+            ' anyway -- confirmed real-hardware finding, see HOME above).
             Off 4
             Call EnsurePipetteUp
             Tool 2
@@ -419,10 +479,16 @@ server_start:
             coord_str$ = Mid$(cmd$, sp1 + 1)
             comma1 = InStr(coord_str$, ",")
             comma2 = InStr(Mid$(coord_str$, comma1 + 1), ",") + comma1
+            comma3 = InStr(Mid$(coord_str$, comma2 + 1), ",") + comma2
             rx = Val(Left$(coord_str$, comma1 - 1))
             ry = Val(Mid$(coord_str$, comma1 + 1, comma2 - comma1 - 1))
-            ru = Val(Mid$(coord_str$, comma2 + 1))
-            Go XY(rx, ry, -47.700, ru)
+            ru = Val(Mid$(coord_str$, comma2 + 1, comma3 - comma2 - 1))
+            hand$ = Mid$(coord_str$, comma3 + 1)
+            If Left$(hand$, 1) = "L" Then
+                Go XY(rx, ry, -47.700, ru) /L
+            Else
+                Go XY(rx, ry, -47.700, ru) /R
+            EndIf
             Move XY(rx, ry, -58.660, ru)
             On 4
             Call WaitPipetteDown
@@ -505,7 +571,13 @@ server_start:
             Print #201, "OK DROPPED " + Str$(rx) + "," + Str$(ry)
 
         ElseIf Left$(cmd$, 7) = "DROP_U " Then
-            ' DROP_U x,y,u — pipette (Tool 2) to (x,y) at explicit U, dispenses.
+            ' DROP_U x,y,u,hand — pipette (Tool 2) to (x,y) at explicit U
+            ' AND hand (2026-08-26, multi-station integration), dispenses.
+            ' Caller (orchestrator.py) is responsible for always passing
+            ' the current side's HOME U here, never a quadrant-pick U --
+            ' this command itself just goes wherever it's told. Only this
+            ' initial travel-height Go needs /L//R -- everything after is
+            ' Z-only at the same XY/hand, safe unqualified.
             Off 4
             Call EnsurePipetteUp
             Tool 2
@@ -513,15 +585,21 @@ server_start:
             coord_str$ = Mid$(cmd$, sp1 + 1)
             comma1 = InStr(coord_str$, ",")
             comma2 = InStr(Mid$(coord_str$, comma1 + 1), ",") + comma1
+            comma3 = InStr(Mid$(coord_str$, comma2 + 1), ",") + comma2
             rx = Val(Left$(coord_str$, comma1 - 1))
             ry = Val(Mid$(coord_str$, comma1 + 1, comma2 - comma1 - 1))
-            ru = Val(Mid$(coord_str$, comma2 + 1))
+            ru = Val(Mid$(coord_str$, comma2 + 1, comma3 - comma2 - 1))
+            hand$ = Mid$(coord_str$, comma3 + 1)
             ' Reverted the CP-blended Go->Move travel conversion here too —
             ' see the matching comment in DROP above (2026-08-22: real
             ' hardware showed robot_drop got slower, not faster, once this
             ' travel move was capped by SpeedS instead of using Go's PTP
             ' joint-speed profile).
-            Go XY(rx, ry, -47.700, ru)
+            If Left$(hand$, 1) = "L" Then
+                Go XY(rx, ry, -47.700, ru) /L
+            Else
+                Go XY(rx, ry, -47.700, ru) /R
+            EndIf
             ' 3s E-stop reaction pause removed 2026-08-21 (optimize-speed pass,
             ' operator's own call — "we don't need 3 secs there, remove it").
             ' Was here to give a reaction window before descending near the
