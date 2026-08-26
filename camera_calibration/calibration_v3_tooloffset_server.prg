@@ -55,6 +55,14 @@ Function calib_v3_server
     Integer comma1, comma2, comma3
 
     Motor On
+    ' Explicitly clear CP mode -- 2026-08-26 real-hardware finding: CP does
+    ' NOT auto-reset except at controller startup/motor-on/task end, so it
+    ' can persist from whatever ran before this task (error 4037 seen from
+    ' calib_tool.prg, a different file in this project, left it ON). CP
+    ' blending requires staying in the same hand throughout -- it cannot
+    ' blend through a Righty<->Lefty change, which GO_HOME_LEFT/MOVE_U /L
+    ' need to do. Defensive: clears it regardless of what left it on.
+    CP Off
     Off 4                                    ' pipette starts retracted -- safety, matches sort_server.prg
     TLSet 1, XY(17.1876, -77.0233, 0, 0)   ' EoA camera offset from U axis (measured 2026-07-08)
     TLSet 2, XY(-22.8124, -77.5233, 0, 0)  ' Pipette offset -- same as sort_server.prg
