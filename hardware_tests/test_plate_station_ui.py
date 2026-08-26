@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import socket
 import sys
+import threading
 from pathlib import Path
 
 sys.path.insert(0, ".")
@@ -114,6 +115,14 @@ class TestWorker(QThread):
         self._selected = sorted(selected_stations)
         self._stations = stations
         self._station_u = station_u
+        self._stop_requested = threading.Event()
+
+    def request_stop(self) -> None:
+        """Halts before the next command -- does not abort a move already
+        in flight (that needs the real E-stop). The robot is left exactly
+        wherever the last completed command put it, so it can be jogged
+        from there in RC+ to record coordinates."""
+        self._stop_requested.set()
 
     def run(self) -> None:
         client = None
@@ -122,7 +131,11 @@ class TestWorker(QThread):
             client = RobotTestClient(self._ip, self._port)
             self.log.emit("Connected. " + client.send("STATUS"))
 
+            stopped_early = False
             for station in self._selected:
+                if self._stop_requested.is_set():
+                    stopped_early = True
+                    break
                 wells = self._stations.get(station)
                 if not wells:
                     self.log.emit(f"Station {station}: no well data loaded, skipping.")
@@ -140,16 +153,27 @@ class TestWorker(QThread):
                     ("first", wells[0]),
                     ("last", wells[-1]),
                 ):
+                    if self._stop_requested.is_set():
+                        stopped_early = True
+                        break
                     self.log.emit(f"Moving to {well_label} ({label} well) at ({x}, {y})...")
                     resp = client.send(f"MOVE_WELL {x},{y},{u},{hand}")
                     self.log.emit(resp)
                     self.log.emit(f"Dropping at {well_label}...")
                     resp = client.send("DROP")
                     self.log.emit(resp)
+                if stopped_early:
+                    break
 
-            self.log.emit("Returning to right_home to finish...")
-            self.log.emit(client.send("GO_HOME_RIGHT"))
-            self.log.emit("Done.")
+            if stopped_early:
+                self.log.emit("Stopped by request. Robot left where it is -- "
+                               "jog from here in RC+ to record coordinates.")
+            else:
+                # No auto-return-to-home (2026-08-26, operator request) --
+                # stays wherever the last drop happened, same reasoning as
+                # stopped_early above: makes it easy to jog from there.
+                self.log.emit("Done. Robot left at the last drop position -- "
+                               "jog from here in RC+ to record coordinates.")
             self.finished_ok.emit()
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -233,10 +257,18 @@ class MainWindow(QMainWindow):
 
         root.addWidget(layout_box)
 
-        # ── Start / log ─────────────────────────────────────────────────
+        # ── Start / Stop / log ─────────────────────────────────────────────
+        start_stop_row = QHBoxLayout()
         self.start_btn = QPushButton("Start Test")
         self.start_btn.clicked.connect(self._start_test)
-        root.addWidget(self.start_btn)
+        start_stop_row.addWidget(self.start_btn)
+
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.setStyleSheet("background-color: #d32f2f; color: white; font-weight: bold;")
+        self.stop_btn.clicked.connect(self._stop_test)
+        start_stop_row.addWidget(self.stop_btn)
+        root.addLayout(start_stop_row)
 
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
@@ -280,15 +312,28 @@ class MainWindow(QMainWindow):
             return
 
         self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
         self._worker = TestWorker(self.ip_field.text(), port, selected, self._stations, station_u)
         self._worker.log.connect(self._log)
-        self._worker.finished_ok.connect(lambda: self.start_btn.setEnabled(True))
+        self._worker.finished_ok.connect(self._on_test_finished)
         self._worker.failed.connect(self._on_test_failed)
         self._worker.start()
+
+    def _stop_test(self) -> None:
+        if self._worker is not None:
+            self._log("Stop requested -- halting before the next command "
+                       "(a move already in progress will still finish).")
+            self._worker.request_stop()
+        self.stop_btn.setEnabled(False)
+
+    def _on_test_finished(self) -> None:
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
 
     def _on_test_failed(self, msg: str) -> None:
         self._log(f"FAILED: {msg}")
         self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
 
 
 if __name__ == "__main__":
