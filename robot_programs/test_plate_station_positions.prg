@@ -95,26 +95,31 @@ server_start:
             ' immune to any trailing terminator garbage; an exact-string
             ' compare here would NOT be, and could silently fall through
             ' to the Righty Else branch even when "L" was actually sent.
-            ' Explicit /L or /R -- an unreachable/wrong coordinate for the
-            ' requested hand throws here instead of silently re-flipping.
-            '
-            ' Both steps are Move (CP/linear), not Go (PTP) -- 2026-08-26,
-            ' operator request: only the home-to-home transitions
-            ' (GO_HOME_RIGHT/LEFT above) should be PTP. PTP interpolates
-            ' each joint independently along its own speed profile to
-            ' arrive simultaneously -- it does NOT take a straight
-            ' Cartesian path, so even with the exact right destination
-            ' (confirmed correct via the echoed coordinate and no error)
-            ' a PTP travel move from right_home to a farther-out target
-            ' could sweep through an unexpected, alarming-looking arc on
-            ' the way there. Move interpolates linearly in Cartesian
-            ' space, so the path itself is predictable.
+            ' REVERTED to Go, not Move (2026-08-26, real-hardware finding):
+            ' Move's documented syntax is
+            '   Move destination [ROT] [ECP] [CP] [searchExpr] [!...!] [SYNC]
+            ' -- there is NO /L or /R (Hand) parameter in it at all, unlike
+            ' Go (the manual's own example is literally "Go P1 /L"). The
+            ' earlier "switch to Move for a predictable path" change
+            ' silently dropped the /L we appended -- Move just ignored it
+            ' and let its own internal CP path-resolution pick the hand,
+            ' which happened to agree with Righty for Stations 1/2 (moving
+            ' from right_home) but ALSO picked Righty for Stations 3/4
+            ' (moving from left_home), even though /L was specified.
+            ' Confirmed on real hardware: RC+'s Current Position readout
+            ' showed the exact right X/Y/Z/U for a Station 3 well, but
+            ' Hand=Righty even though hand=L was sent -- Lefty and Righty
+            ' can both reach the identical (X,Y,Z,U), just via a different
+            ' arm posture, so the coordinate itself was never wrong; only
+            ' the hand was. Go DOES respect /L /R (confirmed in the
+            ' manual), so it's the only way to actually guarantee landing
+            ' in the requested hand -- more important here than path shape.
             If Left$(hand$, 1) = "L" Then
-                Move XY(rx, ry, -47.700, ru) /L
-                Move XY(rx, ry, -58.660, ru) /L
+                Go XY(rx, ry, -47.700, ru) /L
+                Go XY(rx, ry, -58.660, ru) /L
             Else
-                Move XY(rx, ry, -47.700, ru) /R
-                Move XY(rx, ry, -58.660, ru) /R
+                Go XY(rx, ry, -47.700, ru) /R
+                Go XY(rx, ry, -58.660, ru) /R
             EndIf
             Print #201, "OK WELL_POSITION " + Str$(rx) + "," + Str$(ry)
 
