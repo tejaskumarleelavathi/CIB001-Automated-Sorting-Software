@@ -100,6 +100,20 @@ Function calib_v3_server
             ' just below -47.700). Pin it explicitly instead of assuming
             ' "no XY change" means "no hand needed" -- that assumption was
             ' wrong.
+            ' Third real-hardware finding: crossing hands directly from an
+            ' arbitrary point (e.g. Lefty at some quadrant click) straight
+            ' into right home is unpredictable to the operator, even though
+            ' it lands correctly -- they want the SAME behavior as the
+            ' already-proven home<->home transition (see
+            ' test_left_right_home.prg). So if currently Lefty, first
+            ' return to left_home (same-hand, already reliable), THEN do
+            ' the proven Lefty->Righty home-to-home PTP into right home.
+            If Hand = Lefty Then
+                If CZ(Here) < -47.700 Then
+                    Go XY(CX(Here), CY(Here), -47.700, CU(Here)) /L
+                EndIf
+                Go left_home
+            EndIf
             If CZ(Here) < -47.700 Then
                 Go XY(CX(Here), CY(Here), -47.700, CU(Here)) /R
             EndIf
@@ -109,7 +123,17 @@ Function calib_v3_server
         ' ── GO_HOME_LEFT (left_home, Lefty) -- 2026-08-26: establishes Lefty
         ' via the named taught point (reliable) before any quadrant MOVE_U
         ' click attempts /L from wherever the arm currently happens to be.
+        ' Same fix as HOME above: if currently Righty, first return to
+        ' right_home (same-hand), THEN do the proven Righty->Lefty
+        ' home-to-home PTP into left home, instead of crossing hands
+        ' directly from an arbitrary point.
         ElseIf UCase$(cmd$) = "GO_HOME_LEFT" Then
+            If Hand = Righty Then
+                If CZ(Here) < -47.700 Then
+                    Go XY(CX(Here), CY(Here), -47.700, CU(Here)) /R
+                EndIf
+                Go P0
+            EndIf
             If CZ(Here) < -47.700 Then
                 Go XY(CX(Here), CY(Here), -47.700, CU(Here)) /L
             EndIf
