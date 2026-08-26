@@ -13,6 +13,8 @@ from enum import Enum, auto
 from typing import Any
 import numpy as np
 
+from cib.config.loader import PlateConfig
+
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -107,6 +109,16 @@ class OperatorAcknowledgeEvent:
 class OperatorShutdownEvent:
     """Operator pressed SHUTDOWN — disconnect all hardware and exit cleanly."""
     pass
+
+@dataclass(frozen=True)
+class OperatorConfigureStationsEvent:
+    """
+    Operator selected which plate stations to fill for the next run (Excel
+    upload + checkboxes in the UI). selected maps station number ->
+    PlateConfig, already loaded from the workbook. Handled while IDLE,
+    before START -- see Orchestrator.configure_stations().
+    """
+    selected: dict[int, PlateConfig]
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +253,7 @@ class AllDevicesReadyEvent:
 # All event types in one union — used for type hints in the orchestrator
 SystemEvent = (
     OperatorStartEvent | OperatorStopEvent | OperatorAbortEvent | OperatorAcknowledgeEvent
-    | OperatorShutdownEvent
+    | OperatorShutdownEvent | OperatorConfigureStationsEvent
     | SafetyFaultEvent | SafetyClearEvent | SafetyStatusEvent
     | RobotConnectedEvent | RobotInPositionEvent | RobotMissionCompleteEvent
     | RobotClearedFOVEvent | RobotFaultEvent
