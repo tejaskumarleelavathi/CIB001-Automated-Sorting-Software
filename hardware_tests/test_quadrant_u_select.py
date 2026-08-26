@@ -138,6 +138,14 @@ def robot_move_u(s: socket.socket, rx: float, ry: float, u: float, hand: str) ->
     return float(parts[2]), float(parts[3]), float(parts[4])
 
 
+def robot_go_home_left(s: socket.socket) -> None:
+    """Establishes Lefty via the named taught point before quadrant clicks
+    rely on /L from wherever the arm currently happens to be."""
+    resp = send_cmd(s, "GO_HOME_LEFT")
+    if not resp.startswith("OK GO_HOME_LEFT"):
+        raise RuntimeError(f"GO_HOME_LEFT failed: {resp!r}")
+
+
 def robot_drop_test(s: socket.socket) -> None:
     """D key -- pipette to Station 3's H12, Lefty, U=200.023 (left_home's
     U). Position only, no actuation. See DROP_TEST in
@@ -349,15 +357,35 @@ def main() -> None:
             break
 
         if key in (ord("l"), ord("L")):
-            hand_state[0] = "L"
-            print("\n  Switched to LEFTY quadrant U's "
-                  f"(top={LEFTY_TOP_U}, bottom={LEFTY_BOTTOM_U}).")
+            if busy[0]:
+                print("  [WAIT] robot busy, can't switch now")
+                continue
+            print("\n  Going to left_home first (establishes Lefty reliably)...")
+            busy[0] = True
+            try:
+                robot_go_home_left(sock)
+                hand_state[0] = "L"
+                print("  At left_home. Switched to LEFTY quadrant U's "
+                      f"(top={LEFTY_TOP_U}, bottom={LEFTY_BOTTOM_U}).")
+            except Exception as exc:
+                print(f"  [ERROR] {exc}")
+            busy[0] = False
             continue
 
         if key in (ord("y"), ord("Y")):
-            hand_state[0] = "R"
-            print("\n  Switched to RIGHTY quadrant U's "
-                  f"(top={RIGHTY_TOP_U}, bottom={RIGHTY_BOTTOM_U}).")
+            if busy[0]:
+                print("  [WAIT] robot busy, can't switch now")
+                continue
+            print("\n  Going to right_home first (establishes Righty reliably)...")
+            busy[0] = True
+            try:
+                robot_home(sock)
+                hand_state[0] = "R"
+                print("  At right_home. Switched to RIGHTY quadrant U's "
+                      f"(top={RIGHTY_TOP_U}, bottom={RIGHTY_BOTTOM_U}).")
+            except Exception as exc:
+                print(f"  [ERROR] {exc}")
+            busy[0] = False
             continue
 
         if key in (ord("d"), ord("D")):

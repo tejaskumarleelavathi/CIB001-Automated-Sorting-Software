@@ -77,13 +77,23 @@ Function calib_v3_server
         If UCase$(cmd$) = "STATUS" Then
             Print #201, "OK STATUS READY"
 
-        ' ── HOME ──────────────────────────────────────────────────────────────
+        ' ── HOME (right_home, Righty) ────────────────────────────────────────
         ElseIf UCase$(cmd$) = "HOME" Then
             If CZ(Here) < -47.700 Then
                 Move XY(CX(Here), CY(Here), -47.700, CU(Here))
             EndIf
             Go P0
             Print #201, "OK HOME"
+
+        ' ── GO_HOME_LEFT (left_home, Lefty) -- 2026-08-26: establishes Lefty
+        ' via the named taught point (reliable) before any quadrant MOVE_U
+        ' click attempts /L from wherever the arm currently happens to be.
+        ElseIf UCase$(cmd$) = "GO_HOME_LEFT" Then
+            If CZ(Here) < -47.700 Then
+                Move XY(CX(Here), CY(Here), -47.700, CU(Here))
+            EndIf
+            Go left_home
+            Print #201, "OK GO_HOME_LEFT"
 
         ' ── WHERE (returns X Y Z U — X/Y are CAMERA position under Tool 1) ─────
         ElseIf UCase$(cmd$) = "WHERE" Then
