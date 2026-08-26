@@ -28,8 +28,20 @@ BEFORE RUNNING
 
 Controls:
   Left-click  -> EoA moves to that spot at the quadrant's assigned U
+  L           -> switch to LEFTY quadrant U's (177.718 top / 86.053 bottom)
+  Y           -> switch back to RIGHTY quadrant U's (209.0 top / 251.0 bottom)
+  D           -> drop test: pipette (Tool 2) to Station 3's H12 well,
+                 Lefty, U=200.023 (left_home's U -- NOT the quadrant-pick
+                 U, e.g. 86.053, which is not safe to drop at)
   R           -> retake overhead snapshot
   Q / Esc     -> quit (does NOT home)
+
+2026-08-26 update: quadrant U now depends on which hand is active (L/Y
+keys above) -- picking the same physical quadrant needs a DIFFERENT U in
+Lefty vs Righty. MOVE_U now sends an explicit hand too (real-hardware
+finding elsewhere in this project: a bare Go can silently pick the wrong
+hand even when it looks like it shouldn't -- see
+test_plate_station_positions.prg's history for the full story).
 
 Usage:
   & "C:/Users/TejasKumarLeelavathi/miniconda3/envs/cib_env/python.exe" hardware_tests/test_quadrant_u_select.py
@@ -47,8 +59,12 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 # ── FILL THESE IN ────────────────────────────────────────────────────────────
-TOP_U    = 209.0   # U angle (deg) for TL + TR quadrants
-BOTTOM_U = 251.0   # U angle (deg) for BL + BR quadrants
+# Righty (existing production values) and Lefty (2026-08-26, added for the
+# left-side plate stations) -- toggle at runtime with the L / Y keys.
+RIGHTY_TOP_U    = 209.0    # U angle (deg) for TL + TR quadrants, Righty
+RIGHTY_BOTTOM_U = 251.0    # U angle (deg) for BL + BR quadrants, Righty
+LEFTY_TOP_U     = 177.718  # U angle (deg) for TL + TR quadrants, Lefty
+LEFTY_BOTTOM_U  = 86.053   # U angle (deg) for BL + BR quadrants, Lefty
 
 # ── Settings ──────────────────────────────────────────────────────────────────
 
@@ -114,12 +130,21 @@ def send_cmd(s: socket.socket, cmd: str) -> str:
     return _recv_line(s)
 
 
-def robot_move_u(s: socket.socket, rx: float, ry: float, u: float) -> tuple[float, float, float]:
-    resp = send_cmd(s, f"MOVE_U {rx:.3f},{ry:.3f},{u:.3f}")
+def robot_move_u(s: socket.socket, rx: float, ry: float, u: float, hand: str) -> tuple[float, float, float]:
+    resp = send_cmd(s, f"MOVE_U {rx:.3f},{ry:.3f},{u:.3f},{hand}")
     if not resp.startswith("OK MOVE_U"):
         raise RuntimeError(f"MOVE_U failed: {resp!r}")
     parts = resp.split()
     return float(parts[2]), float(parts[3]), float(parts[4])
+
+
+def robot_drop_test(s: socket.socket) -> None:
+    """D key -- pipette to Station 3's H12, Lefty, U=200.023 (left_home's
+    U). Position only, no actuation. See DROP_TEST in
+    calibration_v3_tooloffset_server.prg for the full explanation."""
+    resp = send_cmd(s, "DROP_TEST")
+    if not resp.startswith("OK DROP_TEST"):
+        raise RuntimeError(f"DROP_TEST failed: {resp!r}")
 
 
 def robot_home(s: socket.socket) -> None:
@@ -192,22 +217,26 @@ def pixel_to_robot(px: float, py: float, H: np.ndarray) -> tuple[float, float]:
     return float(out[0][0][0]), float(out[0][0][1])
 
 
-def quadrant_and_u(full_x: float, full_y: float, img_w: int, img_h: int) -> tuple[str, float]:
+def quadrant_and_u(full_x: float, full_y: float, img_w: int, img_h: int,
+                    hand: str) -> tuple[str, float]:
     """
     Image-top half -> BOTTOM_U, image-bottom half -> TOP_U.
     Image-top is physically the BOTTOM of the dish (camera mounting), so this
     is deliberately inverted vs raw image row — matches physical reality.
+
+    hand: "R" or "L" -- picks the Righty or Lefty U pair (2026-08-26).
     """
     is_top_physical = full_y >= img_h / 2   # image-bottom = physical top
     is_left = full_x < img_w / 2
     quadrant = ("TL" if is_left else "TR") if is_top_physical else ("BL" if is_left else "BR")
-    u = TOP_U if is_top_physical else BOTTOM_U
+    top_u, bottom_u = (LEFTY_TOP_U, LEFTY_BOTTOM_U) if hand == "L" else (RIGHTY_TOP_U, RIGHTY_BOTTOM_U)
+    u = top_u if is_top_physical else bottom_u
     return quadrant, u
 
 
 # ── Display ───────────────────────────────────────────────────────────────────
 
-def build_display(frame: np.ndarray, clicks: list, scale: float) -> np.ndarray:
+def build_display(frame: np.ndarray, clicks: list, scale: float, hand: str) -> np.ndarray:
     dh = int(frame.shape[0] * scale)
     dw = int(frame.shape[1] * scale)
     disp = cv2.resize(frame, (dw, dh)).copy()
@@ -226,9 +255,13 @@ def build_display(frame: np.ndarray, clicks: list, scale: float) -> np.ndarray:
                     (dx + 12, dy - 6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
 
-    cv2.rectangle(disp, (0, 0), (dw, 36), (20, 20, 20), -1)
-    cv2.putText(disp, "Click = move EoA (quadrant U)  |  H = home  |  R = refresh  |  Q = quit (no home)",
-                (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 210, 255), 2)
+    cv2.rectangle(disp, (0, 0), (dw, 60), (20, 20, 20), -1)
+    hand_label = "LEFTY" if hand == "L" else "RIGHTY"
+    hand_color = (255, 180, 0) if hand == "L" else (0, 210, 255)
+    cv2.putText(disp, f"Hand: {hand_label}  (L = Lefty, Y = Righty)",
+                (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, hand_color, 2)
+    cv2.putText(disp, "Click = move EoA (quadrant U)  |  D = drop test  |  H = home  |  R = refresh  |  Q = quit",
+                (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 210, 255), 2)
 
     return disp
 
@@ -241,14 +274,10 @@ def main() -> None:
     print("  CIB — Quadrant-Based U Selection Test")
     print("=" * 70)
 
-    if TOP_U is None or BOTTOM_U is None:
-        print("\n  [ERROR] TOP_U / BOTTOM_U are not set. Edit the top of this file")
-        print("  and fill in the U angles for the top-2 and bottom-2 quadrants.")
-        sys.exit(1)
-
     print(f"""
-  TOP_U    (TL, TR) = {TOP_U}
-  BOTTOM_U (BL, BR) = {BOTTOM_U}
+  RIGHTY: TOP_U (TL,TR) = {RIGHTY_TOP_U}   BOTTOM_U (BL,BR) = {RIGHTY_BOTTOM_U}
+  LEFTY:  TOP_U (TL,TR) = {LEFTY_TOP_U}   BOTTOM_U (BL,BR) = {LEFTY_BOTTOM_U}
+  Starts in RIGHTY -- press L to switch to Lefty, Y to switch back.
 
   Uses calibration_v3_tooloffset_server.prg (MOVE_U, Tool 1 active).
   CHECKLIST:
@@ -270,6 +299,7 @@ def main() -> None:
     scale  = DISPLAY_WIDTH / frame.shape[1]
     clicks: list[tuple[int, int, float, float, float, str]] = []
     busy   = [False]
+    hand_state = ["R"]   # mutable so on_click/key loop can both read+write it
 
     WIN = "Quadrant U Select — Click to move EoA"
 
@@ -283,19 +313,20 @@ def main() -> None:
         full_x = x / scale
         full_y = y / scale
         rx, ry = pixel_to_robot(full_x, full_y, H)
-        quadrant, u = quadrant_and_u(full_x, full_y, frame.shape[1], frame.shape[0])
+        hand = hand_state[0]
+        quadrant, u = quadrant_and_u(full_x, full_y, frame.shape[1], frame.shape[0], hand)
 
         print(f"\n  Click -> {quadrant}  display({x},{y})"
-              f"  target robot({rx:.2f}, {ry:.2f}) mm  U={u:.1f}")
+              f"  target robot({rx:.2f}, {ry:.2f}) mm  U={u:.1f}  hand={hand}")
         print("  Sending MOVE_U ...")
 
         busy[0] = True
         try:
-            ax, ay, au = robot_move_u(sock, rx, ry, u)
+            ax, ay, au = robot_move_u(sock, rx, ry, u, hand)
             print(f"  Robot at ({ax:.2f}, {ay:.2f}) mm  U={au:.2f}")
             print("  Watch eoa_live_feed.py — EoA crosshair should be on the clicked spot")
             clicks.append((x, y, rx, ry, u, quadrant))
-            disp = build_display(frame, clicks, scale)
+            disp = build_display(frame, clicks, scale, hand_state[0])
             cv2.imshow(WIN, disp)
         except Exception as exc:
             print(f"  [ERROR] {exc}")
@@ -310,12 +341,38 @@ def main() -> None:
     nonlocal_frame = [frame]
 
     while True:
-        disp = build_display(nonlocal_frame[0], clicks, scale)
+        disp = build_display(nonlocal_frame[0], clicks, scale, hand_state[0])
         cv2.imshow(WIN, disp)
         key = cv2.waitKey(100) & 0xFF
 
         if key in (ord("q"), ord("Q"), 27):
             break
+
+        if key in (ord("l"), ord("L")):
+            hand_state[0] = "L"
+            print("\n  Switched to LEFTY quadrant U's "
+                  f"(top={LEFTY_TOP_U}, bottom={LEFTY_BOTTOM_U}).")
+            continue
+
+        if key in (ord("y"), ord("Y")):
+            hand_state[0] = "R"
+            print("\n  Switched to RIGHTY quadrant U's "
+                  f"(top={RIGHTY_TOP_U}, bottom={RIGHTY_BOTTOM_U}).")
+            continue
+
+        if key in (ord("d"), ord("D")):
+            if busy[0]:
+                print("  [WAIT] robot busy, can't drop-test now")
+                continue
+            print("\n  Drop test -> Station 3 H12, Lefty, U=200.023 ...")
+            busy[0] = True
+            try:
+                robot_drop_test(sock)
+                print("  At Station 3 H12. Tool restored to 1 -- quadrant clicks still work.")
+            except Exception as exc:
+                print(f"  [ERROR] {exc}")
+            busy[0] = False
+            continue
 
         if key in (ord("h"), ord("H")):
             if busy[0]:
