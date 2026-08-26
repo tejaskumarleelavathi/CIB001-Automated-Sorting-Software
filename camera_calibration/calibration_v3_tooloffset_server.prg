@@ -87,8 +87,15 @@ Function calib_v3_server
 
         ' ── HOME (right_home, Righty) ────────────────────────────────────────
         ElseIf UCase$(cmd$) = "HOME" Then
+            ' Go, not Move, for this Z-only lift (2026-08-26 real-hardware
+            ' finding) -- Move has no Hand parameter at all (confirmed in
+            ' the manual) and threw error 4037 ("point attribute...differ
+            ' for CP control command") when the current hand was Lefty
+            ' (e.g. right after a bottom-quadrant Lefty click). Go at the
+            ' exact current XY needs no hand resolution -- only Z changes,
+            ' J1/J2 don't move at all -- so no /L /R qualifier is needed here.
             If CZ(Here) < -47.700 Then
-                Move XY(CX(Here), CY(Here), -47.700, CU(Here))
+                Go XY(CX(Here), CY(Here), -47.700, CU(Here))
             EndIf
             Go P0
             Print #201, "OK HOME"
@@ -98,7 +105,7 @@ Function calib_v3_server
         ' click attempts /L from wherever the arm currently happens to be.
         ElseIf UCase$(cmd$) = "GO_HOME_LEFT" Then
             If CZ(Here) < -47.700 Then
-                Move XY(CX(Here), CY(Here), -47.700, CU(Here))
+                Go XY(CX(Here), CY(Here), -47.700, CU(Here))
             EndIf
             Go left_home
             Print #201, "OK GO_HOME_LEFT"
