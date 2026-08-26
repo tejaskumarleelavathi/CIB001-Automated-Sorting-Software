@@ -143,7 +143,18 @@ Function calib_v3_server
         ' MOVE_U clicks keep working without needing to restart.
         ElseIf UCase$(cmd$) = "DROP_TEST" Then
             Off 4
-            Call EnsurePipetteUp
+            ' Inlined, not a separate Function -- sort_server.prg already
+            ' defines EnsurePipetteUp with this exact name, and if both
+            ' files are in the same RC+ project (shared function
+            ' namespace), a duplicate name fails to compile.
+            If Sw(20) = 1 Then
+                ' Already up -- nothing to do
+            Else
+                Do
+                    If Sw(20) = 1 Then Exit Do
+                    Wait 0.05
+                Loop
+            EndIf
             Tool 2
             ' Power High for Tool 2/pipette reach, same as sort_server.prg --
             ' the rest of this program runs Power Low (fine for Tool 1/camera
@@ -179,22 +190,4 @@ Function calib_v3_server
 
     Loop
 
-Fend
-
-
-' =============================================================================
-' EnsurePipetteUp -- block until Input 20 confirms the pipette is fully
-' retracted, before any XY travel. Duplicated from sort_server.prg (kept
-' self-contained here rather than assumed cross-file, since this program
-' lives in a different project folder) -- identical, already-proven logic.
-' =============================================================================
-Function EnsurePipetteUp
-    If Sw(20) = 1 Then
-        ' Already up -- nothing to do
-    Else
-        Do
-            If Sw(20) = 1 Then Exit Do
-            Wait 0.05
-        Loop
-    EndIf
 Fend
