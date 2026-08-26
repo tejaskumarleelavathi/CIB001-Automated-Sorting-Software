@@ -266,6 +266,7 @@ def main() -> None:
         u_bottom_deg=cfg.robot.u_bottom_deg,
         plate_config=plate_config,
         plate_u=PLATE_U,
+        plate_stations_cfg=cfg.plate_stations,
         db_path=db_path,
         runs_base_dir=runs_base_dir,
         field_code=DEV_FIELD_CODE,
