@@ -90,12 +90,18 @@ Function calib_v3_server
             ' Go, not Move, for this Z-only lift (2026-08-26 real-hardware
             ' finding) -- Move has no Hand parameter at all (confirmed in
             ' the manual) and threw error 4037 ("point attribute...differ
-            ' for CP control command") when the current hand was Lefty
-            ' (e.g. right after a bottom-quadrant Lefty click). Go at the
-            ' exact current XY needs no hand resolution -- only Z changes,
-            ' J1/J2 don't move at all -- so no /L /R qualifier is needed here.
+            ' for CP control command") when the current hand was Lefty.
+            ' Explicit /R -- 2026-08-26, second real-hardware finding: a
+            ' bare Go XY(...) with NO hand does NOT reliably preserve
+            ' whatever hand the arm is currently in -- it silently defaults
+            ' toward Righty regardless, causing an unwanted Lefty->Righty->
+            ' Lefty double-flip here (this lift runs almost every time --
+            ' right_home/left_home's real Z, -47.739/-47.743, is always
+            ' just below -47.700). Pin it explicitly instead of assuming
+            ' "no XY change" means "no hand needed" -- that assumption was
+            ' wrong.
             If CZ(Here) < -47.700 Then
-                Go XY(CX(Here), CY(Here), -47.700, CU(Here))
+                Go XY(CX(Here), CY(Here), -47.700, CU(Here)) /R
             EndIf
             Go P0
             Print #201, "OK HOME"
@@ -105,7 +111,7 @@ Function calib_v3_server
         ' click attempts /L from wherever the arm currently happens to be.
         ElseIf UCase$(cmd$) = "GO_HOME_LEFT" Then
             If CZ(Here) < -47.700 Then
-                Go XY(CX(Here), CY(Here), -47.700, CU(Here))
+                Go XY(CX(Here), CY(Here), -47.700, CU(Here)) /L
             EndIf
             Go left_home
             Print #201, "OK GO_HOME_LEFT"
@@ -123,7 +129,19 @@ Function calib_v3_server
             Else
                 rx = Val(Left$(coord_str$, comma_pos - 1))
                 ry = Val(Mid$(coord_str$, comma_pos + 1))
-                Go XY(rx, ry, CZ(Here), CU(Here))
+                ' Explicit hand, pinned to whatever hand is CURRENTLY active
+                ' (queried via Hand, not assumed) -- 2026-08-26, same root
+                ' cause as HOME/GO_HOME_LEFT's Z-lift fix above: a bare Go
+                ' XY(...) with no hand does not reliably preserve the
+                ' current hand, it can silently default toward Righty.
+                ' MOVETO's whole contract is "change x,y, nothing else", so
+                ' unlike HOME/GO_HOME_LEFT (which WANT a specific hand) this
+                ' preserves current hand rather than forcing one.
+                If Hand = Lefty Then
+                    Go XY(rx, ry, CZ(Here), CU(Here)) /L
+                Else
+                    Go XY(rx, ry, CZ(Here), CU(Here)) /R
+                EndIf
                 Print #201, "OK MOVETO " + Str$(CX(Here)) + " " + Str$(CY(Here))
             EndIf
 
