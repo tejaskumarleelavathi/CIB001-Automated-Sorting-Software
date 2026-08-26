@@ -108,16 +108,28 @@ Function calib_v3_server
             ' test_left_right_home.prg). So if currently Lefty, first
             ' return to left_home (same-hand, already reliable), THEN do
             ' the proven Lefty->Righty home-to-home PTP into right home.
+            ' Fourth real-hardware finding: the crossing step must be a
+            ' bare "Go P0" with NO separate Z-lift/hand-pin step first --
+            ' that separate step was flipping the arm's posture to Righty
+            ' IN PLACE at left_home's own X/Y (a Z-only move with /R)
+            ' before ever moving toward right home, instead of sweeping
+            ' across in the one continuous motion test_left_right_home.prg
+            ' proved safe. The Z-lift safety check is only for returning to
+            ' the MATCHING home from an arbitrary point (no reorientation
+            ' happening there, same hand throughout) -- it must not be
+            ' reused for the actual hand-crossing move.
             If Hand = Lefty Then
                 If CZ(Here) < -47.700 Then
                     Go XY(CX(Here), CY(Here), -47.700, CU(Here)) /L
                 EndIf
                 Go left_home
+                Go P0
+            Else
+                If CZ(Here) < -47.700 Then
+                    Go XY(CX(Here), CY(Here), -47.700, CU(Here)) /R
+                EndIf
+                Go P0
             EndIf
-            If CZ(Here) < -47.700 Then
-                Go XY(CX(Here), CY(Here), -47.700, CU(Here)) /R
-            EndIf
-            Go P0
             Print #201, "OK HOME"
 
         ' ── GO_HOME_LEFT (left_home, Lefty) -- 2026-08-26: establishes Lefty
@@ -125,19 +137,23 @@ Function calib_v3_server
         ' click attempts /L from wherever the arm currently happens to be.
         ' Same fix as HOME above: if currently Righty, first return to
         ' right_home (same-hand), THEN do the proven Righty->Lefty
-        ' home-to-home PTP into left home, instead of crossing hands
-        ' directly from an arbitrary point.
+        ' home-to-home PTP into left home as a bare "Go left_home" with no
+        ' separate Z-lift/hand-pin step first (see HOME's comment above --
+        ' that step reorients the arm IN PLACE at right_home instead of
+        ' sweeping across).
         ElseIf UCase$(cmd$) = "GO_HOME_LEFT" Then
             If Hand = Righty Then
                 If CZ(Here) < -47.700 Then
                     Go XY(CX(Here), CY(Here), -47.700, CU(Here)) /R
                 EndIf
                 Go P0
+                Go left_home
+            Else
+                If CZ(Here) < -47.700 Then
+                    Go XY(CX(Here), CY(Here), -47.700, CU(Here)) /L
+                EndIf
+                Go left_home
             EndIf
-            If CZ(Here) < -47.700 Then
-                Go XY(CX(Here), CY(Here), -47.700, CU(Here)) /L
-            EndIf
-            Go left_home
             Print #201, "OK GO_HOME_LEFT"
 
         ' ── WHERE (returns X Y Z U — X/Y are CAMERA position under Tool 1) ─────
