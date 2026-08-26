@@ -235,8 +235,17 @@ server_start:
             ' currently Lefty, first settle at left_home (same-hand, safe),
             ' THEN one bare Go P0 to cross. If already Righty, just the
             ' same-hand return.
+            ' Slowed to Speed 5/Accel 5,5 for the whole homing sequence
+            ' (operator feedback, 2026-08-26 -- full-speed 25/25,25 was too
+            ' fast for this move, especially the hand-crossing sweep). Same
+            ' value already proven safe for this exact right_home<->left_home
+            ' transition in test_left_right_home.prg. Restored to the normal
+            ' 25/25,25 baseline before returning so PICK/DROP/MOVE_IMAGE etc.
+            ' aren't left running slow afterward.
             Call EnsurePipetteUp
             Tool 1
+            Speed 5
+            Accel 5, 5
             If Hand = Lefty Then
                 If CZ(Here) < -47.700 Then
                     Go XY(CX(Here), CY(Here), -47.700, CU(Here)) /L
@@ -249,6 +258,8 @@ server_start:
                 EndIf
                 Go P0
             EndIf
+            Speed 25
+            Accel 25, 25
             Print #201, "OK HOME"
 
         ElseIf Left$(cmd$, 11) = "MOVE_IMAGE " Then
