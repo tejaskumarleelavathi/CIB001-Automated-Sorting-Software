@@ -29,18 +29,23 @@ class RobotDriver(Protocol):
     async def disconnect(self) -> None: ...
     async def is_ready(self) -> bool: ...
 
-    async def move_to_image_site(self, x: float, y: float, u: float | None = None) -> None:
+    async def move_to_image_site(
+        self, x: float, y: float, u: float | None = None, hand: str = "R",
+    ) -> None:
         """
         Move to pick site for EoA close-up image.
 
         u: optional wrist angle (deg). If given, the robot moves to this exact
-        U (quadrant-based U selection). If None, holds whatever U the robot is
-        currently at (pre-2026-08-05 behavior).
+        U (quadrant-based U selection). If None, holds whatever U/hand the
+        robot is currently at (pre-2026-08-05 behavior) — hand is ignored.
+
+        hand: "L" or "R" — which side's quadrant U this is. Only meaningful
+        when u is given.
         """
         ...
 
     async def execute_pick(
-        self, pick_x: float, pick_y: float, u: float | None = None,
+        self, pick_x: float, pick_y: float, u: float | None = None, hand: str = "R",
     ) -> None:
         """
         Aspirate the specimen at (pick_x, pick_y) using the pipette (Tool 2).
@@ -48,6 +53,8 @@ class RobotDriver(Protocol):
 
         u: wrist angle (deg) for the pick move — same u used for the EoA
         move that found this specimen (dish quadrant selection).
+        hand: "L" or "R" — which side this quadrant U belongs to. Only
+        meaningful when u is given.
 
         Split from the drop step (execute_place) so the orchestrator can
         record "specimen is now in the pipette" as its own durable state
@@ -59,7 +66,7 @@ class RobotDriver(Protocol):
         ...
 
     async def execute_place(
-        self, well_x: float, well_y: float, well_u: float | None = None,
+        self, well_x: float, well_y: float, well_u: float | None = None, hand: str = "R",
     ) -> None:
         """
         Travel to (well_x, well_y) and dispense the specimen currently held
@@ -68,12 +75,19 @@ class RobotDriver(Protocol):
         well_u: wrist angle (deg) for the drop move. The plate station is a
         different physical location from the dish and needs its own U —
         do not reuse the pick's u here. None holds whatever U the arm is
-        currently at.
+        currently at. Caller must always pass the current side's HOME U
+        (never a quadrant-pick U) — hard safety rule.
+        hand: "L" or "R" — which side's plate station this is. Only
+        meaningful when well_u is given.
         """
         ...
 
     async def move_to_safe_park(self) -> None:
-        """Move to parked/home position."""
+        """Move to parked/home position (always ends Righty at right home)."""
+        ...
+
+    async def go_home_left(self) -> None:
+        """Move to left home position (always ends Lefty at left home)."""
         ...
 
     async def halt(self) -> None:
