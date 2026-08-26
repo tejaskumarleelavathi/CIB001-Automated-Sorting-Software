@@ -2,7 +2,15 @@
 '
 ' Commands (sent from Python on port 2000):
 '   STATUS               -> OK READY
-'   HOME                 -> OK HOME              (ensures pipette up, lifts, goes to P0)
+'   HOME                 -> OK HOME              (ensures pipette up, lifts, always ends
+'                                                  Righty at P0/right home -- if currently
+'                                                  Lefty, settles at left_home first, then
+'                                                  one continuous Go crosses to P0. Requires
+'                                                  left_home/right_home taught points in
+'                                                  this same RC+ project -- see
+'                                                  camera_calibration/calibration_v3_tooloffset_server.prg
+'                                                  and robot_programs/test_plate_station_positions.prg,
+'                                                  both already using them.)
 '   MOVE_IMAGE x,y       -> OK IMAGE_POSITION x,y      (Tool 1/camera, holds current U)
 '   MOVE_IMAGE_U x,y,u   -> OK IMAGE_POSITION x,y      (Tool 1/camera, explicit U — quadrant selection)
 '   MOVE_PIPETTE x,y     -> OK PIPETTE_POSITION x,y    (Tool 2/pipette, holds current U, NO actuation — teaching)
@@ -141,6 +149,13 @@ Function sort_server
     Integer comma1, comma2
 
     Motor On
+    ' CP does NOT auto-reset except at controller startup/motor-on/task end,
+    ' so it can persist from whatever ran before this task -- and CP
+    ' blending cannot cross a Righty<->Lefty hand change (error 4037),
+    ' which HOME/GO_HOME_LEFT now need to do. Defensive: clears it
+    ' regardless of what left it on (2026-08-26 real-hardware finding,
+    ' ported from camera_calibration/calibration_v3_tooloffset_server.prg).
+    CP Off
     Off 4    ' pipette always starts retracted (UP) — never DOWN on program start
     TLSet 1, XY(17.1876, -77.0233, 0, 0)    ' EoA camera offset (measured 2026-07-08)
     TLSet 2, XY(-22.8124, -77.5233, 0, 0)   ' Pipette offset (measured 2026-08-06
@@ -205,12 +220,35 @@ server_start:
             Print #201, "OK READY"
 
         ElseIf Left$(cmd$, 4) = "HOME" Then
+            ' Always ends Righty at P0 (right home). Real-hardware findings
+            ' (2026-08-25/26, proven in calibration_v3_tooloffset_server.prg
+            ' and ported here): (1) Move has no Hand parameter at all -- a
+            ' bare Move here threw error 4037 when the current hand was
+            ' Lefty; (2) a bare Go XY(...) with no hand does NOT reliably
+            ' preserve the arm's current hand -- it can silently default
+            ' toward Righty, so any Z-lift here must be explicitly /L or /R
+            ' to match whatever hand is ACTUALLY current; (3) crossing hands
+            ' must be a single bare Go with nothing in between -- a Z-lift
+            ' step with the opposite hand's qualifier right before the
+            ' crossing move reorients the arm IN PLACE at the wrong home
+            ' instead of sweeping across in one continuous motion. So: if
+            ' currently Lefty, first settle at left_home (same-hand, safe),
+            ' THEN one bare Go P0 to cross. If already Righty, just the
+            ' same-hand return.
             Call EnsurePipetteUp
             Tool 1
-            If CZ(Here) < -47.700 Then
-                Move XY(CX(Here), CY(Here), -47.700, CU(Here))
+            If Hand = Lefty Then
+                If CZ(Here) < -47.700 Then
+                    Go XY(CX(Here), CY(Here), -47.700, CU(Here)) /L
+                EndIf
+                Go left_home
+                Go P0
+            Else
+                If CZ(Here) < -47.700 Then
+                    Go XY(CX(Here), CY(Here), -47.700, CU(Here)) /R
+                EndIf
+                Go P0
             EndIf
-            Go P0
             Print #201, "OK HOME"
 
         ElseIf Left$(cmd$, 11) = "MOVE_IMAGE " Then
