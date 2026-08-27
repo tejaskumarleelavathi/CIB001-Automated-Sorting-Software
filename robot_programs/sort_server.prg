@@ -1,7 +1,13 @@
 ' sort_server.prg — production robot TCP server
 '
 ' Commands (sent from Python on port 2000):
-'   STATUS               -> OK READY
+'   STATUS               -> OK READY SORT_SERVER_VER=<date-tag>  (version tag
+'                                                  lets a redownload be verified
+'                                                  on the spot instead of trusted
+'                                                  blind -- see cib/drivers/robot/driver.py's
+'                                                  "robot.connected" log line,
+'                                                  which surfaces this automatically
+'                                                  on every connect)
 '   HOME                 -> OK HOME              (ensures pipette up, lifts, always ends
 '                                                  Righty at P0/right home -- if currently
 '                                                  Lefty, settles at left_home first, then
@@ -248,7 +254,13 @@ server_start:
         CP Off
 
         If Left$(cmd$, 6) = "STATUS" Then
-            Print #201, "OK READY"
+            ' Version tag appended so a redownload can be verified on the
+            ' spot (send STATUS, read the tag) instead of trusting that a
+            ' download-over-a-running-task actually replaced the code --
+            ' this exact class of mixup has cost real debugging time this
+            ' session more than once. BUMP THIS every time sort_server.prg
+            ' changes.
+            Print #201, "OK READY SORT_SERVER_VER=2026-08-27d"
 
         ElseIf Left$(cmd$, 4) = "HOME" Then
             ' Always ends Righty at P0 (right home). Real-hardware findings

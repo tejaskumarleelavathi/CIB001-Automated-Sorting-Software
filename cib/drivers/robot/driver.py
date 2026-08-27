@@ -139,7 +139,10 @@ class EpsonT3BDriver:
                 f"Robot STATUS returned unexpected response: {resp!r}\n"
                 "sort_server.prg must be running in RC+ (F5)."
             )
-        log.info("robot.connected", ip=self._ip, port=self._port)
+        # Surfaces sort_server.prg's version tag in the log automatically on
+        # every connect, so a stale download-over-a-running-task shows up
+        # immediately instead of needing a manual STATUS query to catch.
+        log.info("robot.connected", ip=self._ip, port=self._port, controller_response=resp)
 
     async def disconnect(self) -> None:
         loop = asyncio.get_running_loop()
