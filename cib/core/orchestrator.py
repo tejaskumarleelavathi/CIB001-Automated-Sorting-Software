@@ -239,6 +239,12 @@ class Orchestrator:
         self._station_order: list[int] = []
         self._current_station_idx = 0
         self._current_well_idx = 0
+        # Which hand the robot is ACTUALLY, physically in right now --
+        # updated only by _home_right()/_home_left() (the sole two places
+        # that ever change it), never derived/guessed. "right" is correct
+        # at construction time because _startup() always homes Righty
+        # unconditionally, regardless of which stations get selected.
+        self._current_physical_side: str = "right"
 
         # ── Data layer (SQLite + per-run CSV) ──────────────────────────
         # field_code/default_plate_id are placeholders until the real
@@ -432,7 +438,7 @@ class Orchestrator:
             # Send robot to safe park position immediately after connecting.
             # This lifts Z if the arm was left at imaging height by a previous
             # run, then moves to P0 (taught in RC+ Jog & Teach).
-            await d.robot.move_to_safe_park()
+            await self._home_right(d)
             log.info("orchestrator.robot_homed")
             # Turn backlight on immediately.
             # set_backlight(True) blocks until all LEDs are at full brightness (0.5s
@@ -656,7 +662,7 @@ class Orchestrator:
                     await self._cleanup_interrupted_attempt(reason="operator_abort")
                 sm.abort()
                 await d.lighting.set_backlight(False)
-                await d.robot.move_to_safe_park()
+                await self._home_right(d)
                 await d.plc.set_status_light(StatusLight.AMBER)
                 await d.plc.set_work_light(True)
                 await self._close_run(RunStatus.ABORTED)
@@ -838,7 +844,7 @@ class Orchestrator:
         """
         self._sm.cycle_complete()
         await d.lighting.set_backlight(False)
-        await d.robot.move_to_safe_park()
+        await self._home_right(d)
         await d.plc.set_status_light(StatusLight.AMBER)
         await d.plc.set_work_light(True)
         log.info("orchestrator.stopped")
@@ -954,7 +960,7 @@ class Orchestrator:
         # Home the robot — Z retracts before XY, so always safe
         homed = False
         try:
-            await d.robot.move_to_safe_park()
+            await self._home_right(d)
             homed = True
             log.info("orchestrator.safe_recovery_homed", from_phase=phase.name)
         except Exception as exc:
@@ -1000,7 +1006,7 @@ class Orchestrator:
                     self._current_pick.timestamp_end = datetime.now()
                     await self._csv_append(self._current_pick)
             self._cycle_phase = CyclePhase.ROBOT_PARKING
-            await d.robot.move_to_safe_park()
+            await self._home_right(d)
         except Exception as exc:
             log.error(
                 "orchestrator.interrupted_specimen_delivery_failed",
@@ -1369,6 +1375,16 @@ class Orchestrator:
         log.info("cycle.start", preselected=preselected_target is not None)
 
         try:
+            # Correct the robot's physical hand BEFORE any overhead capture
+            # if it doesn't already match what this cycle's station needs
+            # (2026-08-27 real-hardware finding -- see
+            # _ensure_physical_hand_for_next_pick's docstring: this is a
+            # cheap no-op except right at the start of a run whose first
+            # selected station is on the left side, where it closes a real
+            # gap -- _startup() always homes Righty regardless of which
+            # stations were selected).
+            await self._ensure_physical_hand_for_next_pick(d)
+
             if preselected_target is not None:
                 target_x, target_y, all_centroids = preselected_target
                 log.info("cycle.using_preselected_target",
@@ -1663,7 +1679,7 @@ class Orchestrator:
                 # go home, same as the original single-candidate reject path.
                 self._cycle_phase = CyclePhase.ROBOT_PARKING
                 with self._time_step("robot_park"):
-                    await d.robot.move_to_safe_park()
+                    await self._home_right(d)
                 log.info("orchestrator.robot_returning_backlight_already_on")
                 self._log_timing_summary("eoa_reject")
                 if stopping:
@@ -1829,7 +1845,7 @@ class Orchestrator:
                 # lookahead result to consult here (none was fired above).
                 self._cycle_phase = CyclePhase.ROBOT_PARKING   # crossing to a home, same phase family as parking
                 with self._time_step("robot_cross_to_left"):
-                    await d.robot.go_home_left()
+                    await self._home_left(d)
                 log.info("cycle.side_switched", new_side="left")
                 self._log_timing_summary("success")
                 if stopping:
@@ -1864,7 +1880,16 @@ class Orchestrator:
             else:
                 self._cycle_phase = CyclePhase.ROBOT_PARKING
                 with self._time_step("robot_park"):
-                    await d.robot.move_to_safe_park()
+                    # Park matching whichever side is currently active --
+                    # not always right. When stopping, _finish_stop() below
+                    # homes Righty regardless anyway, so it doesn't matter
+                    # here; when continuing on the left side with no
+                    # lookahead result, parking Righty would just force an
+                    # unnecessary swing back left on the very next cycle.
+                    if stopping or self._current_station_side() == "right":
+                        await self._home_right(d)
+                    else:
+                        await self._home_left(d)
                 log.info("orchestrator.robot_returning_backlight_already_on")
                 self._log_timing_summary("success")
 
@@ -2234,6 +2259,58 @@ class Orchestrator:
     def _current_hand(self) -> str:
         """"L" or "R" -- whichever hand _current_station_side() currently is."""
         return "L" if self._current_station_side() == "left" else "R"
+
+    async def _home_right(self, d: DriverSet) -> None:
+        """
+        Send HOME (always ends Righty) and record that the robot is
+        physically Righty now. The ONLY thing that should ever set
+        self._current_physical_side = "right" -- every existing
+        move_to_safe_park() call site in this file goes through here
+        instead, so the tracking can never drift from reality.
+        """
+        await d.robot.move_to_safe_park()
+        self._current_physical_side = "right"
+
+    async def _home_left(self, d: DriverSet) -> None:
+        """
+        Send GO_HOME_LEFT (always ends Lefty) and record that the robot
+        is physically Lefty now. The ONLY thing that should ever set
+        self._current_physical_side = "left".
+        """
+        await d.robot.go_home_left()
+        self._current_physical_side = "left"
+
+    async def _ensure_physical_hand_for_next_pick(self, d: DriverSet) -> None:
+        """
+        Cross hands FIRST if the robot's actual physical side doesn't
+        match what the sequencer needs for the upcoming pick.
+
+        Closes a real gap (2026-08-27, found via real-hardware testing):
+        _startup() always homes Righty unconditionally, no matter which
+        stations were selected. The explicit GO_HOME_LEFT crossing is
+        normally inserted by _get_next_well_coords()'s side_switch signal
+        -- but that only fires on a TRANSITION between stations mid-run.
+        If the very FIRST selected station of a run is on the left side
+        (e.g. only Station 3 selected, no right-side stations at all),
+        there is no such transition to trigger it -- the sequencer
+        correctly computes hand="L" for the very first pick, but nothing
+        ever told the robot to actually get there, so it was trying to
+        reach a left-side target directly from right_home in one bare
+        command instead of the proven settle-then-sweep crossing.
+        Called at the top of _run_cycle(), before overhead capture --
+        cheap no-op on every cycle where the sides already match (the
+        overwhelming majority: same-side continuation, or already
+        correctly positioned by a prior side_switch crossing).
+        """
+        needed = self._current_station_side()
+        if needed == self._current_physical_side:
+            return
+        log.info("cycle.correcting_physical_hand",
+                 current=self._current_physical_side, needed=needed)
+        if needed == "left":
+            await self._home_left(d)
+        else:
+            await self._home_right(d)
 
     def _select_quadrant_u(self, target_y: float) -> float | None:
         """
