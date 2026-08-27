@@ -29,13 +29,18 @@ THREADING NOTE:
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFrame, QApplication,
+    QCheckBox, QFileDialog,
 )
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QCloseEvent, QFont
 
+from cib.config.loader import PlateConfig, load_all_stations
+from cib.config.validator import ConfigValidationError
 from cib.core.state_machine import State
 
 
@@ -63,6 +68,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._orchestrator = orchestrator
         self._capture_count = 0
+        # Loaded from the plate-stations Excel upload (see _on_load_stations) --
+        # {station_number: PlateConfig}. Empty until the operator loads a file.
+        self._loaded_stations: dict[int, PlateConfig] = {}
+        self._station_checkboxes: dict[int, QCheckBox] = {}
 
         self.setWindowTitle("CIB Automated Sorting Cell")
         self.setMinimumSize(480, 430)
@@ -108,6 +117,28 @@ class MainWindow(QMainWindow):
             "border-radius: 6px; background-color: #7f8c8d; color: white; padding: 4px;"
         )
         outer.addWidget(self._state_label)
+
+        outer.addSpacing(8)
+
+        # ── Plate stations config ───────────────────────────────────────
+        # Excel upload (one "Station N" sheet per physical nest) + a
+        # checkbox per discovered station so the operator can select which
+        # ones to fill this run — only meaningful while IDLE, before START
+        # (see Orchestrator.configure_stations()).
+        stations_row = QHBoxLayout()
+        self._stations_path_label = QLabel("No plate stations file loaded")
+        self._stations_path_label.setWordWrap(True)
+        _apply_font(self._stations_path_label, size=9)
+        self._stations_path_label.setStyleSheet("color: #7f8c8d;")
+        stations_row.addWidget(self._stations_path_label, 1)
+
+        self._load_stations_btn = QPushButton("Load Plate Stations…")
+        self._load_stations_btn.clicked.connect(self._on_load_stations)
+        stations_row.addWidget(self._load_stations_btn)
+        outer.addLayout(stations_row)
+
+        self._stations_checkbox_row = QHBoxLayout()
+        outer.addLayout(self._stations_checkbox_row)
 
         outer.addSpacing(8)
 
@@ -234,6 +265,47 @@ class MainWindow(QMainWindow):
     def _on_abort(self) -> None:
         self._orchestrator.operator_abort()
 
+    def _on_load_stations(self) -> None:
+        path_str, _ = QFileDialog.getOpenFileName(
+            self, "Select plate stations workbook", "", "Excel Files (*.xlsx)"
+        )
+        if not path_str:
+            return
+        try:
+            stations = load_all_stations(Path(path_str))
+        except (FileNotFoundError, ConfigValidationError) as exc:
+            self._stations_path_label.setText(f"Failed to load: {exc}")
+            self._stations_path_label.setStyleSheet("color: #c0392b;")
+            return
+        self._loaded_stations = stations
+        self._stations_path_label.setText(
+            f"Loaded: {Path(path_str).name} ({len(stations)} station(s))"
+        )
+        self._stations_path_label.setStyleSheet("color: #7f8c8d;")
+        self._rebuild_station_checkboxes()
+
+    def _rebuild_station_checkboxes(self) -> None:
+        while self._stations_checkbox_row.count():
+            item = self._stations_checkbox_row.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._station_checkboxes = {}
+        for num in sorted(self._loaded_stations.keys()):
+            cb = QCheckBox(f"Station {num}")
+            cb.setChecked(True)
+            cb.stateChanged.connect(self._on_station_selection_changed)
+            self._stations_checkbox_row.addWidget(cb)
+            self._station_checkboxes[num] = cb
+        self._on_station_selection_changed()
+
+    def _on_station_selection_changed(self, *_args) -> None:
+        selected = {
+            num: cfg for num, cfg in self._loaded_stations.items()
+            if self._station_checkboxes[num].isChecked()
+        }
+        self._orchestrator.operator_configure_stations(selected)
+
     def _on_shutdown(self) -> None:
         """
         Clean shutdown: tell orchestrator to disconnect all hardware (sends
@@ -278,6 +350,12 @@ class MainWindow(QMainWindow):
 
         # Button enable logic
         self._start_btn.setEnabled(state == State.IDLE)
+        # Station selection only takes effect while IDLE, before START (see
+        # Orchestrator.configure_stations()) -- disable the controls outside
+        # that window so it's clear a change wouldn't apply.
+        self._load_stations_btn.setEnabled(state == State.IDLE)
+        for cb in self._station_checkboxes.values():
+            cb.setEnabled(state == State.IDLE)
         self._stop_btn.setEnabled(state in {State.RUNNING, State.CYCLE_STOPPING})
         # CONTINUE: clears E_STOP only once the FULL hardware reset sequence
         # has physically completed (button released AND blue reset button

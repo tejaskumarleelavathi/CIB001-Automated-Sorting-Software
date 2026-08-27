@@ -168,7 +168,7 @@ class TestSpecimenInTransitRecovery:
         await _to_running(orch)
 
         # Simulate: cycle had already aspirated a specimen when the fault hit.
-        orch._pending_well = (150.0, 200.0, 45.0, "B3", None)
+        orch._pending_well = (150.0, 200.0, 45.0, "B3", None, "R")
         await orch._drivers.robot.halt()
         orch._sm.safety_fault_estop()
         assert orch.state == State.E_STOP
@@ -199,7 +199,7 @@ class TestSpecimenInTransitRecovery:
         self, orch: Orchestrator,
     ) -> None:
         await _to_running(orch)
-        orch._pending_well = (10.0, 10.0, None, "A1", None)
+        orch._pending_well = (10.0, 10.0, None, "A1", None, "R")
         await orch._drivers.robot.halt()
         orch._state_before_fault = State.RUNNING   # normally set by _evaluate_safety()
         orch._sm.safety_fault_protective()
@@ -254,7 +254,7 @@ class TestSpecimenInTransitRecovery:
         NOT clear _pending_well (nothing was actually delivered).
         """
         await _to_running(orch)
-        orch._pending_well = (5.0, 5.0, None, "D1", None)
+        orch._pending_well = (5.0, 5.0, None, "D1", None, "R")
         await orch._drivers.robot.halt()
         orch._sm.safety_fault_estop()
 
@@ -291,7 +291,7 @@ class TestSpecimenInTransitRecovery:
         finish an already-in-flight delivery.
         """
         await _to_running(orch)
-        orch._pending_well = (77.0, 88.0, None, "C5", None)
+        orch._pending_well = (77.0, 88.0, None, "C5", None, "R")
         await orch._drivers.robot.halt()
         orch._sm.safety_fault_estop()
         assert orch.state == State.E_STOP
@@ -417,7 +417,7 @@ class TestInterruptedAttemptCleanup:
         """A specimen already in the pipette must be delivered, never deleted."""
         await _to_running(orch)
         pick, paths = self._make_interrupted_pick(orch, tmp_path)
-        orch._pending_well = (5.0, 5.0, None, "C5", pick.pick_id)   # now in transit
+        orch._pending_well = (5.0, 5.0, None, "C5", pick.pick_id, "R")   # now in transit
         await orch._drivers.robot.halt()
         orch._sm.safety_fault_estop()
 

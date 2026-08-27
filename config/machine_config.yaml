@@ -27,7 +27,15 @@ robot:
 plc:
   ip: "172.16.9.11"
   port: 502
-  poll_interval_ms: 100
+  # 100 -> 200ms (2026-08-27, real-hardware finding): reduces total Modbus
+  # traffic sharing the USB-Ethernet adapter with the robot/Flexi/cameras --
+  # contention from this + flexi polling was implicated in RC+ losing its
+  # own connection to the controller during slow robot moves (Epson error
+  # 1503/1504, "Communication disconnection... while executing a task").
+  # The hardware e-stop circuit itself is a hardwired safety loop, cut
+  # entirely independent of this software poll -- this only affects how
+  # fast the STATUS LIGHT/UI reacts, not the actual physical stop.
+  poll_interval_ms: 200
   unit_id: 1
   registers:
     status_light_mode: 0
@@ -44,7 +52,14 @@ plc:
 flexi:
   ip: "172.16.9.12"
   port: 502
-  poll_interval_ms: 100
+  # 100 -> 200ms (2026-08-27) -- see plc.poll_interval_ms comment above,
+  # same reasoning. IMPORTANT: the physical e-stop/light-curtain SAFETY
+  # CIRCUIT is a hardwired loop that cuts robot power instantly, entirely
+  # independent of this poll -- this interval only governs how fast the
+  # SOFTWARE (state machine, status light, UI) reacts/logs the event
+  # after the hardware has already stopped everything. 200ms is still a
+  # fast software reaction, just less network traffic than 100ms.
+  poll_interval_ms: 200
   unit_id: 1
   registers:
     # Address 256 = live process I/O (25 registers). Address 2000 = static device status.
@@ -136,3 +151,33 @@ vision:
 logging:
   level: "INFO"
   retention_days: 30
+
+plate_stations:
+  # Multi-station Lefty/Righty sorting cycle (2026-08-26). Optional section --
+  # its absence disables multi-station mode entirely (MachineConfig.plate_stations
+  # is None), falling back to the original single-plate/Righty-only cycle.
+  #
+  # right_home_u/left_home_u: the wrist U angle at right_home/left_home
+  # (measured on real hardware). DROP must ALWAYS use the current side's
+  # home U here -- never a quadrant-pick U below -- confirmed operator
+  # safety rule (see cib/core/orchestrator.py's drop-U handling).
+  right_home_u: 170.065
+  left_home_u: 200.023
+  # righty_top_u/righty_bottom_u match the existing robot.u_top_deg/
+  # u_bottom_deg above (same physical quadrants, same hand) -- duplicated
+  # here so all four quadrant U values live together with their Lefty
+  # counterparts. lefty_top_u/lefty_bottom_u measured via
+  # hardware_tests/test_quadrant_u_select.py (2026-08-26).
+  righty_top_u: 209.0
+  righty_bottom_u: 251.0
+  lefty_top_u: 177.718
+  lefty_bottom_u: 86.053
+  # Station number -> side. Side determines hand (Righty for "right",
+  # Lefty for "left"), which home the robot returns to between stations
+  # on the same side, and which quadrant U pair is used for picking.
+  # Matches config/plate_configs/plate_stations.xlsx's 4 sheets.
+  stations:
+    1: {side: right}
+    2: {side: right}
+    3: {side: left}
+    4: {side: left}

@@ -11,14 +11,21 @@ motion. Never call two methods concurrently.
 
 Commands used:
     STATUS              -> OK READY
-    HOME                -> OK HOME         (lift Z, go to home)
-    MOVE_IMAGE rx,ry    -> OK IMAGE_POSITION rx,ry   (XY + drop Z for EoA, holds current U)
-    MOVE_IMAGE_U rx,ry,u -> OK IMAGE_POSITION rx,ry  (same, but explicit U — quadrant selection)
-    PICK rx,ry          -> OK PICKED rx,ry           (pipette Tool 2, aspirate, holds current U)
-    PICK_U rx,ry,u      -> OK PICKED rx,ry           (same, but explicit U — quadrant selection)
-    DROP rx,ry          -> OK DROPPED rx,ry          (pipette Tool 2, dispense, holds current U)
-    DROP_U rx,ry,u      -> OK DROPPED rx,ry          (same, but explicit U — quadrant selection)
+    HOME                -> OK HOME         (lift Z, always ends Righty at right home)
+    GO_HOME_LEFT         -> OK GO_HOME_LEFT (lift Z, always ends Lefty at left home)
+    MOVE_IMAGE rx,ry    -> OK IMAGE_POSITION rx,ry   (XY + drop Z for EoA, holds current U/hand)
+    MOVE_IMAGE_U rx,ry,u,hand -> OK IMAGE_POSITION rx,ry  (explicit U + hand — quadrant selection)
+    PICK rx,ry          -> OK PICKED rx,ry           (pipette Tool 2, aspirate, holds current U/hand)
+    PICK_U rx,ry,u,hand -> OK PICKED rx,ry           (explicit U + hand — quadrant selection)
+    DROP rx,ry          -> OK DROPPED rx,ry          (pipette Tool 2, dispense, holds current U/hand)
+    DROP_U rx,ry,u,hand -> OK DROPPED rx,ry          (explicit U + hand — always the current
+                                                       side's HOME U, never a quadrant-pick U)
     BYE                 -> OK BYE
+
+hand is "L" or "R" — only meaningful on the *_U commands (the non-U
+variants hold whatever hand the arm is currently in, no hand field at
+all). Defaults to "R" everywhere below for backward compatibility with
+single-hand/Righty-only callers.
 """
 
 from __future__ import annotations
@@ -91,13 +98,27 @@ class EpsonT3BDriver:
         s.settimeout(self._connect_timeout)
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-        # TCP keepalive — OS sends ACK probes after 5s idle, every 2s.
+        # TCP keepalive — OS sends ACK probes after idle, every interval below.
         # Prevents the Epson controller's TCP stack from timing out the
         # connection during long overhead-capture + vision processing gaps.
+        # Idle threshold raised 5s -> 60s (2026-08-27 real-hardware finding):
+        # a slow (Speed 5/Accel 5,5, per operator request) HOME/GO_HOME_LEFT
+        # right_home<->left_home crossing can genuinely take longer than the
+        # old 5s-idle-then-probe / ~15-20s-total-before-giving-up window --
+        # Python's blocking _send() sits waiting the whole time with zero
+        # bytes flowing, so Windows' own OS-level keepalive was declaring the
+        # (perfectly healthy, just busy) connection dead and killing the
+        # socket underneath it -- no SPEL+ error ever fires, since nothing
+        # actually failed on the robot side. 60s comfortably covers any
+        # single motion command (matches MOTION_TIMEOUT_S's own 120s
+        # philosophy) while still catching a truly dead peer well within
+        # that -- the STATUS-based application-level keepalive loop already
+        # handles the "genuinely idle between commands" case in a few
+        # seconds regardless, this OS-level one is just a backstop.
         s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         try:
             # Windows: (enable, idle_ms before first probe, interval_ms)
-            s.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 5_000, 2_000))
+            s.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 60_000, 5_000))
         except (AttributeError, OSError):
             pass  # non-Windows or older Python — SO_KEEPALIVE above still applies
 
@@ -118,7 +139,10 @@ class EpsonT3BDriver:
                 f"Robot STATUS returned unexpected response: {resp!r}\n"
                 "sort_server.prg must be running in RC+ (F5)."
             )
-        log.info("robot.connected", ip=self._ip, port=self._port)
+        # Surfaces sort_server.prg's version tag in the log automatically on
+        # every connect, so a stale download-over-a-running-task shows up
+        # immediately instead of needing a manual STATUS query to catch.
+        log.info("robot.connected", ip=self._ip, port=self._port, controller_response=resp)
 
     async def disconnect(self) -> None:
         loop = asyncio.get_running_loop()
@@ -147,7 +171,9 @@ class EpsonT3BDriver:
     # Motion commands — called by orchestrator
     # ------------------------------------------------------------------
 
-    async def move_to_image_site(self, x: float, y: float, u: float | None = None) -> None:
+    async def move_to_image_site(
+        self, x: float, y: float, u: float | None = None, hand: str = "R",
+    ) -> None:
         """
         Move EoA camera above the specimen at (x, y) for imaging.
 
@@ -156,23 +182,28 @@ class EpsonT3BDriver:
           2. Move linearly down to (x, y, Z_IMAGING=-58.660) — EoA imaging height
 
         u: optional wrist angle (deg) for quadrant-based U selection. If given,
-        sends MOVE_IMAGE_U (explicit U). If None, sends MOVE_IMAGE (holds
-        whatever U the robot is currently at).
+        sends MOVE_IMAGE_U (explicit U + hand). If None, sends MOVE_IMAGE (holds
+        whatever U/hand the robot is currently at) — hand is ignored in that case.
+
+        hand: "L" or "R" — which side of the dish this quadrant U belongs to.
+        Only meaningful when u is given (the non-U command has no hand field).
 
         Blocks until robot is stationary at imaging height (robot sends response
         only after both moves complete). Then Python triggers camera capture.
         """
-        log.info("robot.move_to_image_site", x=x, y=y, u=u)
+        log.info("robot.move_to_image_site", x=x, y=y, u=u, hand=hand)
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
             None,
             self._move_image_sync,
-            x, y, u,
+            x, y, u, hand,
         )
 
-    def _move_image_sync(self, x: float, y: float, u: float | None = None) -> None:
+    def _move_image_sync(
+        self, x: float, y: float, u: float | None = None, hand: str = "R",
+    ) -> None:
         cmd = (
-            f"MOVE_IMAGE_U {x:.3f},{y:.3f},{u:.3f}"
+            f"MOVE_IMAGE_U {x:.3f},{y:.3f},{u:.3f},{hand}"
             if u is not None
             else f"MOVE_IMAGE {x:.3f},{y:.3f}"
         )
@@ -216,8 +247,33 @@ class EpsonT3BDriver:
             raise RuntimeError(f"HOME failed: {resp!r}")
         log.info("robot.at_home")
 
+    async def go_home_left(self) -> None:
+        """
+        Return robot to LEFT home position (Lefty hand) — mirrors
+        move_to_safe_park()/HOME above but for the left-side stations.
+        sort_server.prg's GO_HOME_LEFT lifts Z if needed and always ends
+        Lefty at left_home, using the same validated hand-crossing pattern
+        as HOME (settle at whichever home matches the current hand first,
+        then one continuous Go to cross).
+        """
+        log.info("robot.moving_to_home_left")
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._home_left_sync)
+
+    def _home_left_sync(self) -> None:
+        with self._cmd_lock:
+            try:
+                resp = self._send("GO_HOME_LEFT", timeout=self._motion_timeout)
+            except (ConnectionError, OSError) as exc:
+                log.warning("robot.reconnecting_after_drop", reason=str(exc))
+                self._reconnect_sync()
+                resp = self._send("GO_HOME_LEFT", timeout=self._motion_timeout)
+        if "OK GO_HOME_LEFT" not in resp:
+            raise RuntimeError(f"GO_HOME_LEFT failed: {resp!r}")
+        log.info("robot.at_home_left")
+
     async def execute_pick(
-        self, pick_x: float, pick_y: float, u: float | None = None,
+        self, pick_x: float, pick_y: float, u: float | None = None, hand: str = "R",
     ) -> None:
         """
         Aspirate the specimen at (pick_x, pick_y) using the pipette (Tool 2).
@@ -225,6 +281,8 @@ class EpsonT3BDriver:
 
         u: wrist angle for the PICK move (dish quadrant U — see
            cib/core/orchestrator.py _select_quadrant_u()).
+        hand: "L" or "R" — which hand this quadrant U belongs to. Only
+              meaningful when u is given.
 
         Split from execute_place() so the orchestrator can durably record
         "specimen is now in the pipette" the instant this returns — needed
@@ -232,12 +290,12 @@ class EpsonT3BDriver:
         the specimen on recovery instead of losing it or attempting a
         second pick on top of it.
         """
-        log.info("robot.execute_pick", pick_x=pick_x, pick_y=pick_y, u=u)
+        log.info("robot.execute_pick", pick_x=pick_x, pick_y=pick_y, u=u, hand=hand)
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._pick_sync, pick_x, pick_y, u)
+        await loop.run_in_executor(None, self._pick_sync, pick_x, pick_y, u, hand)
 
     async def execute_place(
-        self, well_x: float, well_y: float, well_u: float | None = None,
+        self, well_x: float, well_y: float, well_u: float | None = None, hand: str = "R",
     ) -> None:
         """
         Travel to (well_x, well_y) and dispense the specimen currently held
@@ -248,14 +306,19 @@ class EpsonT3BDriver:
                 certainly needing a different U — do NOT reuse the pick's u
                 here. None falls back to holding whatever U the arm is
                 already at (rarely correct once a real plate config is wired in).
+                Caller must always pass the current side's HOME U here (never
+                a quadrant-pick U) — hard safety rule, see
+                cib/core/orchestrator.py's drop-U handling.
+        hand: "L" or "R" — which side's plate station this is. Only
+              meaningful when well_u is given.
         """
-        log.info("robot.execute_place", well_x=well_x, well_y=well_y, well_u=well_u)
+        log.info("robot.execute_place", well_x=well_x, well_y=well_y, well_u=well_u, hand=hand)
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._drop_sync, well_x, well_y, well_u)
+        await loop.run_in_executor(None, self._drop_sync, well_x, well_y, well_u, hand)
 
-    def _pick_sync(self, x: float, y: float, u: float | None = None) -> None:
+    def _pick_sync(self, x: float, y: float, u: float | None = None, hand: str = "R") -> None:
         cmd = (
-            f"PICK_U {x:.3f},{y:.3f},{u:.3f}"
+            f"PICK_U {x:.3f},{y:.3f},{u:.3f},{hand}"
             if u is not None
             else f"PICK {x:.3f},{y:.3f}"
         )
@@ -270,9 +333,9 @@ class EpsonT3BDriver:
             raise RuntimeError(f"PICK failed: {resp!r}")
         log.info("robot.pick_complete", response=resp)
 
-    def _drop_sync(self, x: float, y: float, u: float | None = None) -> None:
+    def _drop_sync(self, x: float, y: float, u: float | None = None, hand: str = "R") -> None:
         cmd = (
-            f"DROP_U {x:.3f},{y:.3f},{u:.3f}"
+            f"DROP_U {x:.3f},{y:.3f},{u:.3f},{hand}"
             if u is not None
             else f"DROP {x:.3f},{y:.3f}"
         )

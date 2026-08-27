@@ -34,18 +34,24 @@ class MockRobotDriver:
     async def is_ready(self) -> bool:
         return self._connected and not self._halted
 
-    async def move_to_image_site(self, x: float, y: float, u: float | None = None) -> None:
-        log.info("mock_robot.move_to_image_site", x=x, y=y, u=u)
+    async def move_to_image_site(
+        self, x: float, y: float, u: float | None = None, hand: str = "R",
+    ) -> None:
+        log.info("mock_robot.move_to_image_site", x=x, y=y, u=u, hand=hand)
         await asyncio.sleep(MOCK_MOVE_SECONDS)
         log.info("mock_robot.in_position")
 
-    async def execute_pick(self, pick_x: float, pick_y: float, u: float | None = None) -> None:
-        log.info("mock_robot.pick_start", pick_x=pick_x, pick_y=pick_y, u=u)
+    async def execute_pick(
+        self, pick_x: float, pick_y: float, u: float | None = None, hand: str = "R",
+    ) -> None:
+        log.info("mock_robot.pick_start", pick_x=pick_x, pick_y=pick_y, u=u, hand=hand)
         await asyncio.sleep(MOCK_PICK_SECONDS)
         log.info("mock_robot.pick_complete")
 
-    async def execute_place(self, well_x: float, well_y: float, well_u: float | None = None) -> None:
-        log.info("mock_robot.place_start", well_x=well_x, well_y=well_y, well_u=well_u)
+    async def execute_place(
+        self, well_x: float, well_y: float, well_u: float | None = None, hand: str = "R",
+    ) -> None:
+        log.info("mock_robot.place_start", well_x=well_x, well_y=well_y, well_u=well_u, hand=hand)
         await asyncio.sleep(MOCK_PICK_SECONDS)
         log.info("mock_robot.place_complete")
 
@@ -53,6 +59,11 @@ class MockRobotDriver:
         log.info("mock_robot.parking")
         await asyncio.sleep(MOCK_MOVE_SECONDS)
         log.info("mock_robot.parked")
+
+    async def go_home_left(self) -> None:
+        log.info("mock_robot.parking_left")
+        await asyncio.sleep(MOCK_MOVE_SECONDS)
+        log.info("mock_robot.parked_left")
 
     async def ring_light_on(self) -> None:
         log.info("mock_robot.ring_light_on")

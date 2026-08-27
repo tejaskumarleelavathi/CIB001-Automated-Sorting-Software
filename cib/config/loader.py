@@ -2,12 +2,16 @@
 cib/config/loader.py — Load and parse machine config (YAML) and plate config (Excel).
 
 Usage:
-    from cib.config.loader import load_machine_config, load_plate_config
+    from cib.config.loader import load_machine_config, load_plate_config, load_all_stations
 
     machine = load_machine_config()                      # reads default path
     machine = load_machine_config(Path("custom.yaml"))  # or a custom path
 
     plate = load_plate_config(Path(r"C:\LabAutomation\config\plate_configs\96well.xlsx"))
+
+    # Multi-station workbook (one "Station N" sheet per physical nest):
+    stations = load_all_stations(Path("config/plate_configs/plate_stations.xlsx"))
+    # -> {1: PlateConfig(...), 2: PlateConfig(...), ...}
 
 Both functions return typed dataclass objects. Validators run automatically —
 ConfigValidationError is raised if anything is wrong.
@@ -17,7 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import yaml
 import openpyxl
@@ -181,6 +185,32 @@ class LoggingConfig:
 
 
 @dataclass
+class PlateStationsConfig:
+    """
+    Per-side home/quadrant U angles plus the station->side mapping, for the
+    multi-station Lefty/Righty sorting cycle. Optional -- absent from
+    machine_config.yaml entirely means the single-plate, Righty-only cycle
+    (MachineConfig.plate_stations is None).
+    """
+    right_home_u:    float
+    left_home_u:     float
+    righty_top_u:    float
+    righty_bottom_u: float
+    lefty_top_u:     float
+    lefty_bottom_u:  float
+    stations:        Dict[int, str]   # station number -> "right" | "left"
+
+    def side_of(self, station: int) -> str:
+        side = self.stations.get(station)
+        if side is None:
+            raise ConfigValidationError(
+                f"Station {station} has no 'side' configured in "
+                f"machine_config.yaml's plate_stations.stations section."
+            )
+        return side
+
+
+@dataclass
 class MachineConfig:
     robot:           RobotConfig
     plc:             PLCConfig
@@ -193,6 +223,7 @@ class MachineConfig:
     paths:           PathsConfig
     vision:          VisionConfig
     logging:         LoggingConfig
+    plate_stations:  Optional[PlateStationsConfig] = None
 
 
 # ── Loaders ───────────────────────────────────────────────────────────────────
@@ -239,6 +270,45 @@ def load_plate_config(path: Path) -> PlateConfig:
     return PlateConfig(source_file=path.name, wells=wells)
 
 
+def load_all_stations(path: Path) -> Dict[int, PlateConfig]:
+    """
+    Load a multi-sheet plate-stations workbook (one "Station N" sheet per
+    physical nest, e.g. config/plate_configs/plate_stations.xlsx) into
+    {station_number: PlateConfig}. Same well/x/y/... column schema as
+    load_plate_config's single-sheet files -- one sheet per station instead
+    of one file per plate. Sheets not named "Station <int>" are ignored.
+    Raises ConfigValidationError if no station sheets with data are found,
+    or if any sheet's rows fail the normal plate-row validation.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Plate stations config not found: {path}")
+
+    wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
+    stations: Dict[int, PlateConfig] = {}
+    for sheet_name in wb.sheetnames:
+        if not sheet_name.startswith("Station "):
+            continue
+        try:
+            station_num = int(sheet_name.split(" ")[1])
+        except (IndexError, ValueError):
+            continue
+        rows = _rows_from_sheet(wb[sheet_name])
+        if not rows:
+            continue
+        source = f"{path.name}:{sheet_name}"
+        validate_plate_rows(rows, source=source)
+        wells = [_parse_well_row(r) for r in rows]
+        stations[station_num] = PlateConfig(source_file=source, wells=wells)
+    wb.close()
+
+    if not stations:
+        raise ConfigValidationError(
+            f"{path.name}: no 'Station N' sheets found with data."
+        )
+    return stations
+
+
 def list_plate_configs(config_dir: Path) -> List[Path]:
     """
     Return all .xlsx files in the plate config directory, sorted by name.
@@ -254,27 +324,33 @@ def list_plate_configs(config_dir: Path) -> List[Path]:
 
 def _read_excel(path: Path) -> list[dict]:
     """
-    Read an Excel file and return rows as a list of dicts with normalised keys.
-    First row is treated as the header. Column names are lowercased and stripped.
+    Read an Excel file's active sheet and return rows as a list of dicts
+    with normalised keys. First row is treated as the header.
     """
     wb = openpyxl.load_workbook(str(path), read_only=True, data_only=True)
-    ws = wb.active
+    result = _rows_from_sheet(wb.active)
+    wb.close()
+    return result
 
+
+def _rows_from_sheet(ws) -> list[dict]:
+    """
+    Shared by _read_excel (single-plate files) and load_all_stations
+    (multi-sheet plate-stations workbook). First row is treated as the
+    header, normalised to lowercase stripped strings. Blank rows skipped.
+    """
     rows = list(ws.iter_rows(values_only=True))
     if not rows:
         return []
 
-    # First row = header — normalise to lowercase stripped strings
     headers = [str(h).strip().lower() if h is not None else "" for h in rows[0]]
 
     result = []
     for row in rows[1:]:
-        # Skip entirely blank rows
         if all(cell is None or str(cell).strip() == "" for cell in row):
             continue
         result.append({headers[i]: row[i] for i in range(len(headers))})
 
-    wb.close()
     return result
 
 
@@ -308,6 +384,7 @@ def _parse_machine_config(raw: dict) -> MachineConfig:
     pa = raw["paths"]
     vi = raw["vision"]
     lo = raw["logging"]
+    ps = raw.get("plate_stations")
 
     return MachineConfig(
         robot=RobotConfig(
@@ -396,5 +473,17 @@ def _parse_machine_config(raw: dict) -> MachineConfig:
         logging=LoggingConfig(
             level=lo.get("level", "INFO"),
             retention_days=int(lo.get("retention_days", 30)),
+        ),
+        plate_stations=(
+            PlateStationsConfig(
+                right_home_u=float(ps["right_home_u"]),
+                left_home_u=float(ps["left_home_u"]),
+                righty_top_u=float(ps["righty_top_u"]),
+                righty_bottom_u=float(ps["righty_bottom_u"]),
+                lefty_top_u=float(ps["lefty_top_u"]),
+                lefty_bottom_u=float(ps["lefty_bottom_u"]),
+                stations={int(k): str(v["side"]) for k, v in ps["stations"].items()},
+            )
+            if ps is not None else None
         ),
     )

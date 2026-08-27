@@ -25,7 +25,7 @@ from typing import Any, Callable
 
 import structlog
 
-from cib.config.loader import PlateConfig
+from cib.config.loader import PlateConfig, PlateStationsConfig
 from cib.data.database import Database
 from cib.data.storage import RunStorage
 from cib.data.models import (
@@ -46,6 +46,7 @@ from cib.core.events import (
     CameraID,
     OperatorAbortEvent,
     OperatorAcknowledgeEvent,
+    OperatorConfigureStationsEvent,
     OperatorShutdownEvent,
     OperatorStartEvent,
     OperatorStopEvent,
@@ -154,6 +155,7 @@ class Orchestrator:
         u_bottom_deg: float | None = None,
         plate_config: PlateConfig | None = None,
         plate_u: float | None = None,
+        plate_stations_cfg: PlateStationsConfig | None = None,
         db_path: Path | None = None,
         runs_base_dir: Path | None = None,
         field_code: str = "DEV",
@@ -223,6 +225,26 @@ class Orchestrator:
         self._plate_config = plate_config
         self._plate_u = plate_u
         self._next_well_index = 0
+        # Multi-station Lefty/Righty sequencing (2026-08-26) -- see
+        # configure_stations()/_get_next_well_coords()/_stations_exhausted().
+        # plate_stations_cfg (home U's, quadrant U's, station->side map) comes
+        # from machine_config.yaml, loaded once at startup regardless of which
+        # stations get selected for any given run. _selected_stations/
+        # _station_order are populated per-run by configure_stations(),
+        # called by the operator (via the UI) before pressing START.
+        # _station_order empty = multi-station mode is off -- every method
+        # below falls back to the original single-plate/Righty-only behavior.
+        self._plate_stations_cfg = plate_stations_cfg
+        self._selected_stations: dict[int, PlateConfig] = {}
+        self._station_order: list[int] = []
+        self._current_station_idx = 0
+        self._current_well_idx = 0
+        # Which hand the robot is ACTUALLY, physically in right now --
+        # updated only by _home_right()/_home_left() (the sole two places
+        # that ever change it), never derived/guessed. "right" is correct
+        # at construction time because _startup() always homes Righty
+        # unconditionally, regardless of which stations get selected.
+        self._current_physical_side: str = "right"
 
         # ── Data layer (SQLite + per-run CSV) ──────────────────────────
         # field_code/default_plate_id are placeholders until the real
@@ -240,8 +262,8 @@ class Orchestrator:
         # fault interrupts the cycle while this is set, recovery MUST
         # deliver this specimen to (well_x, well_y, well_u) before doing
         # anything else — never lose it, never start a new pick on top of it.
-        # Tuple: (well_x, well_y, well_u, well_label, pick_id)
-        self._pending_well: tuple[float, float, float | None, str, int | None] | None = None
+        # Tuple: (well_x, well_y, well_u, well_label, pick_id, hand)
+        self._pending_well: tuple[float, float, float | None, str, int | None, str] | None = None
         # DB row id of the currently-open (uncleared) safety event, if any.
         self._current_safety_event_id: int | None = None
         # What state we were in right before a safety fault interrupted us —
@@ -294,6 +316,41 @@ class Orchestrator:
     def operator_acknowledge(self) -> None:
         """After e-stop reset or protective stop — resume."""
         self._put_event(OperatorAcknowledgeEvent())
+
+    def configure_stations(self, selected: dict[int, PlateConfig]) -> None:
+        """
+        Set which stations (by number) the NEXT run should fill, from the
+        operator's Excel upload + checkbox selection (see
+        OperatorConfigureStationsEvent / operator_configure_stations()).
+
+        Builds self._station_order as right-side stations first (ascending
+        by number), then left-side stations (ascending) -- per the
+        operator's explicit one-way requirement: finish every selected
+        right-side station completely before ever switching to the left
+        side, never interleaved, never switching back. Resets the
+        sequencer cursor (_current_station_idx/_current_well_idx) and
+        _current_side to match the first station in that order.
+
+        Only meaningful while IDLE, before START -- like _next_well_index,
+        this cursor is a per-run thing; call again to reconfigure between
+        runs. Raises RuntimeError if machine_config.yaml has no
+        plate_stations section (multi-station mode not configured at all).
+        """
+        if self._plate_stations_cfg is None:
+            raise RuntimeError(
+                "configure_stations() called but machine_config.yaml has no "
+                "plate_stations section -- multi-station mode is not available."
+            )
+        self._selected_stations = dict(selected)
+        right = sorted(n for n in selected if self._plate_stations_cfg.side_of(n) == "right")
+        left = sorted(n for n in selected if self._plate_stations_cfg.side_of(n) == "left")
+        self._station_order = right + left
+        self._current_station_idx = 0
+        self._current_well_idx = 0
+        log.info("orchestrator.stations_configured", order=self._station_order)
+
+    def operator_configure_stations(self, selected: dict[int, PlateConfig]) -> None:
+        self._put_event(OperatorConfigureStationsEvent(selected=selected))
 
     def operator_shutdown(self) -> None:
         """
@@ -363,31 +420,48 @@ class Orchestrator:
         log.info("orchestrator.connecting_devices")
         d = self._drivers
         try:
-            # Connect cameras, lighting, safety and PLC first — GigE camera
-            # discovery takes ~6 seconds. Robot is connected AFTER so it is
-            # never left idle on the TCP socket while we wait for cameras.
-            # The Epson controller resets idle connections after a few seconds.
+            # Connect the fast, safety-critical devices first (Flexi, PLC,
+            # pump, lighting -- none of these do multi-second discovery).
+            # Cameras deliberately NOT connected yet -- see below.
             await asyncio.gather(
                 d.safety.connect(),
                 d.plc.connect(),
                 d.pump.connect(),
-                d.camera_overhead.connect(),
-                d.camera_eoa.connect(),
                 d.lighting.connect(),
             )
-            # Connect robot now — cameras are ready so we immediately follow
-            # up with motion commands and keep the connection active.
+            # Connect robot now and home it IMMEDIATELY, before cameras ever
+            # touch the network (2026-08-27 real-hardware finding). GigE
+            # camera discovery/connect takes ~6s and is chatty (GVCP
+            # broadcast discovery, parameter negotiation) on the same
+            # shared USB-Ethernet adapter Flexi/PLC/robot all use -- with
+            # cameras connecting concurrently, that traffic was contending
+            # with this exact HOME call, occasionally starving RC+'s own
+            # link to the controller long enough to trip a real
+            # "Communication disconnection detected" (Epson error
+            # 1503/1504 -- disconnection while executing a task) and abort
+            # the move mid-motion. Robot still never sits idle waiting
+            # (the original reason cameras were connected first) -- it
+            # gets a command the instant it connects, same as before.
             await d.robot.connect()
             # Send robot to safe park position immediately after connecting.
             # This lifts Z if the arm was left at imaging height by a previous
             # run, then moves to P0 (taught in RC+ Jog & Teach).
-            await d.robot.move_to_safe_park()
+            await self._home_right(d)
             log.info("orchestrator.robot_homed")
             # Turn backlight on immediately.
             # set_backlight(True) blocks until all LEDs are at full brightness (0.5s
             # stabilisation built into the driver) — no extra sleep needed here.
             await d.lighting.set_backlight(True)
             log.info("orchestrator.backlight_on")
+
+            # NOW connect cameras -- robot's one guaranteed-solo move is
+            # already done, so their ~6s chatty discovery no longer has
+            # anything time-critical to contend with.
+            await asyncio.gather(
+                d.camera_overhead.connect(),
+                d.camera_eoa.connect(),
+            )
+            log.info("orchestrator.cameras_connected")
             # Ring light — skipped until digital output 12 is confirmed wired
             # in RC+ 7.0. Sending RING_ON when output 12 is not configured
             # causes sort_server.prg's On 12 to block ~5s then throw a SPEL+
@@ -548,6 +622,14 @@ class Orchestrator:
                     if not self._cycle_active:
                         asyncio.create_task(self._run_cycle())
 
+            case OperatorConfigureStationsEvent(selected=selected):
+                if sm.current == State.IDLE:
+                    self.configure_stations(selected)
+                else:
+                    log.warning("orchestrator.configure_stations_ignored",
+                                state=sm.current.value,
+                                note="station selection can only change while IDLE, before START")
+
             case OperatorStopEvent():
                 if sm.is_running():
                     sm.cycle_stop()
@@ -597,7 +679,7 @@ class Orchestrator:
                     await self._cleanup_interrupted_attempt(reason="operator_abort")
                 sm.abort()
                 await d.lighting.set_backlight(False)
-                await d.robot.move_to_safe_park()
+                await self._home_right(d)
                 await d.plc.set_status_light(StatusLight.AMBER)
                 await d.plc.set_work_light(True)
                 await self._close_run(RunStatus.ABORTED)
@@ -779,7 +861,7 @@ class Orchestrator:
         """
         self._sm.cycle_complete()
         await d.lighting.set_backlight(False)
-        await d.robot.move_to_safe_park()
+        await self._home_right(d)
         await d.plc.set_status_light(StatusLight.AMBER)
         await d.plc.set_work_light(True)
         log.info("orchestrator.stopped")
@@ -895,7 +977,7 @@ class Orchestrator:
         # Home the robot — Z retracts before XY, so always safe
         homed = False
         try:
-            await d.robot.move_to_safe_park()
+            await self._home_right(d)
             homed = True
             log.info("orchestrator.safe_recovery_homed", from_phase=phase.name)
         except Exception as exc:
@@ -925,14 +1007,14 @@ class Orchestrator:
         if self._pending_well is None:
             return
         d = self._drivers
-        well_x, well_y, well_u, well_label, pick_id = self._pending_well
+        well_x, well_y, well_u, well_label, pick_id, hand = self._pending_well
         log.warning("orchestrator.delivering_interrupted_specimen",
-                    well=well_label, well_xy=f"({well_x:.1f}, {well_y:.1f})")
+                    well=well_label, well_xy=f"({well_x:.1f}, {well_y:.1f})", hand=hand)
         try:
             self._cycle_phase = CyclePhase.PUMP_DISPENSING
             if pick_id is not None:
                 await self._db_update_pick_status(pick_id, PickStatus.DISPENSING)
-            await d.robot.execute_place(well_x, well_y, well_u)
+            await d.robot.execute_place(well_x, well_y, well_u, hand=hand)
             log.info("orchestrator.interrupted_specimen_delivered", well=well_label)
             if pick_id is not None:
                 await self._db_finish_pick(pick_id, PickResult.SUCCESS)
@@ -941,7 +1023,7 @@ class Orchestrator:
                     self._current_pick.timestamp_end = datetime.now()
                     await self._csv_append(self._current_pick)
             self._cycle_phase = CyclePhase.ROBOT_PARKING
-            await d.robot.move_to_safe_park()
+            await self._home_right(d)
         except Exception as exc:
             log.error(
                 "orchestrator.interrupted_specimen_delivery_failed",
@@ -1287,6 +1369,20 @@ class Orchestrator:
         if self._cycle_active:
             return   # don't stack concurrent cycles
 
+        if self._stations_exhausted():
+            # Every selected station's every well is already filled — no
+            # point capturing/picking with nowhere left to drop. Unlike the
+            # "no bugs visible right now" case below (which retries after a
+            # short sleep), this is permanent for the rest of this run —
+            # finish gracefully, same as an operator-pressed STOP, which
+            # also returns the robot to right home (Phase 0's hand-aware
+            # HOME, already validated).
+            log.info("cycle.all_stations_complete")
+            if self._sm.is_running():
+                self._sm.cycle_stop()
+            await self._finish_stop(self._drivers)
+            return
+
         self._cycle_active = True
         self._cycle_phase = CyclePhase.OVERHEAD_CAPTURE
         self._cycle_image_paths = []   # fresh slate — see constructor comment
@@ -1296,6 +1392,16 @@ class Orchestrator:
         log.info("cycle.start", preselected=preselected_target is not None)
 
         try:
+            # Correct the robot's physical hand BEFORE any overhead capture
+            # if it doesn't already match what this cycle's station needs
+            # (2026-08-27 real-hardware finding -- see
+            # _ensure_physical_hand_for_next_pick's docstring: this is a
+            # cheap no-op except right at the start of a run whose first
+            # selected station is on the left side, where it closes a real
+            # gap -- _startup() always homes Righty regardless of which
+            # stations were selected).
+            await self._ensure_physical_hand_for_next_pick(d)
+
             if preselected_target is not None:
                 target_x, target_y, all_centroids = preselected_target
                 log.info("cycle.using_preselected_target",
@@ -1353,11 +1459,18 @@ class Orchestrator:
                 # always the same quadrant — so recomputing would be redundant
                 # and risks flip-flopping right at the quadrant boundary).
                 target_u = self._select_quadrant_u(target_y)
+                # Same hand for this cycle's pick AND drop -- no crossing
+                # happens mid-cycle, so this is computed once here and
+                # reused everywhere below. Derived fresh from the
+                # sequencer's own position (_current_station_side()), not
+                # tracked separately, so it can't drift out of sync with
+                # what _get_next_well_coords() later returns for the drop.
+                hand = self._current_hand()
                 self._cycle_phase = CyclePhase.ROBOT_MOVING
                 with self._time_step("robot_to_bug"):
                     await asyncio.gather(
                         d.camera_eoa.start_streaming(),
-                        d.robot.move_to_image_site(target_x, target_y, u=target_u),
+                        d.robot.move_to_image_site(target_x, target_y, u=target_u, hand=hand),
                     )
                 log.debug("cycle.eoa_stream_started")
 
@@ -1583,7 +1696,7 @@ class Orchestrator:
                 # go home, same as the original single-candidate reject path.
                 self._cycle_phase = CyclePhase.ROBOT_PARKING
                 with self._time_step("robot_park"):
-                    await d.robot.move_to_safe_park()
+                    await self._home_right(d)
                 log.info("orchestrator.robot_returning_backlight_already_on")
                 self._log_timing_summary("eoa_reject")
                 if stopping:
@@ -1633,7 +1746,7 @@ class Orchestrator:
                     if self._view:
                         self._cycle_phase = CyclePhase.ROBOT_MOVING
                         with self._time_step("eoa_correction_move"):
-                            await d.robot.move_to_image_site(corrected_x, corrected_y, u=target_u)
+                            await d.robot.move_to_image_site(corrected_x, corrected_y, u=target_u, hand=hand)
                         log.info("cycle.eoa_correction_complete",
                                  pick_xy=f"({corrected_x:.3f}, {corrected_y:.3f})")
                         with self._time_step("eoa_verification_capture"):
@@ -1666,9 +1779,10 @@ class Orchestrator:
             # Test-scoped well sequencing (2026-08-11) — see
             # prd_updated.md Appendix D for the not-yet-finalized production
             # design (this is NOT that; see _get_next_well_coords() docstring).
-            well_x, well_y, well_label = self._get_next_well_coords()
+            well_x, well_y, well_label, well_u, well_side, side_switch = self._get_next_well_coords()
             log.info("cycle.picking", refined_x=refined_x, refined_y=refined_y,
-                     u=target_u, well=well_label, well_xy=f"({well_x:.1f}, {well_y:.1f})")
+                     u=target_u, hand=hand, well=well_label,
+                     well_xy=f"({well_x:.1f}, {well_y:.1f})", well_side=well_side)
 
             # Log this pick attempt now — from here on, a safety fault means
             # a specimen may end up in the pipette, and recovery needs to
@@ -1689,14 +1803,17 @@ class Orchestrator:
             self._cycle_phase = CyclePhase.ROBOT_PICK
             await self._db_update_pick_status(pick.pick_id, PickStatus.ASPIRATING)
             with self._time_step("robot_pick"):
-                await d.robot.execute_pick(refined_x, refined_y, u=target_u)
+                await d.robot.execute_pick(refined_x, refined_y, u=target_u, hand=hand)
             log.info("cycle.pick_complete", refined_x=refined_x, refined_y=refined_y)
 
             # Specimen is now physically in the tip — this is the hard gate:
             # from this line until _deliver_pending_specimen() clears it,
             # NOTHING may start a new pick, and any safety fault MUST
             # deliver this specimen on recovery instead of losing it.
-            self._pending_well = (well_x, well_y, self._plate_u, well_label, pick.pick_id)
+            # well_u is ALWAYS this side's HOME U (see _get_next_well_coords'
+            # docstring) — never target_u/the quadrant-pick U, hard safety
+            # rule confirmed by the operator.
+            self._pending_well = (well_x, well_y, well_u, well_label, pick.pick_id, hand)
             pick.pick_status = PickStatus.BUG_IN_PIPETTE
             await self._db_update_pick_status(pick.pick_id, PickStatus.BUG_IN_PIPETTE)
 
@@ -1711,11 +1828,19 @@ class Orchestrator:
             # _capture_and_select_target's docstring). Awaited (with a
             # timeout, not blocking indefinitely) right after the drop
             # finishes — see below.
-            lookahead_task = asyncio.create_task(
-                self._capture_and_select_target(is_lookahead=True)
+            # SKIPPED when side_switch is True (2026-08-26): this drop is
+            # the last well of this side's stations — after it, the robot
+            # must cross hands (go_home_left()) before the next capture,
+            # per the operator's explicit "only capture once physically at
+            # the new home" requirement. A concurrent lookahead here would
+            # be for the wrong side's dish-quadrant U anyway, so it's not
+            # just skipped, it would be actively wrong to use.
+            lookahead_task = (
+                asyncio.create_task(self._capture_and_select_target(is_lookahead=True))
+                if not side_switch else None
             )
             with self._time_step("robot_drop"):
-                await d.robot.execute_place(well_x, well_y, self._plate_u)
+                await d.robot.execute_place(well_x, well_y, well_u, hand=hand)
             log.info("cycle.pick_place_complete", refined_x=refined_x, refined_y=refined_y,
                      well=well_label)
 
@@ -1727,6 +1852,24 @@ class Orchestrator:
             await self._csv_append(pick)
             self._pending_well = None
             self._current_pick = None
+
+            stopping = self._sm.current == State.CYCLE_STOPPING
+
+            if side_switch:
+                # Explicit hand crossing -- always right-to-left, never the
+                # reverse (configure_stations() only ever orders right-side
+                # stations before left-side ones, one-way per run). No
+                # lookahead result to consult here (none was fired above).
+                self._cycle_phase = CyclePhase.ROBOT_PARKING   # crossing to a home, same phase family as parking
+                with self._time_step("robot_cross_to_left"):
+                    await self._home_left(d)
+                log.info("cycle.side_switched", new_side="left")
+                self._log_timing_summary("success")
+                if stopping:
+                    await self._finish_stop(d)
+                elif self._sm.is_running():
+                    asyncio.create_task(self._run_cycle())
+                return
 
             # ── Lookahead: skip homing if the concurrent capture above
             # already found the next target ──────────────────────────────
@@ -1746,7 +1889,6 @@ class Orchestrator:
             except Exception as exc:
                 log.warning("cycle.lookahead_failed", error=str(exc))
 
-            stopping = self._sm.current == State.CYCLE_STOPPING
             if next_target is not None and self._sm.is_running() and not stopping:
                 log.info("orchestrator.lookahead_skip_home",
                          target_x=next_target[0], target_y=next_target[1])
@@ -1755,7 +1897,16 @@ class Orchestrator:
             else:
                 self._cycle_phase = CyclePhase.ROBOT_PARKING
                 with self._time_step("robot_park"):
-                    await d.robot.move_to_safe_park()
+                    # Park matching whichever side is currently active --
+                    # not always right. When stopping, _finish_stop() below
+                    # homes Righty regardless anyway, so it doesn't matter
+                    # here; when continuing on the left side with no
+                    # lookahead result, parking Righty would just force an
+                    # unnecessary swing back left on the very next cycle.
+                    if stopping or self._current_station_side() == "right":
+                        await self._home_right(d)
+                    else:
+                        await self._home_left(d)
                 log.info("orchestrator.robot_returning_backlight_already_on")
                 self._log_timing_summary("success")
 
@@ -2101,24 +2252,118 @@ class Orchestrator:
                  steps_total_s=round(steps_total, 3), wall_total_s=round(wall_total, 3),
                  **{k: round(v, 3) for k, v in self._cycle_timings.items()})
 
+    def _current_station_side(self) -> str:
+        """
+        "right" or "left" -- the side of whichever station the sequencer is
+        currently positioned at (peek only, does not advance anything).
+
+        This is the single source of truth for which hand THIS cycle's
+        pick+drop must use, derived fresh every call from the sequencer's
+        own position rather than tracked as separate mutable state — it
+        can never drift out of sync with what _get_next_well_coords() is
+        about to return (e.g. after a fault-recovery re-home, which always
+        parks Righty via move_to_safe_park() regardless of which side the
+        run's sequencer is mid-way through — see _deliver_pending_specimen).
+
+        Legacy fallback (multi-station not configured): always "right",
+        matching the original Righty-only cycle.
+        """
+        if not self._station_order:
+            return "right"
+        station_num = self._station_order[self._current_station_idx]
+        return self._plate_stations_cfg.side_of(station_num)
+
+    def _current_hand(self) -> str:
+        """"L" or "R" -- whichever hand _current_station_side() currently is."""
+        return "L" if self._current_station_side() == "left" else "R"
+
+    async def _home_right(self, d: DriverSet) -> None:
+        """
+        Send HOME (always ends Righty) and record that the robot is
+        physically Righty now. The ONLY thing that should ever set
+        self._current_physical_side = "right" -- every existing
+        move_to_safe_park() call site in this file goes through here
+        instead, so the tracking can never drift from reality.
+        """
+        await d.robot.move_to_safe_park()
+        self._current_physical_side = "right"
+
+    async def _home_left(self, d: DriverSet) -> None:
+        """
+        Send GO_HOME_LEFT (always ends Lefty) and record that the robot
+        is physically Lefty now. The ONLY thing that should ever set
+        self._current_physical_side = "left".
+        """
+        await d.robot.go_home_left()
+        self._current_physical_side = "left"
+
+    async def _ensure_physical_hand_for_next_pick(self, d: DriverSet) -> None:
+        """
+        Cross hands FIRST if the robot's actual physical side doesn't
+        match what the sequencer needs for the upcoming pick.
+
+        Closes a real gap (2026-08-27, found via real-hardware testing):
+        _startup() always homes Righty unconditionally, no matter which
+        stations were selected. The explicit GO_HOME_LEFT crossing is
+        normally inserted by _get_next_well_coords()'s side_switch signal
+        -- but that only fires on a TRANSITION between stations mid-run.
+        If the very FIRST selected station of a run is on the left side
+        (e.g. only Station 3 selected, no right-side stations at all),
+        there is no such transition to trigger it -- the sequencer
+        correctly computes hand="L" for the very first pick, but nothing
+        ever told the robot to actually get there, so it was trying to
+        reach a left-side target directly from right_home in one bare
+        command instead of the proven settle-then-sweep crossing.
+        Called at the top of _run_cycle(), before overhead capture --
+        cheap no-op on every cycle where the sides already match (the
+        overwhelming majority: same-side continuation, or already
+        correctly positioned by a prior side_switch crossing).
+        """
+        needed = self._current_station_side()
+        if needed == self._current_physical_side:
+            return
+        log.info("cycle.correcting_physical_hand",
+                 current=self._current_physical_side, needed=needed)
+        if needed == "left":
+            await self._home_left(d)
+        else:
+            await self._home_right(d)
+
     def _select_quadrant_u(self, target_y: float) -> float | None:
         """
         Pick the wrist U angle (deg) for a target's robot-Y position, so the
         arm can reach every quadrant of the dish.
 
-        robot_y >= quadrant_split_y_mm -> physical top    -> u_top_deg
-        robot_y <  quadrant_split_y_mm -> physical bottom -> u_bottom_deg
+        robot_y >= quadrant_split_y_mm -> physical top    -> top U
+        robot_y <  quadrant_split_y_mm -> physical bottom -> bottom U
 
-        Returns None if quadrant U-selection is not configured (any of the
-        three config values missing) — callers should then omit u from
-        move_to_image_site(), which preserves the pre-2026-08-05 behavior of
-        holding whatever U the robot is currently at.
+        Multi-station mode (self._station_order non-empty): the top/bottom
+        U PAIR depends on _current_station_side() (Righty and Lefty need
+        different U's to reach the same physical quadrant — see
+        hardware_tests/test_quadrant_u_select.py). The split threshold
+        itself (quadrant_split_y_mm) is a physical robot-Y boundary on the
+        dish, unaffected by hand, so it's shared between both pairs.
+
+        Legacy fallback (multi-station not configured): the original single
+        Righty-only u_top_deg/u_bottom_deg pair, unchanged.
+
+        Returns None if quadrant U-selection is not configured at all —
+        callers should then omit u from move_to_image_site(), which
+        preserves the pre-2026-08-05 behavior of holding whatever U the
+        robot is currently at.
         """
-        if (
-            self._quadrant_split_y_mm is None
-            or self._u_top_deg is None
-            or self._u_bottom_deg is None
-        ):
+        if self._quadrant_split_y_mm is None:
+            return None
+
+        if self._station_order and self._plate_stations_cfg is not None:
+            top, bottom = (
+                (self._plate_stations_cfg.righty_top_u, self._plate_stations_cfg.righty_bottom_u)
+                if self._current_station_side() == "right"
+                else (self._plate_stations_cfg.lefty_top_u, self._plate_stations_cfg.lefty_bottom_u)
+            )
+            return top if target_y >= self._quadrant_split_y_mm else bottom
+
+        if self._u_top_deg is None or self._u_bottom_deg is None:
             return None
         return (
             self._u_top_deg
@@ -2244,25 +2489,77 @@ class Orchestrator:
 
         return corrected_x, corrected_y
 
-    def _get_next_well_coords(self) -> tuple[float, float, str]:
+    def _stations_exhausted(self) -> bool:
         """
-        Return (x, y, well_label) for the next well to drop into, advancing
-        the internal well index each call.
+        True if multi-station mode is active (configure_stations() called)
+        and every selected station's every well has already been used.
 
-        Test-scoped (2026-08-11) — sequential fill order from a single
-        loaded PlateConfig, wrapping back to the first well when the plate
-        is full (fine for repeated hardware testing; NOT correct production
-        behavior — production should stop/alert when a plate fills up, not
-        silently overwrite already-filled wells. See prd_updated.md
-        Appendix D — this whole area is still an open design question,
-        including whether one config covers one station or needs a
-        per-station registration offset).
-
-        Falls back to the old hardcoded (100.0, 100.0) placeholder if no
-        plate config was loaded (e.g. mock/dev runs without a real plate).
+        Checked at the top of _run_cycle() BEFORE committing to a pick —
+        there's no point aspirating a specimen with nowhere left to drop
+        it. Always False when multi-station mode isn't active — the
+        legacy single-plate _get_next_well_coords() fallback below wraps
+        forever instead of ever reporting exhaustion.
         """
+        return bool(self._station_order) and self._current_station_idx >= len(self._station_order)
+
+    def _get_next_well_coords(self) -> tuple[float, float, str, float | None, str, bool]:
+        """
+        Return (well_x, well_y, well_label, well_home_u, side, side_switch)
+        for the next well to drop into, advancing the internal sequencer.
+
+        well_home_u is ALWAYS the current side's HOME U (right_home_u/
+        left_home_u from machine_config.yaml's plate_stations section) —
+        NEVER the quadrant-pick U used for this cycle's PICK. Confirmed
+        operator safety rule: dropping at a quadrant-pick U is not safe.
+
+        side_switch is True only when the NEXT call to this method (the
+        well after the one just returned) will be for a different side —
+        signals _run_cycle() that after finishing THIS drop, it must
+        explicitly cross hands (go_home_left()) before the next overhead
+        capture, instead of the normal same-side concurrent-lookahead trick.
+
+        Multi-station mode (configure_stations() called, self._station_order
+        non-empty): fills the selected stations in the order built by
+        configure_stations() (right side fully, then left side fully).
+        Raises RuntimeError if every well is already used — callers must
+        check _stations_exhausted() before committing to a pick; this
+        should never actually be hit.
+
+        Legacy fallback (multi-station not configured): sequential fill
+        order from the single loaded self._plate_config, wrapping back to
+        the first well when the plate is full (2026-08-11 test-scoped
+        behavior, unchanged — see prd_updated.md Appendix D). Falls back
+        further to the old hardcoded (100.0, 100.0) placeholder if no
+        plate config was loaded at all (mock/dev runs without a real plate).
+        """
+        if self._station_order:
+            if self._current_station_idx >= len(self._station_order):
+                raise RuntimeError(
+                    "_get_next_well_coords() called after all stations were "
+                    "already exhausted -- caller must check _stations_exhausted() first."
+                )
+            station_num = self._station_order[self._current_station_idx]
+            plate = self._selected_stations[station_num]
+            well = plate.wells[self._current_well_idx]
+            side = self._plate_stations_cfg.side_of(station_num)
+            home_u = (
+                self._plate_stations_cfg.right_home_u if side == "right"
+                else self._plate_stations_cfg.left_home_u
+            )
+
+            self._current_well_idx += 1
+            side_switch = False
+            if self._current_well_idx >= len(plate.wells):
+                self._current_well_idx = 0
+                self._current_station_idx += 1
+                if self._current_station_idx < len(self._station_order):
+                    next_station = self._station_order[self._current_station_idx]
+                    next_side = self._plate_stations_cfg.side_of(next_station)
+                    side_switch = next_side != side
+            return (well.x, well.y, well.well, home_u, side, side_switch)
+
         if self._plate_config is None or not self._plate_config.wells:
-            return (100.0, 100.0, "NONE")
+            return (100.0, 100.0, "NONE", self._plate_u, "right", False)
 
         wells = self._plate_config.wells
         well = wells[self._next_well_index % len(wells)]
@@ -2271,7 +2568,7 @@ class Orchestrator:
                         note="well index wrapped past the end of the plate — "
                              "test-scoped behavior, not correct for production")
         self._next_well_index += 1
-        return (well.x, well.y, well.well)
+        return (well.x, well.y, well.well, self._plate_u, "right", False)
 
     # ------------------------------------------------------------------
     # VIEW helpers — image display for testing (VIEW=True in main.py)
