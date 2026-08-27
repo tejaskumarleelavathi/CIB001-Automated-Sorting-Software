@@ -98,13 +98,27 @@ class EpsonT3BDriver:
         s.settimeout(self._connect_timeout)
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-        # TCP keepalive — OS sends ACK probes after 5s idle, every 2s.
+        # TCP keepalive — OS sends ACK probes after idle, every interval below.
         # Prevents the Epson controller's TCP stack from timing out the
         # connection during long overhead-capture + vision processing gaps.
+        # Idle threshold raised 5s -> 60s (2026-08-27 real-hardware finding):
+        # a slow (Speed 5/Accel 5,5, per operator request) HOME/GO_HOME_LEFT
+        # right_home<->left_home crossing can genuinely take longer than the
+        # old 5s-idle-then-probe / ~15-20s-total-before-giving-up window --
+        # Python's blocking _send() sits waiting the whole time with zero
+        # bytes flowing, so Windows' own OS-level keepalive was declaring the
+        # (perfectly healthy, just busy) connection dead and killing the
+        # socket underneath it -- no SPEL+ error ever fires, since nothing
+        # actually failed on the robot side. 60s comfortably covers any
+        # single motion command (matches MOTION_TIMEOUT_S's own 120s
+        # philosophy) while still catching a truly dead peer well within
+        # that -- the STATUS-based application-level keepalive loop already
+        # handles the "genuinely idle between commands" case in a few
+        # seconds regardless, this OS-level one is just a backstop.
         s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         try:
             # Windows: (enable, idle_ms before first probe, interval_ms)
-            s.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 5_000, 2_000))
+            s.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 60_000, 5_000))
         except (AttributeError, OSError):
             pass  # non-Windows or older Python — SO_KEEPALIVE above still applies
 
