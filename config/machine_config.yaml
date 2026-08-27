@@ -27,7 +27,15 @@ robot:
 plc:
   ip: "172.16.9.11"
   port: 502
-  poll_interval_ms: 100
+  # 100 -> 200ms (2026-08-27, real-hardware finding): reduces total Modbus
+  # traffic sharing the USB-Ethernet adapter with the robot/Flexi/cameras --
+  # contention from this + flexi polling was implicated in RC+ losing its
+  # own connection to the controller during slow robot moves (Epson error
+  # 1503/1504, "Communication disconnection... while executing a task").
+  # The hardware e-stop circuit itself is a hardwired safety loop, cut
+  # entirely independent of this software poll -- this only affects how
+  # fast the STATUS LIGHT/UI reacts, not the actual physical stop.
+  poll_interval_ms: 200
   unit_id: 1
   registers:
     status_light_mode: 0
@@ -44,7 +52,14 @@ plc:
 flexi:
   ip: "172.16.9.12"
   port: 502
-  poll_interval_ms: 100
+  # 100 -> 200ms (2026-08-27) -- see plc.poll_interval_ms comment above,
+  # same reasoning. IMPORTANT: the physical e-stop/light-curtain SAFETY
+  # CIRCUIT is a hardwired loop that cuts robot power instantly, entirely
+  # independent of this poll -- this interval only governs how fast the
+  # SOFTWARE (state machine, status light, UI) reacts/logs the event
+  # after the hardware has already stopped everything. 200ms is still a
+  # fast software reaction, just less network traffic than 100ms.
+  poll_interval_ms: 200
   unit_id: 1
   registers:
     # Address 256 = live process I/O (25 registers). Address 2000 = static device status.

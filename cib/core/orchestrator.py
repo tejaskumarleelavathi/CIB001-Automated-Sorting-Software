@@ -420,20 +420,28 @@ class Orchestrator:
         log.info("orchestrator.connecting_devices")
         d = self._drivers
         try:
-            # Connect cameras, lighting, safety and PLC first — GigE camera
-            # discovery takes ~6 seconds. Robot is connected AFTER so it is
-            # never left idle on the TCP socket while we wait for cameras.
-            # The Epson controller resets idle connections after a few seconds.
+            # Connect the fast, safety-critical devices first (Flexi, PLC,
+            # pump, lighting -- none of these do multi-second discovery).
+            # Cameras deliberately NOT connected yet -- see below.
             await asyncio.gather(
                 d.safety.connect(),
                 d.plc.connect(),
                 d.pump.connect(),
-                d.camera_overhead.connect(),
-                d.camera_eoa.connect(),
                 d.lighting.connect(),
             )
-            # Connect robot now — cameras are ready so we immediately follow
-            # up with motion commands and keep the connection active.
+            # Connect robot now and home it IMMEDIATELY, before cameras ever
+            # touch the network (2026-08-27 real-hardware finding). GigE
+            # camera discovery/connect takes ~6s and is chatty (GVCP
+            # broadcast discovery, parameter negotiation) on the same
+            # shared USB-Ethernet adapter Flexi/PLC/robot all use -- with
+            # cameras connecting concurrently, that traffic was contending
+            # with this exact HOME call, occasionally starving RC+'s own
+            # link to the controller long enough to trip a real
+            # "Communication disconnection detected" (Epson error
+            # 1503/1504 -- disconnection while executing a task) and abort
+            # the move mid-motion. Robot still never sits idle waiting
+            # (the original reason cameras were connected first) -- it
+            # gets a command the instant it connects, same as before.
             await d.robot.connect()
             # Send robot to safe park position immediately after connecting.
             # This lifts Z if the arm was left at imaging height by a previous
@@ -445,6 +453,15 @@ class Orchestrator:
             # stabilisation built into the driver) — no extra sleep needed here.
             await d.lighting.set_backlight(True)
             log.info("orchestrator.backlight_on")
+
+            # NOW connect cameras -- robot's one guaranteed-solo move is
+            # already done, so their ~6s chatty discovery no longer has
+            # anything time-critical to contend with.
+            await asyncio.gather(
+                d.camera_overhead.connect(),
+                d.camera_eoa.connect(),
+            )
+            log.info("orchestrator.cameras_connected")
             # Ring light — skipped until digital output 12 is confirmed wired
             # in RC+ 7.0. Sending RING_ON when output 12 is not configured
             # causes sort_server.prg's On 12 to block ~5s then throw a SPEL+
