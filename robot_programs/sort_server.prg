@@ -230,6 +230,22 @@ server_start:
 
         OnErr GoTo 0
         cmd$ = Trim$(cmd$)
+        ' Defensive CP Off before EVERY command, not just once at program
+        ' startup (2026-08-27 real-hardware finding). The one-time CP Off
+        ' near the top of this Function only runs once when the task first
+        ' starts -- a client disconnect/BYE only jumps back to server_start:
+        ' (never re-runs that setup), so if CP was ever left ON by an
+        ' interrupted command from earlier in this task's lifetime (this
+        ' session or before), it silently persists across every reconnect.
+        ' Confirmed on hardware: a stale CP On caused GO_HOME_LEFT's two
+        ' discrete Go P0 / Go left_home crossing moves to get blended into
+        ' one continuous CP path instead -- fast, and landing in the wrong
+        ' posture instead of cleanly at left_home -- then the very next
+        ' command's plain Move hit the same bad state and threw error 4037.
+        ' Cheap no-op if CP is already off; any command that WANTS CP on
+        ' (PICK/PICK_U's blended retract) still explicitly turns it on for
+        ' just that block and off again right after, unaffected by this.
+        CP Off
 
         If Left$(cmd$, 6) = "STATUS" Then
             Print #201, "OK READY"
