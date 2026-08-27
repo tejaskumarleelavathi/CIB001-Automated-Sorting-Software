@@ -111,13 +111,30 @@ class OperatorShutdownEvent:
     pass
 
 @dataclass(frozen=True)
-class OperatorConfigureStationsEvent:
+class OperatorConfigurePreRunEvent:
     """
-    Operator selected which plate stations to fill for the next run (Excel
-    upload + checkboxes in the UI). selected maps station number ->
-    PlateConfig, already loaded from the workbook. Handled while IDLE,
-    before START -- see Orchestrator.configure_stations().
+    Operator filled out the pre-run setup screen (field code, per-station
+    Plate ID, optional per-station starting well, Excel upload + station
+    map taps). Handled while IDLE, before START -- see
+    Orchestrator.configure_pre_run(). Supersedes the older
+    OperatorConfigureStationsEvent (2026-08-27, FR-UI-01) -- Plate ID and
+    starting well are new; selected/field_code carry the same meaning as
+    before.
+
+    field_code: this run's field collection code (Run.field_code).
+    plate_ids: station number -> Plate ID text (Pick.plate_id -- per
+        station, not per run, since each station holds a physically
+        different plate).
+    starting_wells: station number -> well label to resume from (e.g.
+        "C4"), or None to start from the first well -- passed to
+        PlateConfig.wells_from() when building the fill sequence.
+    selected: station number -> PlateConfig, already loaded from the
+        uploaded workbook. Only stations present here are filled --
+        station map taps determine which stations end up in this dict.
     """
+    field_code: str
+    plate_ids: dict[int, str]
+    starting_wells: dict[int, str | None]
     selected: dict[int, PlateConfig]
 
 
@@ -253,7 +270,7 @@ class AllDevicesReadyEvent:
 # All event types in one union — used for type hints in the orchestrator
 SystemEvent = (
     OperatorStartEvent | OperatorStopEvent | OperatorAbortEvent | OperatorAcknowledgeEvent
-    | OperatorShutdownEvent | OperatorConfigureStationsEvent
+    | OperatorShutdownEvent | OperatorConfigurePreRunEvent
     | SafetyFaultEvent | SafetyClearEvent | SafetyStatusEvent
     | RobotConnectedEvent | RobotInPositionEvent | RobotMissionCompleteEvent
     | RobotClearedFOVEvent | RobotFaultEvent

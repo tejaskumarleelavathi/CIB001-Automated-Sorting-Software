@@ -46,7 +46,7 @@ from cib.core.events import (
     CameraID,
     OperatorAbortEvent,
     OperatorAcknowledgeEvent,
-    OperatorConfigureStationsEvent,
+    OperatorConfigurePreRunEvent,
     OperatorShutdownEvent,
     OperatorStartEvent,
     OperatorStopEvent,
@@ -226,19 +226,24 @@ class Orchestrator:
         self._plate_u = plate_u
         self._next_well_index = 0
         # Multi-station Lefty/Righty sequencing (2026-08-26) -- see
-        # configure_stations()/_get_next_well_coords()/_stations_exhausted().
+        # configure_pre_run()/_get_next_well_coords()/_stations_exhausted().
         # plate_stations_cfg (home U's, quadrant U's, station->side map) comes
         # from machine_config.yaml, loaded once at startup regardless of which
         # stations get selected for any given run. _selected_stations/
-        # _station_order are populated per-run by configure_stations(),
-        # called by the operator (via the UI) before pressing START.
-        # _station_order empty = multi-station mode is off -- every method
-        # below falls back to the original single-plate/Righty-only behavior.
+        # _station_order/_plate_ids_by_station are populated per-run by
+        # configure_pre_run(), called by the operator (via the pre-run setup
+        # screen) before pressing START. _station_order empty = multi-station
+        # mode is off -- every method below falls back to the original
+        # single-plate/Righty-only behavior.
         self._plate_stations_cfg = plate_stations_cfg
         self._selected_stations: dict[int, PlateConfig] = {}
         self._station_order: list[int] = []
         self._current_station_idx = 0
         self._current_well_idx = 0
+        # Station number -> Plate ID text (FR-UI-01), set by
+        # configure_pre_run(). Read at Pick-creation time in _run_cycle() --
+        # see _current_station_number().
+        self._plate_ids_by_station: dict[int, str] = {}
         # Which hand the robot is ACTUALLY, physically in right now --
         # updated only by _home_right()/_home_left() (the sole two places
         # that ever change it), never derived/guessed. "right" is correct
@@ -317,19 +322,32 @@ class Orchestrator:
         """After e-stop reset or protective stop — resume."""
         self._put_event(OperatorAcknowledgeEvent())
 
-    def configure_stations(self, selected: dict[int, PlateConfig]) -> None:
+    def configure_pre_run(
+        self,
+        field_code: str,
+        plate_ids: dict[int, str],
+        starting_wells: dict[int, str | None],
+        selected: dict[int, PlateConfig],
+    ) -> None:
         """
-        Set which stations (by number) the NEXT run should fill, from the
-        operator's Excel upload + checkbox selection (see
-        OperatorConfigureStationsEvent / operator_configure_stations()).
+        Set up everything the pre-run setup screen collects for the NEXT
+        run (FR-UI-01): field code, a Plate ID per station, an optional
+        starting well per station, and which stations to fill (Excel
+        upload + station map taps). Supersedes the older
+        configure_stations() (2026-08-27) -- same station-ordering/
+        sequencer-reset behavior, plus field_code/plate_ids/starting_wells.
 
         Builds self._station_order as right-side stations first (ascending
         by number), then left-side stations (ascending) -- per the
         operator's explicit one-way requirement: finish every selected
         right-side station completely before ever switching to the left
-        side, never interleaved, never switching back. Resets the
-        sequencer cursor (_current_station_idx/_current_well_idx) and
-        _current_side to match the first station in that order.
+        side, never interleaved, never switching back.
+
+        starting_wells lets a station resume mid-plate (FR-RUN-06/07,
+        e.g. after a field-code change mid-run) -- PlateConfig.wells_from()
+        already does exactly this, slicing the well list to start from the
+        given well (inclusive). None (or missing) means start from the
+        first well, unchanged from before.
 
         Only meaningful while IDLE, before START -- like _next_well_index,
         this cursor is a per-run thing; call again to reconfigure between
@@ -338,19 +356,38 @@ class Orchestrator:
         """
         if self._plate_stations_cfg is None:
             raise RuntimeError(
-                "configure_stations() called but machine_config.yaml has no "
+                "configure_pre_run() called but machine_config.yaml has no "
                 "plate_stations section -- multi-station mode is not available."
             )
-        self._selected_stations = dict(selected)
+        self._field_code = field_code
+        self._plate_ids_by_station = dict(plate_ids)
+        self._selected_stations = {
+            num: (
+                PlateConfig(source_file=plate.source_file,
+                            wells=plate.wells_from(starting_wells[num]))
+                if starting_wells.get(num) else plate
+            )
+            for num, plate in selected.items()
+        }
         right = sorted(n for n in selected if self._plate_stations_cfg.side_of(n) == "right")
         left = sorted(n for n in selected if self._plate_stations_cfg.side_of(n) == "left")
         self._station_order = right + left
         self._current_station_idx = 0
         self._current_well_idx = 0
-        log.info("orchestrator.stations_configured", order=self._station_order)
+        log.info("orchestrator.pre_run_configured", order=self._station_order,
+                 field_code=field_code, plate_ids=self._plate_ids_by_station)
 
-    def operator_configure_stations(self, selected: dict[int, PlateConfig]) -> None:
-        self._put_event(OperatorConfigureStationsEvent(selected=selected))
+    def operator_configure_pre_run(
+        self,
+        field_code: str,
+        plate_ids: dict[int, str],
+        starting_wells: dict[int, str | None],
+        selected: dict[int, PlateConfig],
+    ) -> None:
+        self._put_event(OperatorConfigurePreRunEvent(
+            field_code=field_code, plate_ids=plate_ids,
+            starting_wells=starting_wells, selected=selected,
+        ))
 
     def operator_shutdown(self) -> None:
         """
@@ -622,13 +659,16 @@ class Orchestrator:
                     if not self._cycle_active:
                         asyncio.create_task(self._run_cycle())
 
-            case OperatorConfigureStationsEvent(selected=selected):
+            case OperatorConfigurePreRunEvent(
+                field_code=field_code, plate_ids=plate_ids,
+                starting_wells=starting_wells, selected=selected,
+            ):
                 if sm.current == State.IDLE:
-                    self.configure_stations(selected)
+                    self.configure_pre_run(field_code, plate_ids, starting_wells, selected)
                 else:
-                    log.warning("orchestrator.configure_stations_ignored",
+                    log.warning("orchestrator.configure_pre_run_ignored",
                                 state=sm.current.value,
-                                note="station selection can only change while IDLE, before START")
+                                note="pre-run setup can only change while IDLE, before START")
 
             case OperatorStopEvent():
                 if sm.is_running():
@@ -1787,10 +1827,11 @@ class Orchestrator:
             # Log this pick attempt now — from here on, a safety fault means
             # a specimen may end up in the pipette, and recovery needs to
             # know exactly which well it was headed to.
+            station_num = self._current_station_number()
             pick = Pick(
                 run_id=self._current_run.run_id if self._current_run else "NO_RUN",
                 field_code=self._field_code,
-                plate_id=self._default_plate_id,
+                plate_id=self._plate_ids_by_station.get(station_num, self._default_plate_id),
                 well_position=well_label,
                 pick_status=PickStatus.MOVING_TO_PICK,
                 timestamp_start=datetime.now(),
@@ -1857,7 +1898,7 @@ class Orchestrator:
 
             if side_switch:
                 # Explicit hand crossing -- always right-to-left, never the
-                # reverse (configure_stations() only ever orders right-side
+                # reverse (configure_pre_run() only ever orders right-side
                 # stations before left-side ones, one-way per run). No
                 # lookahead result to consult here (none was fired above).
                 self._cycle_phase = CyclePhase.ROBOT_PARKING   # crossing to a home, same phase family as parking
@@ -2273,6 +2314,17 @@ class Orchestrator:
         station_num = self._station_order[self._current_station_idx]
         return self._plate_stations_cfg.side_of(station_num)
 
+    def _current_station_number(self) -> int | None:
+        """
+        The station number the sequencer is currently positioned at (peek
+        only, does not advance anything), or None if multi-station mode
+        isn't configured. Used to look up this cycle's Plate ID in
+        self._plate_ids_by_station -- see configure_pre_run().
+        """
+        if not self._station_order:
+            return None
+        return self._station_order[self._current_station_idx]
+
     def _current_hand(self) -> str:
         """"L" or "R" -- whichever hand _current_station_side() currently is."""
         return "L" if self._current_station_side() == "left" else "R"
@@ -2491,7 +2543,7 @@ class Orchestrator:
 
     def _stations_exhausted(self) -> bool:
         """
-        True if multi-station mode is active (configure_stations() called)
+        True if multi-station mode is active (configure_pre_run() called)
         and every selected station's every well has already been used.
 
         Checked at the top of _run_cycle() BEFORE committing to a pick —
@@ -2518,9 +2570,9 @@ class Orchestrator:
         explicitly cross hands (go_home_left()) before the next overhead
         capture, instead of the normal same-side concurrent-lookahead trick.
 
-        Multi-station mode (configure_stations() called, self._station_order
+        Multi-station mode (configure_pre_run() called, self._station_order
         non-empty): fills the selected stations in the order built by
-        configure_stations() (right side fully, then left side fully).
+        configure_pre_run() (right side fully, then left side fully).
         Raises RuntimeError if every well is already used — callers must
         check _stations_exhausted() before committing to a pick; this
         should never actually be hit.
