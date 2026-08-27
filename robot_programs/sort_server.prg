@@ -260,7 +260,7 @@ server_start:
             ' this exact class of mixup has cost real debugging time this
             ' session more than once. BUMP THIS every time sort_server.prg
             ' changes.
-            Print #201, "OK READY SORT_SERVER_VER=2026-08-27d"
+            Print #201, "OK READY SORT_SERVER_VER=2026-08-27e"
 
         ElseIf Left$(cmd$, 4) = "HOME" Then
             ' Always ends Righty at P0 (right home). Real-hardware findings
@@ -348,10 +348,7 @@ server_start:
             ' explicit U angle AND hand (2026-08-26, multi-station
             ' integration) instead of holding whatever U/hand the arm
             ' currently has. Used for quadrant-based U selection (see
-            ' cib/core/orchestrator.py). Only this initial travel-height Go
-            ' needs /L//R -- the descent below is Z-only, same XY/hand,
-            ' safe unqualified (Move has no Hand parameter anyway --
-            ' confirmed real-hardware finding, see HOME above).
+            ' cib/core/orchestrator.py).
             Tool 1
             sp1 = InStr(cmd$, " ")
             coord_str$ = Mid$(cmd$, sp1 + 1)
@@ -369,7 +366,27 @@ server_start:
             Else
                 Go XY(rx, ry, -47.700, ru) /R
             EndIf
-            Move XY(rx, ry, -58.660, ru)
+            ' Real-hardware finding (2026-08-27): a bare Move XY(...) has
+            ' no Hand parameter at all, and its own internal target-hand
+            ' resolution silently defaults toward Righty regardless of the
+            ' arm's actual current hand -- fine for Righty (matches the
+            ' default), but throws error 4037 ("point attribute...differ")
+            ' for Lefty, since the resolved target disagrees with the
+            ' Lefty position the qualified Go above just established.
+            ' Fix: assign the target to a point variable and explicitly set
+            ' ITS Hand attribute via the Hand statement before Move'ing to
+            ' it (P1 = coords / Hand P1, Lefty|Righty / Move P1 -- confirmed
+            ' valid via the SPEL+ Language Reference's own Hand Statement
+            ' example) instead of a bare XY(...) expression that carries no
+            ' hand attribute of its own. P100 is an unused scratch point
+            ' number (P0 = right_home, P1 used elsewhere in this project).
+            P100 = XY(rx, ry, -58.660, ru)
+            If Left$(hand$, 1) = "L" Then
+                Hand P100, Lefty
+            Else
+                Hand P100, Righty
+            EndIf
+            Move P100
             Print #201, "OK IMAGE_POSITION " + Str$(CX(Here)) + "," + Str$(CY(Here))
 
         ElseIf Left$(cmd$, 13) = "MOVE_PIPETTE " Then
@@ -496,10 +513,17 @@ server_start:
             ' PICK_U x,y,u,hand — pipette (Tool 2) to (x,y) at explicit U
             ' AND hand (2026-08-26, multi-station integration), aspirates.
             ' Uses the SAME quadrant U/hand as the EoA move that found this
-            ' specimen. Only this initial travel-height Go needs /L//R --
-            ' every step after (descent, CP-blended lift) is Z-only at the
-            ' same XY/hand, safe unqualified (Move has no Hand parameter
-            ' anyway -- confirmed real-hardware finding, see HOME above).
+            ' specimen.
+            ' Real-hardware finding (2026-08-27): every bare Move XY(...)
+            ' below has no Hand parameter and its own internal target-hand
+            ' resolution silently defaults toward Righty regardless of the
+            ' arm's actual current hand -- fine for Righty, but throws
+            ' error 4037 ("point attribute...differ") for Lefty. Fixed by
+            ' assigning each target to scratch point P100 and explicitly
+            ' setting ITS Hand attribute via the Hand statement before
+            ' Move'ing to it (confirmed valid via the SPEL+ Language
+            ' Reference's own Hand Statement example), instead of a bare
+            ' XY(...) expression that carries no hand attribute of its own.
             Off 4
             Call EnsurePipetteUp
             Tool 2
@@ -517,7 +541,13 @@ server_start:
             Else
                 Go XY(rx, ry, -47.700, ru) /R
             EndIf
-            Move XY(rx, ry, -58.660, ru)
+            P100 = XY(rx, ry, -58.660, ru)
+            If Left$(hand$, 1) = "L" Then
+                Hand P100, Lefty
+            Else
+                Hand P100, Righty
+            EndIf
+            Move P100
             On 4
             Call WaitPipetteDown
             ' Slow, controlled final approach — this is the whole point of the
@@ -526,11 +556,23 @@ server_start:
             ' command) restored to the fast baseline right after.
             SpeedS 10
             AccelS 10, 10
-            Move XY(rx, ry, -60.000, ru)
+            P100 = XY(rx, ry, -60.000, ru)
+            If Left$(hand$, 1) = "L" Then
+                Hand P100, Lefty
+            Else
+                Hand P100, Righty
+            EndIf
+            Move P100
             ' Aspirate triggers HERE, partway down — see the matching comment
             ' in PICK above (2026-08-21: mid-descent, not before or after).
             Call StartMotorAspire
-            Move XY(rx, ry, -62.000, ru)
+            P100 = XY(rx, ry, -62.000, ru)
+            If Left$(hand$, 1) = "L" Then
+                Hand P100, Lefty
+            Else
+                Hand P100, Righty
+            EndIf
+            Move P100
             SpeedS 120
             AccelS 120, 120
             Call WaitMotorComplete
@@ -544,8 +586,20 @@ server_start:
             ' it never leaks into the next command, Here-based moves
             ' rewritten to explicit XY/U since Here bypasses CP entirely).
             CP On
-            Move XY(rx, ry, -58.660, ru)
-            Move XY(rx, ry, -47.700, ru)
+            P100 = XY(rx, ry, -58.660, ru)
+            If Left$(hand$, 1) = "L" Then
+                Hand P100, Lefty
+            Else
+                Hand P100, Righty
+            EndIf
+            Move P100
+            P100 = XY(rx, ry, -47.700, ru)
+            If Left$(hand$, 1) = "L" Then
+                Hand P100, Lefty
+            Else
+                Hand P100, Righty
+            EndIf
+            Move P100
             CP Off
             Tool 1
             Print #201, "OK PICKED " + Str$(rx) + "," + Str$(ry)
@@ -603,9 +657,15 @@ server_start:
             ' AND hand (2026-08-26, multi-station integration), dispenses.
             ' Caller (orchestrator.py) is responsible for always passing
             ' the current side's HOME U here, never a quadrant-pick U --
-            ' this command itself just goes wherever it's told. Only this
-            ' initial travel-height Go needs /L//R -- everything after is
-            ' Z-only at the same XY/hand, safe unqualified.
+            ' this command itself just goes wherever it's told.
+            ' Real-hardware finding (2026-08-27): every bare Move XY(...)
+            ' below has no Hand parameter and its own internal target-hand
+            ' resolution silently defaults toward Righty regardless of the
+            ' arm's actual current hand -- fine for Righty, but throws
+            ' error 4037 ("point attribute...differ") for Lefty. Fixed by
+            ' assigning each target to scratch point P100 and explicitly
+            ' setting ITS Hand attribute via the Hand statement before
+            ' Move'ing to it (same pattern as PICK_U above).
             Off 4
             Call EnsurePipetteUp
             Tool 2
@@ -632,7 +692,13 @@ server_start:
             ' operator's own call — "we don't need 3 secs there, remove it").
             ' Was here to give a reaction window before descending near the
             ' plate; now descends immediately after arriving at travel height.
-            Move XY(rx, ry, -58.660, ru)
+            P100 = XY(rx, ry, -58.660, ru)
+            If Left$(hand$, 1) = "L" Then
+                Hand P100, Lefty
+            Else
+                Hand P100, Righty
+            EndIf
+            Move P100
             On 4
             Call WaitPipetteDown
             ' Slow, controlled final approach — this is the whole point of the
@@ -643,14 +709,32 @@ server_start:
             AccelS 10, 10
             ' -60.000, not -62.000 (PICK's aspirate depth) — DROP-only, less
             ' descent needed to reach the well (2026-08-21, operator's call).
-            Move XY(rx, ry, -60.000, ru)
+            P100 = XY(rx, ry, -60.000, ru)
+            If Left$(hand$, 1) = "L" Then
+                Hand P100, Lefty
+            Else
+                Hand P100, Righty
+            EndIf
+            Move P100
             SpeedS 120
             AccelS 120, 120
             Call MotorDrop
-            Move XY(rx, ry, -58.660, ru)
+            P100 = XY(rx, ry, -58.660, ru)
+            If Left$(hand$, 1) = "L" Then
+                Hand P100, Lefty
+            Else
+                Hand P100, Righty
+            EndIf
+            Move P100
             Off 4
             Call WaitPipetteUp
-            Move XY(CX(Here), CY(Here), -47.700, CU(Here))
+            P100 = XY(CX(Here), CY(Here), -47.700, CU(Here))
+            If Left$(hand$, 1) = "L" Then
+                Hand P100, Lefty
+            Else
+                Hand P100, Righty
+            EndIf
+            Move P100
             Tool 1
             Print #201, "OK DROPPED " + Str$(rx) + "," + Str$(ry)
 
