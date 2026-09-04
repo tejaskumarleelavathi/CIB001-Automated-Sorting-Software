@@ -30,9 +30,22 @@
 '   MOVE_PIPETTE_U x,y,u -> OK PIPETTE_POSITION x,y    (Tool 2/pipette, explicit U, NO actuation — teaching)
 '   PIPETTE_DOWN          -> OK PIPETTE_DOWN            (extend pipette at current XY, no motor — teaching)
 '   PIPETTE_UP            -> OK PIPETTE_UP              (retract pipette, no motor — teaching)
-'   PICK x,y             -> OK PICKED x,y              (Tool 2/pipette, holds current U, aspirates)
-'   PICK_U x,y,u,hand     -> OK PICKED x,y              (Tool 2/pipette, explicit U + hand,
-'                                                  aspirates. Breaking change, same as
+'   PICK x,y             -> OK ASPIRATED x,y            (Tool 2/pipette, holds current U, aspirates.
+'                             then OK PICKED x,y          TWO responses as of 2026-08-31 -- ASPIRATED
+'                                                  arrives the instant the motor confirms it has
+'                                                  the specimen, BEFORE the robot retracts/travels
+'                                                  back; PICKED arrives after that full return. The
+'                                                  caller (cib/drivers/robot/driver.py) MUST read
+'                                                  ASPIRATED first via execute_pick(), record the
+'                                                  specimen as held, THEN separately call
+'                                                  wait_pick_complete() to consume PICKED -- this
+'                                                  closes a real race where a safety fault during
+'                                                  the retract/travel-back could cut the connection
+'                                                  before PICKED ever arrived, leaving an already-
+'                                                  aspirated specimen unrecorded.)
+'   PICK_U x,y,u,hand     -> OK ASPIRATED x,y            (Tool 2/pipette, explicit U + hand,
+'                             then OK PICKED x,y          aspirates. Same two-response protocol as
+'                                                  PICK above. Breaking change, same as
 '                                                  MOVE_IMAGE_U above -- 2026-08-26.)
 '   DROP x,y             -> OK DROPPED x,y             (Tool 2/pipette, holds current U, dispenses)
 '   DROP_U x,y,u,hand     -> OK DROPPED x,y             (Tool 2/pipette, explicit U + hand,
@@ -42,6 +55,23 @@
 '                                                  cib/core/orchestrator.py. Breaking
 '                                                  change, same as MOVE_IMAGE_U -- 2026-08-26.)
 '   RING_ON / RING_OFF
+'   RESET_PIPETTE         -> OK RESET_PIPETTE          (motor-only: homes the plunger
+'                                                  against the dispense hard stop via
+'                                                  MotorHome (EX G3, hMT Locked Rotor
+'                                                  detection at low current) -- NO
+'                                                  robot arm travel, no pneumatic.
+'                                                  Sent once by the orchestrator at
+'                                                  every startup (2026-08-31, operator
+'                                                  request) so a specimen can never be
+'                                                  silently left in the tip from a
+'                                                  crashed/interrupted previous run.
+'                                                  Was a blind MotorDrop push-forward
+'                                                  until 2026-09-01 -- switched to a
+'                                                  real home after that produced a bad
+'                                                  grinding noise when the plunger was
+'                                                  already at the hard stop from a
+'                                                  prior run. Takes longer than a plain
+'                                                  drop -- see MotorHome below.)
 '   BYE
 '
 ' Two tools:
@@ -156,6 +186,24 @@
 ' _get_next_well_coords() in the orchestrator is still a hardcoded stub).
 ' To empty the pipette right now: send DROP/DROP_U at wherever you want it
 ' released (e.g. back in the dish, or a waste spot) — it is NOT automatic.
+'
+' Per-move speed bump (2026-09-01, operator request — "increase the robot
+' speed" for 3 specific segments only, everywhere else unchanged): the
+' initial travel-in (Go + the height-settle Move, BEFORE the controlled
+' final descent) inside MOVE_IMAGE(_U), PICK/PICK_U, and DROP/DROP_U now
+' temporarily raises Speed/Accel 25/25,25 -> 35/35,35 and SpeedS/AccelS
+' 120/120,120 -> 160/160,160 for just that one Go+Move pair, then restores
+' the normal 25/120 baseline immediately after. This covers: overhead
+' target -> EoA imaging position (MOVE_IMAGE/_U); EoA imaging position ->
+' above the bug for pickup, i.e. everything between EoA classification
+' confirming a specimen and the pipette arriving over it (PICK/PICK_U);
+' and pick position -> tray/well (DROP/DROP_U). Deliberately NOT touched:
+' HOME/GO_HOME_LEFT (already have their own separate slow override), the
+' controlled final descent itself (SpeedS 10 — the whole point of DEV-11),
+' and PICK/PICK_U's post-aspirate CP-blended retract-and-return. First
+' cautious step, same as every earlier speed change in this file (5->20->25,
+' 100->120) — watch the first several real cycles closely (E-stop ready)
+' before pushing higher.
 
 Function Main
     sort_server
@@ -168,6 +216,22 @@ Function sort_server
     Real rx, ry, cur_u, ru
     Integer sp1, sp2
     Integer comma1, comma2, comma3
+    Integer startupErr
+
+    ' Whole startup block (Motor On through AccelS) wrapped in one error
+    ' trap (2026-08-30 finding, testing Remote Ethernet auto-restart):
+    ' RC+'s own Task Manager showed this task going straight from Running
+    ' to Aborted within ~1-2s of Start, with NO error ever visible via
+    ' GetStatus (error_code stayed 0000 right up to the point Python
+    ' checked) -- meaning whatever failed here killed the task before any
+    ' external channel could see why. Rather than guess which single
+    ' statement is the culprit, catch anything in the whole block, record
+    ' Err's code, and continue to server_start regardless -- STATUS then
+    ' reports it (see below) so a real client (Python, or even a plain
+    ' telnet to port 2000) can read the actual number instead of this
+    ' failing silently again.
+    startupErr = 0
+    OnErr GoTo startup_error
 
     Motor On
     ' CP does NOT auto-reset except at controller startup/motor-on/task end,
@@ -224,11 +288,48 @@ Function sort_server
     ' approach descent.
     SpeedS 120
     AccelS 120, 120
+    OnErr GoTo 0
+    GoTo server_start
+
+startup_error:
+    startupErr = Err
+    OnErr GoTo 0
+    EResume startup_error_resume
+
+startup_error_resume:
+    ' Proceed to server_start anyway -- whatever failed above, still try
+    ' to open the port so STATUS can report startupErr instead of the
+    ' task just dying with no observable cause.
 
 server_start:
+    ' OnErr trap around the FIRST OpenNet/WaitNet only (2026-08-30 finding,
+    ' testing Remote Ethernet auto-restart) -- every LATER re-entry to
+    ' server_start (via BYE or client_gone below) is already safe because
+    ' this task's own CloseNet #201 always runs first. This first call,
+    ' when the task has JUST (re)started, has no such guarantee: a Stop
+    ' command sent via Remote Ethernet kills the previous task abruptly,
+    ' without ever running ITS CloseNet #201 -- so the network object can
+    ' still be held when the freshly-started task tries to bind it again.
+    ' Before this fix, that failure had no handler here at all, so the
+    ' whole task died silently right after starting -- Start/GetStatus
+    ' both reported success (they don't know the task went on to crash),
+    ' but nothing was ever listening on port 2000. Retry with a short wait
+    ' instead of dying.
+    OnErr GoTo open_retry
     OpenNet #201 As Server
+    OnErr GoTo 0
     WaitNet #201
+    GoTo server_ready
 
+open_retry:
+    OnErr GoTo 0
+    EResume open_retry_resume
+
+open_retry_resume:
+    Wait 1.0
+    GoTo server_start
+
+server_ready:
     Do
         OnErr GoTo client_gone
 
@@ -260,7 +361,11 @@ server_start:
             ' this exact class of mixup has cost real debugging time this
             ' session more than once. BUMP THIS every time sort_server.prg
             ' changes.
-            Print #201, "OK READY SORT_SERVER_VER=2026-08-27e"
+            ' STARTUP_ERR appended 2026-08-30 -- see the OnErr trap around
+            ' the whole Motor On..AccelS setup block above. 0 = no error
+            ' occurred during startup; nonzero = the exact SPEL+ error
+            ' code that fired, look it up against the Epson error code list.
+            Print #201, "OK READY SORT_SERVER_VER=2026-09-01b STARTUP_ERR=" + Str$(startupErr)
 
         ElseIf Left$(cmd$, 4) = "HOME" Then
             ' Always ends Righty at P0 (right home). Real-hardware findings
@@ -339,8 +444,24 @@ server_start:
             rx = Val(Mid$(cmd$, sp1 + 1, sp2 - sp1 - 1))
             ry = Val(Mid$(cmd$, sp2 + 1))
             cur_u = CU(Here)
+            ' Faster travel for this specific move only (2026-09-01, operator
+            ' request — overhead-detected target -> EoA imaging position).
+            ' Restored to the normal 25/120 baseline right after — Speed/
+            ' Accel/SpeedS/AccelS are global interpreter settings that
+            ' persist across commands (see the Speed/Accel comment near the
+            ' top of this file), so leaving this elevated would silently
+            ' speed up every later command too, including ones that were
+            ' deliberately NOT part of this request.
+            Speed 35
+            Accel 35, 35
+            SpeedS 160
+            AccelS 160, 160
             Go XY(rx, ry, -47.700, cur_u)
             Move XY(rx, ry, -58.660, cur_u)
+            Speed 25
+            Accel 25, 25
+            SpeedS 120
+            AccelS 120, 120
             Print #201, "OK IMAGE_POSITION " + Str$(CX(Here)) + "," + Str$(CY(Here))
 
         ElseIf Left$(cmd$, 13) = "MOVE_IMAGE_U " Then
@@ -359,6 +480,16 @@ server_start:
             ry = Val(Mid$(coord_str$, comma1 + 1, comma2 - comma1 - 1))
             ru = Val(Mid$(coord_str$, comma2 + 1, comma3 - comma2 - 1))
             hand$ = Mid$(coord_str$, comma3 + 1)
+            ' Faster travel for this specific move only (2026-09-01, operator
+            ' request — overhead-detected target -> EoA imaging position).
+            ' Restored to the normal 25/120 baseline right after Move P100
+            ' below — see the matching comment in MOVE_IMAGE above for why
+            ' the restore is required (Speed/Accel/SpeedS/AccelS persist
+            ' across commands).
+            Speed 35
+            Accel 35, 35
+            SpeedS 160
+            AccelS 160, 160
             ' Left$(hand$,1) not hand$= -- immune to trailing terminator
             ' garbage, same reasoning as test_plate_station_positions.prg.
             If Left$(hand$, 1) = "L" Then
@@ -387,6 +518,10 @@ server_start:
                 Hand P100, Righty
             EndIf
             Move P100
+            Speed 25
+            Accel 25, 25
+            SpeedS 120
+            AccelS 120, 120
             Print #201, "OK IMAGE_POSITION " + Str$(CX(Here)) + "," + Str$(CY(Here))
 
         ElseIf Left$(cmd$, 13) = "MOVE_PIPETTE " Then
@@ -451,8 +586,21 @@ server_start:
             rx = Val(Mid$(cmd$, sp1 + 1, sp2 - sp1 - 1))
             ry = Val(Mid$(cmd$, sp2 + 1))
             cur_u = CU(Here)
+            ' Faster travel for this specific move only (2026-09-01, operator
+            ' request — from the EoA imaging position to above the bug, i.e.
+            ' everything up to (not including) the controlled descent below,
+            ' which stays at its own deliberately slow SpeedS 10). Restored
+            ' to the normal 25/120 baseline right after Move — see the
+            ' matching comment in MOVE_IMAGE above for why the restore is
+            ' required (Speed/Accel/SpeedS/AccelS persist across commands).
+            Speed 35
+            Accel 35, 35
+            SpeedS 160
+            AccelS 160, 160
             Go XY(rx, ry, -47.700, cur_u)
             Move XY(rx, ry, -58.660, cur_u)
+            Speed 25
+            Accel 25, 25
             On 4
             Call WaitPipetteDown
             ' Slow, controlled final approach — this is the whole point of the
@@ -477,6 +625,19 @@ server_start:
             SpeedS 120
             AccelS 120, 120
             Call WaitMotorComplete
+            ' Intermediate response, sent the instant aspiration is actually
+            ' confirmed done -- BEFORE retract/travel-back below (2026-08-31,
+            ' real-hardware finding: Python was only recording "specimen in
+            ' tip" after the FINAL "OK PICKED" response, which only arrives
+            ' after this whole retract+travel-back sequence completes. A
+            ' safety fault landing in that window -- after the bug is
+            ' genuinely already aspirated -- cut the connection before that
+            ' final response could ever arrive, so Python never recorded the
+            ' specimen at all even though it was physically already picked
+            ' up. Python's driver now reads THIS line immediately to record
+            ' it, then separately waits for "OK PICKED" below to confirm the
+            ' full return-to-travel-height also completed.)
+            Print #201, "OK ASPIRATED " + Str$(rx) + "," + Str$(ry)
             ' Pipette (pneumatic) retracts FIRST, THEN robot/EOA Z — reversed
             ' 2026-08-21 from the original EOA-first order (operator's own
             ' hardware observation: the aspirated specimen was falling back
@@ -536,6 +697,17 @@ server_start:
             ry = Val(Mid$(coord_str$, comma1 + 1, comma2 - comma1 - 1))
             ru = Val(Mid$(coord_str$, comma2 + 1, comma3 - comma2 - 1))
             hand$ = Mid$(coord_str$, comma3 + 1)
+            ' Faster travel for this specific move only (2026-09-01, operator
+            ' request — from the EoA imaging position to above the bug, i.e.
+            ' everything up to (not including) the controlled descent below,
+            ' which stays at its own deliberately slow SpeedS 10). Restored
+            ' to the normal 25/120 baseline right after Move P100 — see the
+            ' matching comment in MOVE_IMAGE above for why the restore is
+            ' required (Speed/Accel/SpeedS/AccelS persist across commands).
+            Speed 35
+            Accel 35, 35
+            SpeedS 160
+            AccelS 160, 160
             If Left$(hand$, 1) = "L" Then
                 Go XY(rx, ry, -47.700, ru) /L
             Else
@@ -548,6 +720,8 @@ server_start:
                 Hand P100, Righty
             EndIf
             Move P100
+            Speed 25
+            Accel 25, 25
             On 4
             Call WaitPipetteDown
             ' Slow, controlled final approach — this is the whole point of the
@@ -576,6 +750,12 @@ server_start:
             SpeedS 120
             AccelS 120, 120
             Call WaitMotorComplete
+            ' Intermediate response the instant aspiration is confirmed --
+            ' see the matching comment in PICK above (2026-08-31: closes the
+            ' race where a safety fault during retract/travel-back could cut
+            ' the connection before the final "OK PICKED" ever arrived, so
+            ' Python never recorded an already-aspirated specimen).
+            Print #201, "OK ASPIRATED " + Str$(rx) + "," + Str$(ry)
             ' Pipette retracts FIRST, then robot/EOA Z — see the matching
             ' comment in PICK above (2026-08-21: fixes specimen falling back
             ' into the liquid during retraction).
@@ -625,12 +805,25 @@ server_start:
             ' the 120mm/s linear cap, and that cost more than the blended
             ' corner saved. Back to Go — no CP wrap here (a lone Move with
             ' nothing to blend into is pointless anyway once this reverts).
+            ' Faster travel for this specific move only (2026-09-01, operator
+            ' request — pick position -> tray/well, i.e. everything up to
+            ' (not including) the controlled descent below, which stays at
+            ' its own deliberately slow SpeedS 10). Restored to the normal
+            ' 25/120 baseline right after — see the matching comment in
+            ' MOVE_IMAGE above for why the restore is required (Speed/Accel/
+            ' SpeedS/AccelS persist across commands).
+            Speed 35
+            Accel 35, 35
+            SpeedS 160
+            AccelS 160, 160
             Go XY(rx, ry, -47.700, cur_u)
             ' 3s E-stop reaction pause removed 2026-08-21 (optimize-speed pass,
             ' operator's own call — "we don't need 3 secs there, remove it").
             ' Was here to give a reaction window before descending near the
             ' plate; now descends immediately after arriving at travel height.
             Move XY(rx, ry, -58.660, cur_u)
+            Speed 25
+            Accel 25, 25
             On 4
             Call WaitPipetteDown
             ' Slow, controlled final approach — this is the whole point of the
@@ -683,6 +876,17 @@ server_start:
             ' hardware showed robot_drop got slower, not faster, once this
             ' travel move was capped by SpeedS instead of using Go's PTP
             ' joint-speed profile).
+            ' Faster travel for this specific move only (2026-09-01, operator
+            ' request — pick position -> tray/well, i.e. everything up to
+            ' (not including) the controlled descent below, which stays at
+            ' its own deliberately slow SpeedS 10). Restored to the normal
+            ' 25/120 baseline right after Move P100 — see the matching
+            ' comment in MOVE_IMAGE above for why the restore is required
+            ' (Speed/Accel/SpeedS/AccelS persist across commands).
+            Speed 35
+            Accel 35, 35
+            SpeedS 160
+            AccelS 160, 160
             If Left$(hand$, 1) = "L" Then
                 Go XY(rx, ry, -47.700, ru) /L
             Else
@@ -699,6 +903,8 @@ server_start:
                 Hand P100, Righty
             EndIf
             Move P100
+            Speed 25
+            Accel 25, 25
             On 4
             Call WaitPipetteDown
             ' Slow, controlled final approach — this is the whole point of the
@@ -745,6 +951,32 @@ server_start:
         ElseIf Left$(cmd$, 8) = "RING_OFF" Then
             Off 12
             Print #201, "OK RING_OFF"
+
+        ElseIf Left$(cmd$, 13) = "RESET_PIPETTE" Then
+            ' RESET_PIPETTE — motor-only safety release, no robot arm travel,
+            ' no pneumatic -- safe to send at STARTUP before HOME or
+            ' anything else has run, since it doesn't touch robot position
+            ' or Tool selection at all, only talks to the pipette motor's
+            ' own socket. Sent once by the orchestrator at every startup
+            ' (2026-08-31, operator request) so a specimen can never be
+            ' silently left in the tip from a crashed/interrupted previous
+            ' run.
+            '
+            ' Was Call MotorDrop (a blind fixed-distance push-forward) until
+            ' 2026-09-01 -- real-hardware finding: if the plunger was
+            ' ALREADY at the dispense hard stop (e.g. a previous run already
+            ' dropped and nothing re-aspirated since), MotorDrop tried to
+            ' push it further into a stop it was already touching, at full
+            ' production current/speed -- a very bad grinding noise. Now
+            ' calls MotorHome instead (see that function below): drives
+            ' toward the same hard stop at low current with hMT Locked
+            ' Rotor detection turned on, so it recognizes the touch and
+            ' stops instantly regardless of where the plunger started,
+            ' rather than assuming a starting position and fighting through
+            ' whatever's actually there. Confirmed quiet/clean on real
+            ' hardware, including from-already-dropped, before this switch.
+            Call MotorHome
+            Print #201, "OK RESET_PIPETTE"
 
         ElseIf Left$(cmd$, 3) = "BYE" Then
             Print #201, "OK BYE"
@@ -897,8 +1129,11 @@ Fend
 ' =============================================================================
 ' MotorDrop — connect to the Novanta linear actuator, send EX G1 (push
 ' forward / drop), poll for ">" (move complete) or "?" (error), disconnect.
-' Ported and available, but not yet called from any command — well-travel
-' and dispense are future work.
+' Called by DROP/DROP_U above for the real dispense, and previously also by
+' RESET_PIPETTE at startup -- RESET_PIPETTE now calls MotorHome instead
+' (2026-09-01, see that function below), since a blind push-forward could
+' grind if the plunger was already at the dispense hard stop from a prior
+' run (real-hardware finding, "very bad noise" report).
 ' =============================================================================
 Function MotorDrop
     String resp$
@@ -914,6 +1149,57 @@ Function MotorDrop
             EndIf
             If InStr(resp$, "?") > 0 Then
                 Print "MotorDrop: [ERROR] motor returned error prompt."
+                Exit Do
+            EndIf
+        EndIf
+        Wait 0.1
+    Loop
+    CloseNet #202
+Fend
+
+
+' =============================================================================
+' MotorHome — connect to the Novanta linear actuator, send EX G3 (home to
+' the dispense-end hard stop via hMT Locked Rotor detection), poll for ">"
+' (move complete) or "?" (error), disconnect. Same wire pattern as
+' MotorDrop/MotorAspire -- all the actual homing logic (low current, hMT
+' AS=1 + short LT for fast fault detection, seek, branch on Locked Rotor,
+' P=0, restore normal profile) lives entirely in the G3 program on the
+' motor's own flash, not here -- see
+' hardware_tests/linear_control.py's upload_programs() docstring for the
+' full MCode body and the 2026-09-01 real-hardware story behind it (this
+' drive's hMT closed-loop stall detection is OFF by default; G3 turns it
+' on just for this one seek, at reduced current, and restores everything
+' before finishing). Confirmed working on real hardware via that script's
+' home()/home2 commands before being wired in here.
+'
+' Called by RESET_PIPETTE (below) in place of the old blind MotorDrop call
+' -- MotorDrop always assumed the plunger was starting from the aspirated
+' position and just pushed forward a fixed distance; if it was ALREADY at
+' the dispense hard stop (e.g. a prior run already dropped and nothing
+' re-aspirated since), that produced a real grinding noise pushing into a
+' stop it was already touching. MotorHome has no such assumption -- it
+' creeps in at low current until it genuinely can't go further, regardless
+' of where the plunger started, and recognizes that touch instead of
+' fighting it.
+'
+' Takes noticeably longer than MotorDrop/MotorAspire -- it's a real (slow,
+' low-current) seek move up to HOME_SEEK_STEPS, not an instant trigger.
+' =============================================================================
+Function MotorHome
+    String resp$
+    SetNet #202, "172.16.9.60", 503, CR, NONE, 0
+    OpenNet #202 As Client
+    WaitNet #202
+    Print #202, "EX G3"
+    Do
+        If ChkNet(202) > 0 Then
+            Input #202, resp$
+            If InStr(resp$, ">") > 0 Then
+                Exit Do
+            EndIf
+            If InStr(resp$, "?") > 0 Then
+                Print "MotorHome: [ERROR] motor returned error prompt."
                 Exit Do
             EndIf
         EndIf

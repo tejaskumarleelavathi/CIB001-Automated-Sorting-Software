@@ -15,8 +15,13 @@ Commands used:
     GO_HOME_LEFT         -> OK GO_HOME_LEFT (lift Z, always ends Lefty at left home)
     MOVE_IMAGE rx,ry    -> OK IMAGE_POSITION rx,ry   (XY + drop Z for EoA, holds current U/hand)
     MOVE_IMAGE_U rx,ry,u,hand -> OK IMAGE_POSITION rx,ry  (explicit U + hand — quadrant selection)
-    PICK rx,ry          -> OK PICKED rx,ry           (pipette Tool 2, aspirate, holds current U/hand)
-    PICK_U rx,ry,u,hand -> OK PICKED rx,ry           (explicit U + hand — quadrant selection)
+    PICK rx,ry          -> OK ASPIRATED rx,ry        (pipette Tool 2, aspirate, holds current U/hand.
+                            then OK PICKED rx,ry       TWO responses as of 2026-08-31 — ASPIRATED the
+                                                       instant the motor confirms, before retract/
+                                                       travel-back; PICKED after that full return.
+                                                       execute_pick() below reads both in one call.)
+    PICK_U rx,ry,u,hand -> OK ASPIRATED rx,ry        (explicit U + hand — quadrant selection.
+                            then OK PICKED rx,ry       Same two-response protocol as PICK.)
     DROP rx,ry          -> OK DROPPED rx,ry          (pipette Tool 2, dispense, holds current U/hand)
     DROP_U rx,ry,u,hand -> OK DROPPED rx,ry          (explicit U + hand — always the current
                                                        side's HOME U, never a quadrant-pick U)
@@ -34,7 +39,7 @@ import asyncio
 import socket
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 import structlog
 
@@ -274,10 +279,44 @@ class EpsonT3BDriver:
 
     async def execute_pick(
         self, pick_x: float, pick_y: float, u: float | None = None, hand: str = "R",
+        on_aspirated: Callable[[], None] | None = None,
     ) -> None:
         """
         Aspirate the specimen at (pick_x, pick_y) using the pipette (Tool 2).
-        Returns once the specimen is confirmed in the tip.
+        Returns once the specimen is confirmed in the tip AND the robot has
+        retracted and traveled back to image height (sort_server.prg's
+        final "OK PICKED" response) — same overall contract as before.
+
+        on_aspirated: optional zero-arg callback invoked the instant
+        sort_server.prg's intermediate "OK ASPIRATED" response confirms
+        the motor has the specimen — BEFORE the robot has also retracted/
+        traveled back. Dispatched via loop.call_soon_threadsafe() (this
+        whole call runs in a worker thread), so it's safe for the callback
+        to touch orchestrator/asyncio-owned state directly. The
+        orchestrator uses this to record "specimen is now in the pipette"
+        at the true earliest correct moment instead of waiting for this
+        whole call to return.
+
+        Two-response protocol (2026-08-31, real-hardware finding): the
+        orchestrator used to only learn "specimen aspirated" once this
+        ENTIRE call returned — which only happens after the robot ALSO
+        retracts and travels back to image height. A safety fault landing
+        in that later window — after the specimen was genuinely already
+        aspirated, but before that whole return trip finished — cut the
+        connection before this call could ever return, so the orchestrator
+        never recorded the specimen as picked at all, even though it
+        physically was (confirmed live: operator waited for the aspirate
+        to visibly finish, then tripped the light curtain — CONTINUE's
+        recovery found nothing pending to deliver). sort_server.prg now
+        sends "OK ASPIRATED" the instant the motor confirms, specifically
+        so on_aspirated can fire immediately and close that race — a
+        single synchronous call+lock-hold here (not a second, separate
+        public method/executor round-trip) so nothing else can interleave
+        a command on this socket during the robot's retract/travel-back,
+        and so this doesn't need cross-thread lock hand-off (self._cmd_lock
+        is an RLock, which only the thread that acquired it may release —
+        run_in_executor gives no guarantee two separate calls land on the
+        same worker thread).
 
         u: wrist angle for the PICK move (dish quadrant U — see
            cib/core/orchestrator.py _select_quadrant_u()).
@@ -285,14 +324,19 @@ class EpsonT3BDriver:
               meaningful when u is given.
 
         Split from execute_place() so the orchestrator can durably record
-        "specimen is now in the pipette" the instant this returns — needed
-        so an e-stop/light-curtain fault after this point knows to deliver
+        "specimen is now in the pipette" as early as possible — needed so
+        an e-stop/light-curtain fault after that point knows to deliver
         the specimen on recovery instead of losing it or attempting a
         second pick on top of it.
         """
         log.info("robot.execute_pick", pick_x=pick_x, pick_y=pick_y, u=u, hand=hand)
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._pick_sync, pick_x, pick_y, u, hand)
+        threadsafe_callback = (
+            (lambda: loop.call_soon_threadsafe(on_aspirated)) if on_aspirated is not None else None
+        )
+        await loop.run_in_executor(
+            None, self._pick_sync, pick_x, pick_y, u, hand, threadsafe_callback,
+        )
 
     async def execute_place(
         self, well_x: float, well_y: float, well_u: float | None = None, hand: str = "R",
@@ -316,7 +360,10 @@ class EpsonT3BDriver:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._drop_sync, well_x, well_y, well_u, hand)
 
-    def _pick_sync(self, x: float, y: float, u: float | None = None, hand: str = "R") -> None:
+    def _pick_sync(
+        self, x: float, y: float, u: float | None = None, hand: str = "R",
+        on_aspirated: Callable[[], None] | None = None,
+    ) -> None:
         cmd = (
             f"PICK_U {x:.3f},{y:.3f},{u:.3f},{hand}"
             if u is not None
@@ -329,9 +376,32 @@ class EpsonT3BDriver:
                 log.warning("robot.reconnecting_after_drop", reason=str(exc))
                 self._reconnect_sync()
                 resp = self._send(cmd, timeout=self._motion_timeout)
-        if not resp.startswith("OK PICKED"):
-            raise RuntimeError(f"PICK failed: {resp!r}")
-        log.info("robot.pick_complete", response=resp)
+            if not resp.startswith("OK ASPIRATED"):
+                raise RuntimeError(f"PICK failed: {resp!r}")
+            log.info("robot.aspirated", response=resp)
+            if on_aspirated is not None:
+                on_aspirated()
+
+            # Still holding _cmd_lock -- read the final response before
+            # releasing, so nothing else (keepalive, another command) can
+            # interleave on this socket while the robot retracts/travels
+            # back. Deliberately NO reconnect-on-drop here, unlike the
+            # first read above: the specimen is already recorded via
+            # on_aspirated, so a failure here should fall through to the
+            # existing safety-fault recovery path, not attempt to keep
+            # waiting on what would have to be a fresh connection to a
+            # possibly-restarted task with no memory of this in-flight
+            # retract.
+            self._sock.settimeout(self._motion_timeout)
+            try:
+                final_resp = self._recv_line()
+            except socket.timeout as exc:
+                raise RuntimeError(
+                    f"Robot timed out after {self._motion_timeout}s waiting for PICK completion"
+                ) from exc
+        if not final_resp.startswith("OK PICKED"):
+            raise RuntimeError(f"PICK completion failed: {final_resp!r}")
+        log.info("robot.pick_complete", response=final_resp)
 
     def _drop_sync(self, x: float, y: float, u: float | None = None, hand: str = "R") -> None:
         cmd = (
@@ -399,6 +469,47 @@ class EpsonT3BDriver:
         if "OK RING_OFF" not in resp:
             raise RuntimeError(f"RING_OFF failed: {resp!r}")
         log.info("robot.ring_light_off")
+
+    async def reset_pipette(self) -> None:
+        """
+        Motor-only safety release (2026-08-31, operator request): homes the
+        pipette plunger against its dispense-end hard stop (MotorHome, sort_
+        server.prg -- EX G3, hMT Locked Rotor detection at low current), no
+        robot arm travel. Called once by the orchestrator at every startup
+        so a specimen can never be silently left in the tip from a crashed/
+        interrupted previous run.
+
+        Was a blind MotorDrop push-forward until 2026-09-01 -- real-hardware
+        finding: if the plunger was already at the dispense hard stop (e.g.
+        a previous run already dropped and nothing re-aspirated since),
+        that pushed further into a stop it was already touching, at full
+        production current/speed -- a bad grinding noise. MotorHome creeps
+        in at low current and stops the instant it genuinely can't go
+        further, regardless of where the plunger started. Takes noticeably
+        longer than the old MotorDrop trigger did -- a real (slow,
+        low-current) seek, not an instant command -- see MOTION_TIMEOUT_S,
+        comfortably larger than any realistic homing duration.
+        """
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._reset_pipette_sync)
+
+    def _reset_pipette_sync(self) -> None:
+        # Reconnect-on-drop, same pattern as _drop_sync -- this runs at
+        # startup, right after connect(), so a drop here should be rare,
+        # but not worth a special case. motion_timeout (not
+        # connect_timeout) because MotorHome's own completion wait can
+        # take several real seconds -- a full low-current seek move, not
+        # an instant trigger (see reset_pipette()'s docstring).
+        with self._cmd_lock:
+            try:
+                resp = self._send("RESET_PIPETTE", timeout=self._motion_timeout)
+            except (ConnectionError, OSError) as exc:
+                log.warning("robot.reconnecting_after_drop", reason=str(exc))
+                self._reconnect_sync()
+                resp = self._send("RESET_PIPETTE", timeout=self._motion_timeout)
+        if "OK RESET_PIPETTE" not in resp:
+            raise RuntimeError(f"RESET_PIPETTE failed: {resp!r}")
+        log.info("robot.pipette_reset", response=resp)
 
     def resume(self) -> None:
         """Clear halted flag after safety reset. Call connect() separately to reconnect."""

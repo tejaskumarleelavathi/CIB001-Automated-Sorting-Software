@@ -15,7 +15,7 @@ To add a new device:
 
 from __future__ import annotations
 
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Callable, Protocol, runtime_checkable
 import numpy as np
 
 
@@ -46,15 +46,28 @@ class RobotDriver(Protocol):
 
     async def execute_pick(
         self, pick_x: float, pick_y: float, u: float | None = None, hand: str = "R",
+        on_aspirated: Callable[[], None] | None = None,
     ) -> None:
         """
         Aspirate the specimen at (pick_x, pick_y) using the pipette (Tool 2).
-        Returns once the specimen is confirmed in the tip.
+        Returns once the specimen is confirmed in the tip AND the robot has
+        retracted/returned to travel height.
 
         u: wrist angle (deg) for the pick move — same u used for the EoA
         move that found this specimen (dish quadrant selection).
         hand: "L" or "R" — which side this quadrant U belongs to. Only
         meaningful when u is given.
+
+        on_aspirated: optional zero-arg callback invoked the instant the
+        specimen is confirmed in the tip — BEFORE the robot has also
+        retracted/traveled back. Safe to touch orchestrator state from
+        directly. Lets the orchestrator record "specimen is now in the
+        pipette" at the true earliest correct moment (2026-08-31,
+        real-hardware finding: recording it only after this whole call
+        returns left a real race where a safety fault during the
+        retract/travel-back — after the specimen was genuinely already
+        aspirated — could cut the connection before this call ever
+        returned, leaving an already-aspirated specimen unrecorded).
 
         Split from the drop step (execute_place) so the orchestrator can
         record "specimen is now in the pipette" as its own durable state
@@ -106,6 +119,42 @@ class RobotDriver(Protocol):
     async def keepalive(self) -> None:
         """Send a no-motion ping to prevent the controller dropping an idle connection."""
         ...
+
+    async def reset_pipette(self) -> None:
+        """
+        Motor-only safety release: homes the pipette plunger against its
+        dispense-end hard stop (low current + closed-loop stall detection,
+        not a blind push), no robot arm travel. Called once by the
+        orchestrator at every startup so a specimen can never be silently
+        left in the tip from a crashed/interrupted previous run. Takes
+        noticeably longer than a plain drop -- a real seek move, not an
+        instant trigger.
+        """
+        ...
+
+
+# ---------------------------------------------------------------------------
+# Robot Remote Ethernet — controller-level lifecycle control
+# (Login/Reset/SetMotorsOn/Off/Start/Stop), separate from RobotDriver's
+# own PICK/DROP/MOVE_IMAGE protocol above. See cib/drivers/robot_remote/.
+# Deliberately not held open for the process lifetime — connect(), run a
+# short sequence, disconnect().
+# ---------------------------------------------------------------------------
+
+@runtime_checkable
+class RobotRemoteDriver(Protocol):
+    async def connect(self) -> None: ...
+    async def disconnect(self) -> None: ...
+    async def get_status(self) -> Any: ...
+    async def wait_until_ready(self, timeout_s: float = 30.0, poll_interval_s: float = 0.2) -> bool: ...
+    async def wait_until_error_cleared(self, timeout_s: float = 8.0, poll_interval_s: float = 0.2) -> bool: ...
+    async def wait_until_running(self, timeout_s: float = 8.0, poll_interval_s: float = 0.2) -> bool: ...
+    async def reset(self, robot_number: int = 0) -> None: ...
+    async def set_motors_on(self, robot_number: int = 0) -> None: ...
+    async def set_motors_off(self, robot_number: int = 0) -> None: ...
+    async def start(self, function_no: int = 0) -> None: ...
+    async def stop(self, robot_number: int = 0) -> None: ...
+    async def home(self) -> None: ...
 
 
 # ---------------------------------------------------------------------------

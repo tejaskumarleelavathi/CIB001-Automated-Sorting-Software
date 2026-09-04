@@ -12,20 +12,26 @@ real-world distance until lead screw pitch is confirmed and measured.
 Programs stored on motor flash:
   G1  →  MR -800000  (drop / dispense — carriage moves forward)
   G2  →  MR +800000  (aspire / draw — carriage moves backward)
+  G3  →  home to the dispense-end hard stop (2026-09-01, see
+          upload_programs()'s docstring for the full MCode body)
+  G4  →  G3's internal success handler (not meant to be EX'd directly)
 
-Python just sends "EX G1" or "EX G2" to trigger them.  The motor
+Python just sends "EX G1" / "EX G2" / "EX G3" to trigger them.  The motor
 executes the move autonomously and signals completion via the ">" prompt.
 
-Labels G1 / G2 chosen because:
+Labels G1 / G2 / G3 / G4 chosen because:
   - G prefix is not a reserved MCode mnemonic in LMDAM/LMDAE firmware
   - Lessons from first motor: F* prefix triggers ER=24 (reserved); A* safe,
     G* also safe — use G here to distinguish from the rotary motor's A* labels
 
 Usage:
-  python hardware_tests/linear_control.py upload    # flash G1+G2 to motor (run once)
+  python hardware_tests/linear_control.py upload    # flash G1+G2+G3+G4 to motor (run once)
   python hardware_tests/linear_control.py drop      # execute G1 (forward 800000 steps)
   python hardware_tests/linear_control.py aspire    # execute G2 (reverse 800000 steps)
+  python hardware_tests/linear_control.py move <n>  # raw MR <n>, any step count, no re-flash
   python hardware_tests/linear_control.py pos       # print position, no motion
+  python hardware_tests/linear_control.py home      # home, orchestrated from this script
+  python hardware_tests/linear_control.py home2     # home, via the onboard G3 program (EX G3)
   python hardware_tests/linear_control.py run       # interactive loop
 
 Protocol recap:
@@ -215,8 +221,22 @@ _ER_MEANINGS = {
     "46": "Not in Program Mode — LB/MR/H/E sent outside PG block.",
     "64": "Label already exists — CP+S to clear, then re-upload.",
     "73": "Cannot enter/exit PG or run CP while motor is moving — check PR MV.",
-    "86": "Stall detected — drive bridge disabled (DE→0).",
-    "104": "hMT Locked Rotor — power cycle required.",
+    # 79/96 confirmed 2026-09-01 against MCode-V2.06-NOVA.pdf Appendix B,
+    # found live on real hardware (main motor +V briefly reading 0-6V):
+    "79": "Plus V out of range (too high or too low) — main motor power "
+          "supply issue. Check PR VT: format is 'status, AuxV, +VDC'.",
+    "92": "Position Error (closed-loop following error exceeded).",
+    "96": "Not allowed to start motion with no +V — see ER 79.",
+    "86": "Stall detected (open-loop) — drive bridge disabled (DE→0). Only "
+          "fires with hMT inactive (AS=0, the factory default) — see ER 104.",
+    # 104 confirmed 2026-09-01, same manual, "Locked Rotor" section (p.158)
+    # + CF command definition: recover with CF, NOT plain ER=0. Does NOT
+    # require a power cycle -- that was an earlier, wrong guess. Only
+    # fires when hMT is active (AS=1/2/3) -- see home()'s AS=1 switch.
+    "104": "hMT Locked Rotor — commanded to move but the encoder confirms "
+           "it isn't (e.g. driven into a hard stop). Clear with CF, not ER=0.",
+    "107": "Lag Limit reached (LG exceeded) — closed-loop following error, "
+           "hMT active only.",
 }
 
 def _er_meaning(er: str) -> str:
@@ -385,10 +405,19 @@ def print_velocity(sock: socket.socket) -> None:
         print(f"[VEL]   {label:24s} = {val or '(no response)'}")
 
 
-def run_program(sock: socket.socket, label: str, description: str) -> None:
+def run_program(sock: socket.socket, label: str, description: str) -> bool:
     """
     Execute a stored onboard program by label name and wait for completion.
     E.g. run_program(sock, "G1", "drop (forward)")
+
+    Returns True if EX was accepted and the move completed, False if EX
+    itself was rejected (e.g. ER=30 Unknown Label — the program was never
+    actually flashed/labeled). Callers that need to know whether real
+    motion happened (not just print a status line) must check this —
+    2026-09-01 finding: home_onboard() used to trust PR P's value
+    unconditionally after calling this, which produced a misleading
+    "[OK] found the hard stop" even though EX G3 had just been rejected —
+    the position it read was simply left over from an earlier, real run.
     """
     print(f"[RUN]   EX {label}  ({description}) ...")
     _, ok = send_cmd(sock, f"EX {label}")
@@ -397,8 +426,43 @@ def run_program(sock: socket.socket, label: str, description: str) -> None:
         er = extract_value(resp_er, "PR ER")
         print(f"[ERROR] EX {label} rejected.  ER = {er} — {_er_meaning(er)}")
         print("        Have you run 'upload' yet?  Programs must be flashed before use.")
-        return
+        return False
     wait_for_stop(sock, description)
+    print_position(sock)
+    return True
+
+
+def run_manual_move(sock: socket.socket, steps: int) -> None:
+    """
+    Immediate-mode MR <steps> — a raw relative move for an arbitrary step
+    count, bypassing G1/G2 entirely. No re-flash needed to try a distance
+    that isn't ASPIRE_STEPS/DROP_STEPS -- useful for dialing in a new step
+    count before committing to it (same idea as this file's own step-count
+    tuning history, see DROP_STEPS/ASPIRE_STEPS comments above).
+
+    Sign convention matches ASPIRE_STEPS/DROP_STEPS: positive = aspire /
+    reverse, negative = drop / forward.
+
+    Explicitly sets VM/A/D to VELOCITY_MAX/ACCEL/DECEL first (the same
+    values G1/G2's own onboard bodies use) rather than trusting whatever
+    profile happens to be ambient on the drive -- home()/home2 always
+    restore this after themselves, but being explicit here means a
+    manual move's timing is always genuinely comparable to production,
+    regardless of what ran before it.
+    """
+    print(f"[MOVE]  Setting VM={VELOCITY_MAX} A={ACCEL} D={DECEL} (production profile) ...")
+    send_cmd(sock, f"VM={VELOCITY_MAX}", verbose=False)
+    send_cmd(sock, f"A={ACCEL}", verbose=False)
+    send_cmd(sock, f"D={DECEL}", verbose=False)
+
+    print(f"[MOVE]  MR {steps:+d} ...")
+    _, ok = send_cmd(sock, f"MR {steps}")
+    if not ok:
+        resp_er, _ = send_cmd(sock, "PR ER")
+        er = extract_value(resp_er, "PR ER")
+        print(f"[ERROR] MR {steps} rejected.  ER = {er} — {_er_meaning(er)}")
+        return
+    wait_for_stop(sock, f"manual move ({steps:+d} steps)")
     print_position(sock)
 
 
@@ -430,9 +494,11 @@ def _pgm_or_die(sock: socket.socket, command: str) -> None:
 
 def upload_programs(sock: socket.socket) -> None:
     """
-    Flash two programs to the motor's non-volatile flash memory:
+    Flash four programs to the motor's non-volatile flash memory:
       G1  →  VM=/A=/D= + MR -800000   (drop / forward / dispense)
       G2  →  VM=/A=/D= + MR +800000   (aspire / reverse / draw)
+      G3  →  home-to-hard-stop (2026-09-01, see below)
+      G4  →  G3's internal success handler (not meant to be EX'd directly)
 
     Full sequence:
       1.  Check motor is not moving (Error 73 if CP/PG run while moving)
@@ -442,11 +508,46 @@ def upload_programs(sock: socket.socket) -> None:
       5.  PG        — exit program mode
       6.  S         — commit to flash (survives power cycles)
 
-    Label choice: G1/G2 — 'G' prefix confirmed safe in LMDAE firmware.
+    Label choice: G1/G2/G3/G4 — 'G' prefix confirmed safe in LMDAE firmware.
     Avoid: F* (reserved, causes ER=24), R* (RT = return cmd), SU (auto-runs on boot).
-    Each program sets VM/A/D (velocity profile), then MR (the move), then
-    H (hold — waits for move to finish), then E (end). H is CRITICAL:
-    without it the program exits before the carriage stops moving.
+    CP wipes ALL existing programs at once, so every upload re-flashes G1+G2
+    even when only G3/G4 actually changed — this is why they're all written
+    together in one pass rather than G3/G4 being addable independently.
+
+    G1/G2: sets VM/A/D (velocity profile), then MR (the move), then H (hold
+    — waits for move to finish), then E (end). H is CRITICAL: without it
+    the program exits before the carriage stops moving.
+
+    G3 (home): the ONBOARD equivalent of this same file's home() function
+    (see its docstring for the full story — hMT is off by default on this
+    drive, AS=1 turns on closed-loop Locked Rotor detection, LT shortens
+    the reaction time from 2000ms to 50ms). Confirmed working via home()
+    on real hardware 2026-09-01 before being ported here — this MCode body
+    is the same sequence, just running autonomously on the motor instead
+    of being orchestrated command-by-command from the PC:
+      1. Er=0 — clear any stale error
+      2. AS=1, LT=50, RC=15, VM/A/D lowered — enter the safe seek profile
+      3. MR -2000000 — seek toward the dispense-end hard stop
+      4. H — hold until the move stops (full distance OR a Locked Rotor cutoff)
+      5. BR G4, Er=104 — if Locked Rotor fired (the expected/good outcome),
+         jump to G4 to finish; otherwise fall through
+      6. Fallthrough path (no fault — seek ran the full distance without
+         ever contacting anything): restore the normal profile and end
+         WITHOUT touching P — never trust an un-stalled seek as home.
+      7. G4 (the branch target): CF (clear the Locked Rotor fault, same as
+         the manual's own recovery instruction — NOT plain Er=0), then
+         MR HOME_BACKOFF_STEPS + H (back off ~2mm toward aspiration,
+         David's suggestion 2026-09-01 — see the HOME_BACKOFF_STEPS
+         comment above home() for why: without this, every NORMAL drop
+         cycle, not just homing, was landing right at the true hard stop,
+         since G1/G2 are a matched relative-move pair built on top of
+         wherever P=0 is), THEN P=0 (this backed-off position is home, not
+         the touch point), then restore the normal profile and end.
+    RC=25 / VM=2400000 / A=4000000 / D=4000000 / AS=0 / LT=2000 restored at
+    the end of BOTH paths — these are this motor's confirmed-current
+    production baseline (VM/A/D match VELOCITY_MAX/ACCEL/DECEL below; RC/
+    AS/LT match what was read back off the drive before any of this
+    session's testing touched them).
     """
 
     # ── Guard: must not be moving ─────────────────────────────────────────────
@@ -485,17 +586,17 @@ def upload_programs(sock: socket.socket) -> None:
         sys.exit(1)
     print("[OK]    In program mode.\n")
 
-    # ── Write programs ────────────────────────────────────────────────────────
-    # VM/A/D set INSIDE each program body — G1 and G2 are separate onboard
-    # programs, so each must set its own velocity profile explicitly rather
-    # than relying on whatever an earlier immediate-mode command left behind.
-    programs = [
+    # ── Write G1/G2 (simple 3-line programs) ──────────────────────────────────
+    # VM/A/D set INSIDE each program body — separate onboard programs, so
+    # each must set its own velocity profile explicitly rather than relying
+    # on whatever an earlier immediate-mode command left behind.
+    simple_programs = [
         # (label,  move_cmd,                  description)
         ("G1", f"MR {DROP_STEPS}",   f"drop / forward  ({DROP_STEPS} steps)"),
         ("G2", f"MR {ASPIRE_STEPS}", f"aspire / reverse ({ASPIRE_STEPS} steps)"),
     ]
 
-    for label, move_cmd, desc in programs:
+    for label, move_cmd, desc in simple_programs:
         print(f"  -- Program '{label}'  ({desc})")
         _pgm_or_die(sock, f"LB {label}")   # declare label
         _pgm_or_die(sock, f"VM={VELOCITY_MAX}")   # max velocity
@@ -505,6 +606,42 @@ def upload_programs(sock: socket.socket) -> None:
         _pgm_or_die(sock, "H")              # hold: wait for move to finish
         _pgm_or_die(sock, "E")              # end program
         print()
+
+    # ── Write G3/G4 (home-to-hard-stop, see docstring above) ──────────────────
+    print("  -- Program 'G3' (home to dispense-end hard stop, hMT Locked Rotor)")
+    restore_lines = [
+        f"VM={VELOCITY_MAX}", f"A={ACCEL}", f"D={DECEL}",
+        "AS=0", "LT=2000", "RC=25",
+    ]
+    g3_lines = [
+        "LB G3",   # declare the label -- EX G3 fails with ER=30 (Unknown
+                   # Label) without this; missing on the first upload attempt.
+        "Er=0",
+        "AS=1", "LT=50", "RC=15",
+        f"VM={HOME_SEEK_VELOCITY}", f"A={HOME_SEEK_ACCEL}", f"D={HOME_SEEK_ACCEL}",
+        f"MR {-HOME_SEEK_STEPS}",
+        "H",
+        "BR G4, Er=104",
+        *restore_lines,   # no fault -- do NOT touch P, just restore and end
+        "E",
+    ]
+    for line in g3_lines:
+        _pgm_or_die(sock, line)
+    print()
+
+    print("  -- Program 'G4' (G3's success handler -- not meant to be EX'd directly)")
+    g4_lines = [
+        "CF",                                # clear the Locked Rotor fault, re-enable bridges
+        f"MR {HOME_BACKOFF_STEPS}",          # back off ~2mm toward aspiration -- see
+                                              # HOME_BACKOFF_STEPS comment above home()
+        "H",                                 # wait for the backoff move to finish
+        "P=0",                               # THIS backed-off position is home, not the touch point
+        *restore_lines,
+        "E",
+    ]
+    for label_or_line in ["LB G4", *g4_lines]:
+        _pgm_or_die(sock, label_or_line)
+    print()
 
     # ── Exit program mode ─────────────────────────────────────────────────────
     # 'PG' (no address) switches back to immediate mode — '>' prompt returns.
@@ -526,8 +663,254 @@ def upload_programs(sock: socket.socket) -> None:
     print("\n[UPLOAD] Done.")
     print(f"         G1 = drop   (MR {DROP_STEPS} steps, forward)")
     print(f"         G2 = aspire (MR {ASPIRE_STEPS} steps, reverse)")
-    print(f"         VM={VELOCITY_MAX}  A={ACCEL}  D={DECEL}  (both programs)")
+    print(f"         G3 = home   (seek dispense-end hard stop, hMT Locked Rotor)")
+    print(f"         VM={VELOCITY_MAX}  A={ACCEL}  D={DECEL}  (G1/G2, and G3's restored baseline)")
     print("         Programs survive power cycles.  Re-run 'upload' if step counts OR velocity change.\n")
+
+
+# ── Homing (2026-08-28) ────────────────────────────────────────────────────────
+# No limit switch exists on this actuator -- G1/G2 are pure relative moves
+# (MR), so the drive's own position counter (P) only ever reflects what it
+# THINKS it did, not where the carriage actually is. Any stall, timeout, or
+# interrupted move (e.g. an operator disconnect mid-cycle) silently shifts
+# the effective zero from then on -- reported live 2026-08-28 as "the
+# syringe stays pulled back a little and that's become normal."
+#
+# The only way to establish a true, drift-proof zero without a limit switch
+# is to deliberately drive the carriage into its own mechanical hard stop
+# and let the drive detect that it got there, then redefine that physical
+# position as P=0.
+# Operator-confirmed (2026-08-28): the DISPENSE end (G1 / forward
+# direction) is the safe end to home against -- do NOT home against the
+# aspirate/backward end without separately confirming that end is safe too.
+#
+# Runs at reduced velocity/accel/current for this ONE seek move only, then
+# restores whatever profile was already configured -- hitting a hard stop
+# at full production speed/torque risks mechanical wear on every homing run.
+#
+# 2026-09-01 real-hardware finding, first live test of this function: at
+# RC=30 the carriage visibly reached the syringe and kept grinding against
+# it for several seconds, then simply stopped once the seek move ran out of
+# its own commanded distance -- PR ER read 0 the whole time, no fault ever
+# fired. Root cause, confirmed against the actual manual (Software/
+# MCode-V2.06-NOVA.pdf, one level up from this repo, Appendix B + the hMT
+# chapter): this drive is hMT-*capable* (it has an encoder) but hMT
+# closed-loop monitoring is OFF by default -- AS (hMT Mode) defaults to 0,
+# "hMT inactive: motor performs as a traditional stepper." With hMT off,
+# NOTHING watches the encoder for "commanded to move but isn't" -- not the
+# open-loop stall detector (ER=86, what this function used to check for)
+# and not the closed-loop Locked Rotor detector either. The drive just
+# blindly executes the commanded step profile regardless of what the
+# carriage is actually doing.
+#
+# Fix: temporarily switch to AS=1 ("Fixed Current" hMT mode -- uses RC
+# directly, and critically does NOT auto-start motion the instant it's set,
+# unlike AS=3 "Torque mode", which the manual flags with an explicit hazard
+# warning: "Motion will commence IMMEDIATELY upon setting AS=3"). With hMT
+# active, a genuine jam now raises ER=104 "Locked Rotor" -- the manual's own
+# words: "no rotor movement while at the maximum allowed lag for a
+# specified period of time" -- exactly "commanded to move, encoder says it
+# isn't." Recovered with CF (Clear Locked Rotor Fault), NOT the plain
+# ER=0/DE=1 pattern -- confirmed via the manual's CF command definition.
+# Also shortens LT (Locked Rotor Timeout, how long the drive tolerates
+# "at max lag, no movement" before cutting power) from its 2000ms (2 full
+# second) default down to 50ms, the manual's own example value -- 2 seconds
+# of tolerated grinding before the old default would even react was likely
+# a real part of what made the first test as bad as it was. AS/LT are
+# saved and restored afterward exactly like VM/A/D/RC below -- G1/G2's
+# normal production moves keep running in the plain AS=0 mode they've
+# always used, completely untouched by this.
+#
+# Run current also lowered 30 -> 15 (operator's own real-hardware call,
+# 2026-09-01 -- "we can decrease the power even more"): even with hMT
+# detection now active, current still needs to be low enough that the
+# rotor genuinely CAN'T keep turning against the hard stop (a true stall/
+# lock), rather than merely slipping/grinding through it at reduced but
+# still-sufficient torque. Tune further from here based on what you hear.
+#
+# HOME_SEEK_STEPS is deliberately larger than any step count ever recorded
+# for this actuator (max seen: 1,575,000, per architecture/motor.md) so the
+# seek move cannot possibly complete without hitting something -- but the
+# true mechanical travel limit is still unconfirmed. Watch closely on every
+# real run; Ctrl+C sends SL 0 at any time (see main()'s except block).
+#
+# HOME_BACKOFF_STEPS (2026-09-01, David's suggestion, relayed by operator):
+# P=0 was originally set at the EXACT point of contact with the hard stop.
+# Problem: G1/G2 are relative moves (MR) tuned as a matched forward/back
+# pair, so DROP always lands back at roughly this same reference point --
+# meaning every single NORMAL drop cycle, not just the once-per-startup
+# home, was landing the carriage right at (or essentially at) the true
+# hard stop. Fix, standard practice for hard-stop homing: after confirming
+# the stop (Locked Rotor), back OFF a small distance before declaring
+# P=0 -- so the zero every future relative move is built on sits a small
+# clearance short of the real mechanical limit, and only this one-time
+# homing sequence ever actually touches it. 40,000 steps = 2mm (operator-
+# measured conversion, 2026-09-01) -- towards ASPIRATION (positive
+# direction, same sign as ASPIRE_STEPS), i.e. away from the dispense-end
+# hard stop this routine homes against.
+HOME_SEEK_STEPS      = 2_000_000   # forward -- past any step count ever used
+HOME_SEEK_VELOCITY   = 300_000     # steps/sec -- conservative, well under production VM
+HOME_SEEK_ACCEL      = 500_000     # steps/sec^2
+HOME_RUN_CURRENT_PCT = 15          # % -- lowered from 30, see comment above
+HOME_LOCKED_ROTOR_TIMEOUT_MS = 50  # LT -- default is 2000ms, see comment above
+HOME_BACKOFF_STEPS   = 40_000      # = 2mm, toward aspiration -- see comment above
+
+
+def home(sock: socket.socket) -> None:
+    """
+    Home the carriage against its dispense-end (forward) hard stop, back
+    off HOME_BACKOFF_STEPS (~2mm) toward aspiration, and redefine THAT
+    position as P=0 -- not the touch point itself. See the HOME_* comment
+    block above for why forward specifically, the AS/LT hMT switch, the
+    current/velocity caveats, and why the backoff exists (David's
+    suggestion: G1/G2 are a matched relative-move pair, so without this,
+    every normal drop cycle -- not just homing -- was landing right at the
+    real hard stop).
+    """
+    print("[HOME]  Homing against the DISPENSE (forward) hard stop.")
+    print("        Watch closely — Ctrl+C sends SL 0 (stop) at any time.\n")
+
+    # Save the current velocity/mode profile so it can be restored
+    # afterward — same save/restore pattern as upload_programs(), just
+    # read instead of hardcoded. AS/LT added 2026-09-01, see comment above.
+    saved: dict[str, str] = {}
+    for reg in ("VM", "A", "D", "AS", "LT"):
+        resp, _ = send_cmd(sock, f"PR {reg}", verbose=False)
+        saved[reg] = extract_value(resp, f"PR {reg}")
+
+    resp_rc, ok_rc_read = send_cmd(sock, "PR RC", verbose=False)
+    rc_val = extract_value(resp_rc, "PR RC")
+    rc_supported = ok_rc_read and rc_val != ""
+    if rc_supported:
+        saved["RC"] = rc_val
+        send_cmd(sock, f"RC={HOME_RUN_CURRENT_PCT}")
+    else:
+        print("[WARN]  RC (run current) register not readable on this drive/firmware —"
+              " homing at whatever current is already configured. If you are not"
+              " confident that's safe for a hard-stop impact, Ctrl+C now.\n")
+
+    print(f"[HOME]  Enabling hMT closed-loop detection (AS=1, fixed current) and "
+          f"setting Locked Rotor Timeout to {HOME_LOCKED_ROTOR_TIMEOUT_MS}ms "
+          f"(default 2000ms) ...")
+    send_cmd(sock, "AS=1")
+    send_cmd(sock, f"LT={HOME_LOCKED_ROTOR_TIMEOUT_MS}")
+
+    send_cmd(sock, f"VM={HOME_SEEK_VELOCITY}")
+    send_cmd(sock, f"A={HOME_SEEK_ACCEL}")
+    send_cmd(sock, f"D={HOME_SEEK_ACCEL}")
+
+    print(f"[HOME]  Seeking hard stop: MR {-HOME_SEEK_STEPS} ...")
+    send_cmd(sock, f"MR {-HOME_SEEK_STEPS}")
+
+    # Poll for MV=0 (stopped) — either a real Locked Rotor fault (expected,
+    # see ER check below), or (unexpectedly) having actually completed the
+    # full commanded distance without ever hitting anything.
+    deadline = time.monotonic() + MOVE_TIMEOUT_S
+    stopped = False
+    while time.monotonic() < deadline:
+        resp, _ = send_cmd(sock, "PR MV", verbose=False)
+        if extract_value(resp, "PR MV") == "0":
+            stopped = True
+            break
+        time.sleep(POLL_INTERVAL_S)
+
+    if not stopped:
+        print(f"[ERROR] Home-seek move did not stop within {MOVE_TIMEOUT_S:.0f}s. Sending SL 0.")
+        send_cmd(sock, "SL 0", verbose=False)
+        _restore_profile(sock, saved)
+        raise RuntimeError("Home-seek timeout")
+
+    resp_er, _ = send_cmd(sock, "PR ER")
+    er = extract_value(resp_er, "PR ER")
+
+    if er == "104":
+        print("[OK]    Locked Rotor detected (ER=104) — hard stop reached, encoder "
+              "confirmed the carriage genuinely stopped moving. Clearing with CF ...")
+        send_cmd(sock, "CF")
+        print(f"[HOME]  Backing off {HOME_BACKOFF_STEPS} steps (~2mm) toward aspiration, "
+              f"away from the true hard stop (David's suggestion, 2026-09-01) ...")
+        send_cmd(sock, f"MR {HOME_BACKOFF_STEPS}")
+        wait_for_stop(sock, "home backoff")
+        send_cmd(sock, "P=0")
+        print(f"[OK]    Position redefined as 0, {HOME_BACKOFF_STEPS} steps (~2mm) clear "
+              f"of the true dispense hard stop.")
+    elif er == "86":
+        # Shouldn't normally fire now that AS=1 is set (86 is the
+        # open-loop detector, which mainly matters when hMT is off) — kept
+        # as a fallback in case it fires anyway for some other reason.
+        # Backs off the same as the ER=104 path above -- same reasoning.
+        print("[OK]    Stall detected (ER=86) — hard stop reached as expected.")
+        send_cmd(sock, "ER=0")
+        send_cmd(sock, "DE=1")
+        print(f"[HOME]  Backing off {HOME_BACKOFF_STEPS} steps (~2mm) toward aspiration, "
+              f"away from the true hard stop ...")
+        send_cmd(sock, f"MR {HOME_BACKOFF_STEPS}")
+        wait_for_stop(sock, "home backoff")
+        send_cmd(sock, "P=0")
+        print(f"[OK]    Position redefined as 0, {HOME_BACKOFF_STEPS} steps (~2mm) clear "
+              f"of the true dispense hard stop.")
+    elif er in ("0", ""):
+        print(f"[WARN]  Motor stopped WITHOUT any fault (ER=0) — it completed the full "
+              f"{HOME_SEEK_STEPS} step seek move without the drive ever detecting a jam. "
+              f"P=0 was NOT set — do not trust this as home. If you felt/heard it hit "
+              f"something, HOME_RUN_CURRENT_PCT may still be high enough to grind "
+              f"through even with hMT active — try lowering it further. If it truly "
+              f"never reached anything, HOME_SEEK_STEPS may need to be larger.")
+    else:
+        print(f"[ERROR] Unexpected error during home-seek: ER={er} ({_er_meaning(er)}).")
+        if er == "104":
+            send_cmd(sock, "CF")
+        else:
+            send_cmd(sock, "ER=0")
+
+    _restore_profile(sock, saved)
+    print_position(sock)
+
+
+def _restore_profile(sock: socket.socket, saved: dict) -> None:
+    print("[HOME]  Restoring previous velocity/current profile ...")
+    for reg, val in saved.items():
+        if val:
+            send_cmd(sock, f"{reg}={val}")
+
+
+def home_onboard(sock: socket.socket) -> None:
+    """
+    Trigger the ONBOARD G3 home routine (see upload_programs()'s docstring
+    for the full MCode body) via a single EX G3 — exactly the same trigger
+    sort_server.prg's MotorHome uses once this is wired into production.
+    Requires 'upload' to have been run at least once since G3/G4 were added
+    (they're written together with G1/G2 since CP wipes everything).
+
+    G3 handles its own success/fallback logic on-device (BR on Er=104, CF +
+    P=0 on success, restore-without-P=0 on fallback) — by the time EX G3
+    returns, PR ER has already been cleared either way, so the only way to
+    tell which path it took from here is the position: P=0 on success,
+    still nonzero if it fell through without ever finding the hard stop.
+    Run this to confirm the FLASHED version behaves the same as the
+    already-confirmed-working home() command before trusting it in
+    production.
+    """
+    print("[HOME]  Triggering onboard G3 (home) ...")
+    ran = run_program(sock, "G3", "home (onboard)")
+    if not ran:
+        # EX G3 itself was rejected (e.g. ER=30 Unknown Label — not
+        # actually flashed) — nothing moved, so PR P below reflects
+        # whatever was left over from a previous run, not this attempt.
+        # Do NOT interpret it as a result here — see run_program()'s
+        # docstring for the 2026-09-01 false-positive this fixes.
+        print("[ERROR] G3 never actually ran — see the rejection above. "
+              "Re-run 'upload' and try again.")
+        return
+    pos = print_position(sock)
+    if pos == 0:
+        print("[OK]    Position is 0 — G3 found the hard stop (Locked Rotor), backed off "
+              f"{HOME_BACKOFF_STEPS} steps (~2mm), and set THAT as home, same as the "
+              "pure-Python home() command.")
+    else:
+        print(f"[WARN]  Position is {pos:+d}, not 0 — G3 likely fell through "
+              f"WITHOUT ever detecting the hard stop (see upload_programs()'s "
+              f"docstring for that fallback path). Do not trust this as home.")
 
 
 # ── Interactive loop ──────────────────────────────────────────────────────────
@@ -541,6 +924,18 @@ _HELP = """
               profile (no motion). Never set in this file, so this is
               whatever the motor's factory/flash default is.
     zero    → set current position as the new 0  (P=0, no motion)
+    home    → drive to the dispense-end hard stop and set THAT as 0,
+              orchestrated command-by-command from this script (real
+              motion toward the forward limit — see HOME_* comment above
+              main()'s home() function before running this)
+    home2   → same as 'home', but triggers the ONBOARD G3 program (EX G3)
+              instead — run 'upload' first. Use this to confirm the
+              flashed version matches before wiring it into sort_server.prg.
+    move <n> → raw MR <n> at the production velocity profile, bypassing
+              G1/G2 entirely -- no re-flash needed to try a step count
+              other than ASPIRE_STEPS/DROP_STEPS. Positive = aspire
+              (reverse), negative = drop (forward), same sign convention
+              as those constants. E.g. 'move 50000' or 'move -50000'.
     q       → quit
 """
 
@@ -570,6 +965,21 @@ def interactive_loop(sock: socket.socket) -> None:
                 print("[OK]    Current position redefined as 0.")
             else:
                 print("[ERROR] Could not set P=0.")
+        elif cmd == "home":
+            try:
+                home(sock)
+            except RuntimeError as exc:
+                print(f"[FATAL] {exc}")
+        elif cmd == "home2":
+            home_onboard(sock)
+        elif cmd.startswith("move"):
+            arg = cmd[len("move"):].strip()
+            try:
+                steps = int(arg)
+            except ValueError:
+                print("  Usage: move <steps>  (e.g. 'move 50000' or 'move -50000')")
+            else:
+                run_manual_move(sock, steps)
         elif cmd == "":
             pass
         else:
@@ -581,11 +991,18 @@ def interactive_loop(sock: socket.socket) -> None:
 
 _USAGE = """
 Usage:
-  python hardware_tests/linear_control.py upload    # flash G1+G2 to motor (run once)
+  python hardware_tests/linear_control.py upload    # flash G1+G2+G3+G4 to motor (run once)
   python hardware_tests/linear_control.py drop      # forward  -800000 steps
   python hardware_tests/linear_control.py aspire    # reverse  +800000 steps
+  python hardware_tests/linear_control.py move <n>  # raw MR <n>, any step count, no re-flash
+                                                      # needed -- positive = aspire, negative =
+                                                      # drop. E.g. "move 50000" or "move -50000"
   python hardware_tests/linear_control.py pos       # print position, no motion
   python hardware_tests/linear_control.py speed     # print VM/VI/A/D velocity profile, no motion
+  python hardware_tests/linear_control.py home      # drive to dispense hard stop, set P=0 there
+                                                      # (orchestrated from this script)
+  python hardware_tests/linear_control.py home2     # same, but via the ONBOARD G3 program
+                                                      # (EX G3) -- run 'upload' first
   python hardware_tests/linear_control.py run       # interactive control loop
 """
 
@@ -595,9 +1012,20 @@ def main() -> None:
         sys.exit(0)
 
     sub = sys.argv[1].lower()
-    if sub not in {"upload", "drop", "aspire", "pos", "speed", "run"}:
+    if sub not in {"upload", "drop", "aspire", "move", "pos", "speed", "home", "home2", "run"}:
         print(f"Unknown sub-command: '{sub}'\n{_USAGE}")
         sys.exit(1)
+
+    move_steps: int | None = None
+    if sub == "move":
+        if len(sys.argv) < 3:
+            print(f"Missing step count.\n{_USAGE}")
+            sys.exit(1)
+        try:
+            move_steps = int(sys.argv[2])
+        except ValueError:
+            print(f"'{sys.argv[2]}' is not a valid integer step count.\n{_USAGE}")
+            sys.exit(1)
 
     sock = connect()
 
@@ -614,10 +1042,17 @@ def main() -> None:
                 run_program(sock, "G1", "drop (forward)")
             elif sub == "aspire":
                 run_program(sock, "G2", "aspire (reverse)")
+            elif sub == "move":
+                assert move_steps is not None
+                run_manual_move(sock, move_steps)
             elif sub == "pos":
                 print_position(sock)
             elif sub == "speed":
                 print_velocity(sock)
+            elif sub == "home":
+                home(sock)
+            elif sub == "home2":
+                home_onboard(sock)
             elif sub == "run":
                 interactive_loop(sock)
 

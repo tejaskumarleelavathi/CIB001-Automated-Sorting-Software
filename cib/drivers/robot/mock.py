@@ -8,6 +8,7 @@ and UI behave exactly as they would with real hardware.
 from __future__ import annotations
 
 import asyncio
+from typing import Callable
 
 import structlog
 
@@ -22,6 +23,7 @@ class MockRobotDriver:
     def __init__(self) -> None:
         self._connected = False
         self._halted = False
+        self._reset_pipette_call_count = 0   # lets tests assert startup calls this once
 
     async def connect(self) -> None:
         await asyncio.sleep(0.1)
@@ -43,9 +45,21 @@ class MockRobotDriver:
 
     async def execute_pick(
         self, pick_x: float, pick_y: float, u: float | None = None, hand: str = "R",
+        on_aspirated: Callable[[], None] | None = None,
     ) -> None:
+        """
+        Mirrors the real driver's two-phase timing (2026-08-31): fires
+        on_aspirated partway through, before the simulated retract/
+        travel-back completes, so orchestrator-level tests can exercise
+        the same "specimen recorded before this whole call returns"
+        behavior without needing real hardware.
+        """
         log.info("mock_robot.pick_start", pick_x=pick_x, pick_y=pick_y, u=u, hand=hand)
-        await asyncio.sleep(MOCK_PICK_SECONDS)
+        await asyncio.sleep(MOCK_PICK_SECONDS * 0.5)
+        log.info("mock_robot.aspirated")
+        if on_aspirated is not None:
+            on_aspirated()
+        await asyncio.sleep(MOCK_PICK_SECONDS * 0.5)
         log.info("mock_robot.pick_complete")
 
     async def execute_place(
@@ -70,6 +84,10 @@ class MockRobotDriver:
 
     async def ring_light_off(self) -> None:
         log.info("mock_robot.ring_light_off")
+
+    async def reset_pipette(self) -> None:
+        self._reset_pipette_call_count += 1
+        log.info("mock_robot.pipette_reset")
 
     async def halt(self) -> None:
         self._halted = True
