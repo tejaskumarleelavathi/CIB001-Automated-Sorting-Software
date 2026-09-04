@@ -16,6 +16,7 @@ from cib.drivers.lighting.mock import MockLightingDriver
 from cib.drivers.plc.mock import MockPLCDriver
 from cib.drivers.pump.mock import MockPumpDriver
 from cib.drivers.robot.mock import MockRobotDriver
+from cib.drivers.robot_remote.mock import MockRemoteEthernetDriver
 from cib.drivers.safety.mock import MockSafetyDriver
 
 OUT_DIR = Path(os.environ.get("TEMP", r"C:\Temp")) / f"cib_min_{int(time.time())}"
@@ -24,7 +25,8 @@ OUT_DIR = Path(os.environ.get("TEMP", r"C:\Temp")) / f"cib_min_{int(time.time())
 async def main() -> None:
     OUT_DIR.mkdir(parents=True)
     drivers = DriverSet(
-        robot=MockRobotDriver(), safety=MockSafetyDriver(), plc=MockPLCDriver(),
+        robot=MockRobotDriver(), robot_remote=MockRemoteEthernetDriver(),
+        safety=MockSafetyDriver(), plc=MockPLCDriver(),
         pump=MockPumpDriver(),
         camera_overhead=MockCameraDriver(name="overhead", num_fake_samples=1),
         camera_eoa=MockCameraDriver(name="eoa", num_fake_samples=1),

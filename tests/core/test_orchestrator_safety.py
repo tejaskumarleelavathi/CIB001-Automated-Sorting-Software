@@ -24,9 +24,16 @@ from cib.core.events import (
     AllDevicesReadyEvent,
     OperatorAbortEvent,
     OperatorAcknowledgeEvent,
+    OperatorShutdownEvent,
     OperatorStartEvent,
+    SystemErrorEvent,
+    VisionEoAResultEvent,
 )
-from cib.core.orchestrator import DriverSet, Orchestrator
+from cib.core.orchestrator import (
+    ROBOT_KEEPALIVE_DISCONNECT_THRESHOLD,
+    DriverSet,
+    Orchestrator,
+)
 from cib.core.state_machine import State
 from cib.data.models import Pick, PickResult, PickStatus
 from cib.drivers.base import StatusLight
@@ -35,6 +42,7 @@ from cib.drivers.lighting.mock import MockLightingDriver
 from cib.drivers.plc.mock import MockPLCDriver
 from cib.drivers.pump.mock import MockPumpDriver
 from cib.drivers.robot.mock import MockRobotDriver
+from cib.drivers.robot_remote.mock import MockRemoteEthernetDriver
 from cib.drivers.safety.mock import MockSafetyDriver
 
 
@@ -42,6 +50,7 @@ from cib.drivers.safety.mock import MockSafetyDriver
 def drivers() -> DriverSet:
     return DriverSet(
         robot=MockRobotDriver(),
+        robot_remote=MockRemoteEthernetDriver(),
         safety=MockSafetyDriver(),
         plc=MockPLCDriver(),
         pump=MockPumpDriver(),
@@ -60,6 +69,21 @@ def orch(drivers: DriverSet, tmp_path: Path) -> Orchestrator:
     )
 
 
+async def _drain_to_all_devices_ready(orch: Orchestrator) -> None:
+    """
+    _startup() can also queue other events ahead of AllDevicesReadyEvent
+    (e.g. RecoveryStatusEvent from _remote_ethernet_restart_task, which now
+    fires during startup too, not just recovery) -- drain and handle
+    everything up to and including it, rather than assuming it's always
+    the very next item.
+    """
+    while True:
+        event = await orch._queue.get()
+        await orch._handle_event(event)
+        if isinstance(event, AllDevicesReadyEvent):
+            return
+
+
 async def _to_idle(orch: Orchestrator) -> None:
     await orch._handle_event(AllDevicesReadyEvent())
     assert orch.state == State.IDLE
@@ -68,6 +92,35 @@ async def _to_idle(orch: Orchestrator) -> None:
 async def _to_running(orch: Orchestrator) -> None:
     await _to_idle(orch)
     await orch._handle_event(OperatorStartEvent())
+    assert orch.state == State.RUNNING
+
+
+async def _to_running_no_auto_cycle(orch: Orchestrator) -> None:
+    """
+    Like _to_running, but suppresses the background cycle task that
+    OperatorStartEvent's handler normally auto-launches via
+    asyncio.create_task(self._run_cycle()) (orchestrator.py, right after
+    it turns the backlight on).
+
+    That auto-launched task races any explicit `await orch._run_cycle()`
+    a test makes right afterward -- both attempts share the SAME single
+    _force_sample_detection-injected centroid, so whichever cycle wins
+    the race consumes/visits it, leaving the other with nothing to pick
+    ("cycle.no_samples_detected" / no_bugs). Tests that need to control
+    and observe the FIRST cycle's execution precisely (e.g. overriding
+    execute_pick and asserting on state it sets) need this instead of
+    _to_running.
+
+    Trick: _run_cycle()'s auto-launch is gated behind
+    `if not self._cycle_active`. Setting _cycle_active True before firing
+    OperatorStartEvent suppresses the auto-launch for this transition;
+    resetting it False right after leaves the orchestrator otherwise
+    untouched for the test's own explicit _run_cycle() call.
+    """
+    await _to_idle(orch)
+    orch._cycle_active = True
+    await orch._handle_event(OperatorStartEvent())
+    orch._cycle_active = False
     assert orch.state == State.RUNNING
 
 
@@ -81,8 +134,9 @@ class TestRunLifecycle:
         assert orch._storage is not None
 
     async def test_abort_closes_the_run(self, orch: Orchestrator) -> None:
-        # ABORT isn't legal from RUNNING (matches the PRD state table — the
-        # operator must CYCLE STOP first) — go through that to reach IDLE.
+        # Already stopped (via CYCLE STOP) before ABORT — the plain,
+        # already-paused case. See TestAbortSemantics for ABORT pressed
+        # directly from RUNNING (2026-08-30).
         await _to_running(orch)
         orch._sm.cycle_stop()
         await orch._finish_stop(orch._drivers)
@@ -181,6 +235,71 @@ class TestSpecimenInTransitRecovery:
         # Lands in IDLE (not auto-RUNNING) — a separate START is required
         # after an e-stop, per FR-SAF-06.
         assert orch._drivers.plc.status_light == StatusLight.GREEN
+
+    async def test_pending_well_recorded_even_if_pick_completion_fails(
+        self, orch: Orchestrator,
+    ) -> None:
+        """
+        2026-08-31, real-hardware finding: a safety fault landing during
+        the robot's retract/travel-back -- AFTER the specimen was
+        genuinely already aspirated, but BEFORE execute_pick() fully
+        returns -- must not lose track of the specimen. Confirmed live:
+        operator waited for the aspirate to finish, then tripped the
+        light curtain, and CONTINUE's recovery found nothing pending to
+        deliver even though a specimen was physically in the tip.
+        execute_pick()'s on_aspirated callback (see driver.py) must fire
+        and record _pending_well immediately, even when the rest of that
+        same call subsequently fails (simulating the connection dropping
+        during the retract/travel-back, after aspiration already
+        succeeded).
+        """
+        orch._robot_remote_enabled = False
+        orch._force_sample_detection = True   # guarantee a pick is actually attempted
+        # _run_cycle()'s overhead-capture step bails out silently (no log,
+        # just an early `return None` -> outer "no_bugs" outcome) whenever
+        # self._running is False -- normally set True by run()/_startup(),
+        # neither of which this test's lightweight _to_idle/_to_running-style
+        # setup calls. Every other test in this class either sets this
+        # already or overrides a method reached before this check; this one
+        # overrides execute_pick, reached only after it, so it must be set
+        # explicitly.
+        orch._running = True
+        # NOTE: _to_running_no_auto_cycle (not _to_running) -- the plain
+        # version's auto-launched background cycle would race this test's
+        # own explicit _run_cycle() call below for the single
+        # _force_sample_detection-injected centroid; see its docstring.
+        await _to_running_no_auto_cycle(orch)
+
+        # The synthetic EoA frame (a bright circle, same generator as the
+        # overhead one) reads as almost entirely foreground to the real
+        # classifier ("coverage 99.9% > 65%" -> NO_SPECIMEN -> reject) --
+        # it isn't meant to look like a real close-up specimen image, just
+        # to give the overhead detector something to find. Stub the EoA
+        # step directly so this test can reach the pick step at all,
+        # exactly like _force_sample_detection does for overhead.
+        orch._run_vision_eoa = lambda frame, robot_x, robot_y: VisionEoAResultEvent(
+            proceed_with_pick=True,
+            refined_x=robot_x,
+            refined_y=robot_y,
+            frame_path="",
+            label="BUG",
+            reason="test stub",
+        )
+
+        async def _pick_aspirates_then_connection_drops(
+            pick_x, pick_y, u=None, hand="R", on_aspirated=None,
+        ):
+            if on_aspirated is not None:
+                on_aspirated()
+            raise RuntimeError("Robot closed the connection unexpectedly")
+
+        orch._drivers.robot.execute_pick = _pick_aspirates_then_connection_drops
+
+        await orch._run_cycle()
+
+        # The whole point: recorded even though execute_pick() itself
+        # raised right after calling the callback.
+        assert orch._pending_well is not None
 
     async def test_robot_resume_called_during_recovery(self, orch: Orchestrator) -> None:
         await orch._drivers.robot.connect()   # real precondition for is_ready() to mean anything
@@ -294,6 +413,9 @@ class TestSpecimenInTransitRecovery:
         orch._pending_well = (77.0, 88.0, None, "C5", None, "R")
         await orch._drivers.robot.halt()
         orch._sm.safety_fault_estop()
+        orch._hardware_fault_active = False   # blue button already pressed —
+                                               # see TestAbortSemantics for the
+                                               # blocked-until-cleared case
         assert orch.state == State.E_STOP
 
         await orch._handle_event(OperatorAbortEvent())
@@ -401,6 +523,7 @@ class TestInterruptedAttemptCleanup:
         pick, paths = self._make_interrupted_pick(orch, tmp_path)
         await orch._drivers.robot.halt()
         orch._sm.safety_fault_estop()
+        orch._hardware_fault_active = False   # blue button already pressed
 
         await orch._handle_event(OperatorAbortEvent())
 
@@ -431,6 +554,340 @@ class TestInterruptedAttemptCleanup:
         assert row["result"] == PickResult.SUCCESS
         for p in paths:
             assert Path(p).exists()   # images kept — this pick really happened
+
+
+class TestRemoteEthernetRecovery:
+    """
+    Tests for the Remote Ethernet lifecycle (2026-08-28, revised 2026-08-30):
+    startup always runs a login/reset/motor-on/start sequence before
+    anything else, a robot-related _run_cycle() exception self-heals via
+    the same sequence instead of always FAULTing, and shutdown cuts motor
+    power via the same channel. The connection is HELD OPEN across all of
+    this (2026-08-30 reversal, real-hardware finding — see
+    cib/drivers/robot_remote/driver.py's module docstring: closing it
+    right after Start killed the task every time, regardless of network
+    contention) — only shutdown ever closes it, and only once, never
+    double-connecting (a fresh Login while Main is running kills it too).
+    """
+
+    async def test_startup_restarts_task_and_stays_connected(self, orch: Orchestrator) -> None:
+        orch._robot_remote_enabled = True
+        await orch._startup()
+        # _startup() posts AllDevicesReadyEvent onto the queue rather than
+        # handling it directly — drain up to it explicitly since this test
+        # calls _startup() alone, not the full run()/_event_loop() machinery.
+        await _drain_to_all_devices_ready(orch)
+
+        rr = orch._drivers.robot_remote
+        assert rr._motors_on is True
+        assert rr._running is True
+        assert rr._connected is True   # held open, never closed after a successful start
+        assert orch._robot_remote_connected is True
+        assert orch.state == State.IDLE
+
+    async def test_startup_skips_remote_ethernet_when_disabled(self, orch: Orchestrator) -> None:
+        assert orch._robot_remote_enabled is False   # default (no one-time RC+ setup done)
+        await orch._startup()
+
+        rr = orch._drivers.robot_remote
+        assert rr._motors_on is False
+        assert rr._running is False
+
+    async def test_cycle_error_self_heals_via_remote_ethernet(self, orch: Orchestrator) -> None:
+        orch._robot_remote_enabled = True
+        # _recover_robot_connection() bails immediately if _running is False
+        # (2026-08-31 — see its docstring: a real shutdown request must not
+        # let a retry keep running past main.py's grace period). This test
+        # calls _run_cycle() directly, bypassing run() (which is what
+        # normally sets this), so it must be set explicitly here to
+        # exercise the recovery path at all.
+        orch._running = True
+        await _to_running(orch)
+
+        async def _broken_hand_check(d):
+            raise RuntimeError("MOVE_IMAGE failed: mock disconnect")
+        orch._ensure_physical_hand_for_next_pick = _broken_hand_check
+
+        await orch._run_cycle()
+
+        rr = orch._drivers.robot_remote
+        assert rr._motors_on is True
+        assert rr._running is True
+        assert rr._connected is True   # held open after a successful recovery, same as startup
+        assert orch._robot_remote_connected is True
+        # Self-healed to IDLE, not FAULT — but does NOT auto-resume RUNNING,
+        # same philosophy as e-stop/light-curtain recovery: a fresh operator
+        # START is still required before picking resumes.
+        assert orch.state == State.IDLE
+        assert orch._drivers.plc.status_light == StatusLight.AMBER
+
+    async def test_cycle_error_without_remote_ethernet_goes_to_fault(
+        self, orch: Orchestrator,
+    ) -> None:
+        """Baseline — disabled (the default), behavior is unchanged from before this existed."""
+        assert orch._robot_remote_enabled is False
+        await _to_running(orch)
+
+        async def _broken_hand_check(d):
+            raise RuntimeError("MOVE_IMAGE failed: mock disconnect")
+        orch._ensure_physical_hand_for_next_pick = _broken_hand_check
+
+        await orch._run_cycle()
+
+        assert orch.state == State.FAULT
+        assert orch._drivers.plc.status_light == StatusLight.RED_CHASE
+
+    async def test_unrelated_error_does_not_trigger_remote_recovery(
+        self, orch: Orchestrator,
+    ) -> None:
+        """
+        A non-robot error (e.g. a bug in vision code) must never trigger
+        Stop()/Reset() against a robot that might be perfectly healthy —
+        see ROBOT_ERROR_MARKERS' docstring in orchestrator.py.
+        """
+        orch._robot_remote_enabled = True
+        await _to_running(orch)
+
+        async def _broken_hand_check(d):
+            raise RuntimeError("something unrelated went wrong")
+        orch._ensure_physical_hand_for_next_pick = _broken_hand_check
+
+        await orch._run_cycle()
+
+        rr = orch._drivers.robot_remote
+        assert rr._connected is False
+        assert rr._motors_on is False   # never touched
+        assert orch.state == State.FAULT
+
+    async def test_shutdown_cuts_motor_power_via_remote_ethernet(self, orch: Orchestrator) -> None:
+        orch._robot_remote_enabled = True
+        await _to_idle(orch)
+        rr = orch._drivers.robot_remote
+        rr._motors_on = True   # simulate motors already on from startup
+
+        await orch._handle_event(OperatorShutdownEvent())
+
+        assert rr._motors_on is False
+        assert rr._connected is False
+
+    async def test_shutdown_reuses_already_open_connection(self, orch: Orchestrator) -> None:
+        """
+        Realistic flow: startup already left the session open (matches
+        test_startup_restarts_task_and_stays_connected). Shutdown must
+        reuse it, never call connect() a second time -- a fresh Login
+        while Main is still running kills the task (see driver.py).
+        """
+        orch._robot_remote_enabled = True
+        await orch._startup()
+        await _drain_to_all_devices_ready(orch)
+        rr = orch._drivers.robot_remote
+        assert orch._robot_remote_connected is True
+        connect_calls_before = rr._connect_call_count
+
+        await orch._handle_event(OperatorShutdownEvent())
+
+        assert rr._connect_call_count == connect_calls_before   # no second connect() call
+        assert rr._motors_on is False
+        assert rr._connected is False
+        assert orch._robot_remote_connected is False
+
+    async def test_idle_disconnect_triggers_remote_ethernet_recovery(
+        self, orch: Orchestrator,
+    ) -> None:
+        """
+        2026-08-30 real-hardware finding: the robot's port-2000 connection
+        dropped while genuinely IDLE, between cycles, with no active cycle
+        to catch it -- _run_cycle()'s self-heal only runs mid-cycle, and
+        driver.py's own internal reconnect swallows its own failures
+        silently (never raises), so this was previously invisible: no
+        FAULT, no banner, just log spam. The keepalive loop must now
+        detect it itself via is_ready() (not a raised exception) and drive
+        the same Remote Ethernet recovery _run_cycle() uses.
+        """
+        orch._robot_remote_enabled = True
+        # _recover_robot_connection() bails immediately if _running is False
+        # (2026-08-31 — see its docstring) — normally set by run(), which
+        # this test bypasses by calling _robot_keepalive_tick() directly.
+        orch._running = True
+        await orch._drivers.robot.connect()
+        await _to_idle(orch)
+        orch._startup_complete = True
+        assert await orch._drivers.robot.is_ready() is True
+
+        orch._drivers.robot._connected = False   # simulate a dropped port-2000 connection
+
+        for _ in range(ROBOT_KEEPALIVE_DISCONNECT_THRESHOLD):
+            await orch._robot_keepalive_tick()
+
+        assert await orch._drivers.robot.is_ready() is True   # reconnected + rehomed
+        rr = orch._drivers.robot_remote
+        assert rr._connected is True   # held open, same as every other recovery path
+        assert orch.state == State.IDLE   # must not FAULT when recovery succeeds
+
+        messages = []
+        while not orch._queue.empty():
+            evt = await orch._queue.get()
+            if isinstance(evt, SystemErrorEvent):
+                messages.append(evt.message)
+        assert any("lost while idle" in m for m in messages)
+        assert any("reconnected automatically" in m for m in messages)
+
+    async def test_idle_disconnect_does_not_trigger_recovery_mid_cycle(
+        self, orch: Orchestrator,
+    ) -> None:
+        """
+        _run_cycle()'s own exception handler already owns a mid-cycle
+        disconnect -- the keepalive loop must stay out of its way rather
+        than racing it with a second, redundant Reset()/Start() sequence.
+        """
+        orch._robot_remote_enabled = True
+        await orch._drivers.robot.connect()
+        await _to_idle(orch)
+        orch._startup_complete = True
+        orch._cycle_active = True
+        orch._drivers.robot._connected = False
+
+        for _ in range(ROBOT_KEEPALIVE_DISCONNECT_THRESHOLD):
+            await orch._robot_keepalive_tick()
+
+        rr = orch._drivers.robot_remote
+        assert rr._connected is False   # never touched
+        assert orch._keepalive_consecutive_disconnected == 0   # never even counted
+
+    async def test_idle_disconnect_recovery_failure_goes_to_fault(
+        self, orch: Orchestrator,
+    ) -> None:
+        """If the same recovery sequence _run_cycle() relies on can't bring
+        the robot back, the operator needs to see FAULT, not silence."""
+        orch._robot_remote_enabled = True
+        await orch._drivers.robot.connect()
+        await _to_idle(orch)
+        orch._startup_complete = True
+        orch._drivers.robot._connected = False
+
+        async def _broken_reconnect(d):
+            return False
+        orch._recover_robot_connection = _broken_reconnect
+
+        for _ in range(ROBOT_KEEPALIVE_DISCONNECT_THRESHOLD):
+            await orch._robot_keepalive_tick()
+
+        assert orch.state == State.FAULT
+        assert orch._drivers.plc.status_light == StatusLight.RED_CHASE
+
+
+class TestStartupPipetteReset:
+    """
+    2026-08-31, operator request: every startup must send a motor-only
+    pipette release (sort_server.prg's new RESET_PIPETTE command, no robot
+    arm travel) BEFORE anything else runs, so a specimen can never be
+    silently left in the tip from a crashed/interrupted previous run.
+    """
+
+    async def test_startup_resets_pipette_once(self, orch: Orchestrator) -> None:
+        await orch._startup()
+        await orch._handle_event(await orch._queue.get())   # drain AllDevicesReadyEvent
+
+        assert orch._drivers.robot._reset_pipette_call_count == 1
+
+    async def test_startup_continues_if_pipette_reset_fails(self, orch: Orchestrator) -> None:
+        """A pipette-motor hiccup at startup must not block the rest of
+        startup (cameras, homing, reaching IDLE) -- this is best-effort,
+        logged loudly, never fatal."""
+        async def _broken_reset_pipette():
+            raise RuntimeError("RESET_PIPETTE failed: motor unreachable")
+        orch._drivers.robot.reset_pipette = _broken_reset_pipette
+
+        await orch._startup()
+        await orch._handle_event(await orch._queue.get())
+
+        assert orch.state == State.IDLE
+
+
+class TestAbortSemantics:
+    """
+    Tests for the 2026-08-30 ABORT behavior changes (operator request):
+      - ABORT is now legal directly from RUNNING, not just after a
+        separate CYCLE STOP -- but it's graceful (lets the in-progress
+        cycle finish, same as CYCLE STOP) rather than an immediate hard
+        stop, then closes the run once that finish completes.
+      - ABORT during E_STOP/PROTECTIVE_STOP is now blocked until the
+        hardware fault actually clears (blue reset button pressed) --
+        same physical gate as CONTINUE, since ABORT also delivers a
+        pending specimen (a real robot move) before closing the run,
+        which cannot succeed while motor power is still cut.
+    """
+
+    async def test_abort_from_running_finishes_cycle_then_closes_run(
+        self, orch: Orchestrator,
+    ) -> None:
+        await _to_running(orch)
+        run_id = orch._current_run.run_id
+
+        await orch._handle_event(OperatorAbortEvent())
+
+        # No cycle task was actually active in this test (mock drivers,
+        # _run_cycle() never started) -- _finish_stop() runs immediately
+        # per the same "nothing will call it otherwise" logic as STOP.
+        assert orch.state == State.IDLE
+        assert orch._current_run is None
+        assert orch._abort_after_cycle is False
+
+    async def test_abort_from_running_is_legal_no_warning_needed(
+        self, orch: Orchestrator,
+    ) -> None:
+        """RUNNING used to be an illegal ABORT source (warning + no-op) --
+        confirm it's now accepted."""
+        await _to_running(orch)
+        await orch._handle_event(OperatorAbortEvent())
+        assert orch.state != State.RUNNING
+
+    async def test_abort_blocked_during_estop_until_hardware_clears(
+        self, orch: Orchestrator,
+    ) -> None:
+        await _to_running(orch)
+        orch._pending_well = (5.0, 5.0, None, "A1", None, "R")
+        await orch._drivers.robot.halt()
+        orch._sm.safety_fault_estop()
+        orch._hardware_fault_active = True   # blue button not pressed yet
+        assert orch.state == State.E_STOP
+
+        await orch._handle_event(OperatorAbortEvent())
+
+        # Blocked -- still E_STOP, run still open, specimen still tracked
+        # (never attempted a robot move against a de-energized motor).
+        assert orch.state == State.E_STOP
+        assert orch._current_run is not None
+        assert orch._pending_well is not None
+
+        orch._hardware_fault_active = False   # blue button now pressed
+        await orch._handle_event(OperatorAbortEvent())
+
+        assert orch.state == State.IDLE
+        assert orch._current_run is None
+        assert orch._pending_well is None   # delivered before closing
+
+    async def test_abort_blocked_during_protective_stop_until_curtain_clears(
+        self, orch: Orchestrator,
+    ) -> None:
+        await _to_running(orch)
+        await orch._drivers.robot.halt()
+        orch._state_before_fault = State.RUNNING
+        orch._sm.safety_fault_protective()
+        orch._light_curtain_tripped = True    # still obstructed
+        orch._hardware_fault_active = False
+        assert orch.state == State.PROTECTIVE_STOP
+
+        await orch._handle_event(OperatorAbortEvent())
+
+        assert orch.state == State.PROTECTIVE_STOP
+        assert orch._current_run is not None
+
+        orch._light_curtain_tripped = False   # now clear
+        await orch._handle_event(OperatorAbortEvent())
+
+        assert orch.state == State.IDLE
+        assert orch._current_run is None
 
 
 class TestSafetyFaultDoesNotBounceToFault:

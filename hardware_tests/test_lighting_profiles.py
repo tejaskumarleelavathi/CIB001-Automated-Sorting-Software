@@ -27,6 +27,15 @@ Usage:
         — Side-by-side timing: 10 profile switches vs 10 batch-SET:MODE switches.
           Best run in a dim room so you can see the light physically.
 
+    conda run -n cib_env python test_lighting_profiles.py single
+        — One slow ON transition per method, each with a 5s countdown and a
+          long hold, meant for slow-motion phone video (2026-08-31 —
+          alternating toggles are too fast for the naked eye to judge
+          simultaneity on). Record through each transition, then play back
+          frame by frame: does Method A (profile) show all 3 channels
+          brightening in the same frame, while Method B (batch SET:MODE)
+          shows them brightening across separate frames?
+
     conda run -n cib_env python test_lighting_profiles.py on
     conda run -n cib_env python test_lighting_profiles.py off
         — Quick manual on/off via profile (after setup + probe have succeeded).
@@ -49,6 +58,17 @@ CURRENT_MA = 250
 PROFILE_ON  = 1   # all channels at CURRENT_MA, mode=continuous
 PROFILE_OFF = 2   # all channels mode=off
 
+# Confirmed working 2026-08-31 via 'probe' (twice, against both slot 1 and
+# slot 2) -- LOAD:PROFILE,n selects AND applies a profile in one atomic
+# command, matching the real DCS-100E/103E manual's own command table.
+# Hardcoded here rather than re-discovered by toggle/compare/on/off's own
+# quick inline check every run -- that quick check uses a much less patient
+# drain than 'probe' does and this device's response timing has proven
+# unpredictable run to run (sometimes near-instant, sometimes very slow),
+# so a single fast re-probe attempt is not a reliable way to re-verify
+# something already established.
+CONFIRMED_SELECT_TEMPLATE = "LOAD:PROFILE,%d"
+
 # Will be populated by probe() — the working profile-select command template.
 # %d is replaced with the slot number.
 _SELECT_CMD: str | None = None
@@ -70,8 +90,49 @@ def connect() -> socket.socket:
     return sock
 
 
-def send_batch(sock: socket.socket, commands: list[str], drain_ms: float = 50) -> str:
-    """Send all commands in one TCP write, drain responses for drain_ms ms."""
+def _flush_stale(sock: socket.socket) -> str:
+    """
+    Drain and discard anything already sitting in the socket buffer BEFORE
+    sending a new command (2026-08-31, real-hardware finding): responses
+    can straggle in well behind their own call's drain window (confirmed
+    live -- a *CHANNEL:CONFIGS? XML reply showed up FOUR commands later,
+    and a "Command not found" error for one candidate showed up attached
+    to a totally different, later candidate). Without this, every call's
+    drain can silently consume a PRIOR call's leftover response instead of
+    (or mixed in with) its own, making every result downstream suspect.
+    Returns whatever stale bytes were found (for diagnostic printing).
+    """
+    sock.settimeout(0.02)
+    buf = b""
+    try:
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+    except socket.timeout:
+        pass
+    finally:
+        sock.settimeout(TIMEOUT)
+    if buf:
+        text = buf.decode("ascii", errors="replace").strip()
+        print(f"  !! flushed stale bytes (leftover from an earlier call): {text!r}")
+    return buf.decode("ascii", errors="replace").strip() if buf else ""
+
+
+def send_batch(sock: socket.socket, commands: list[str], drain_ms: float = 400) -> str:
+    """
+    Send all commands in one TCP write, drain responses for drain_ms ms.
+    50 -> 400 default (2026-08-31, real-hardware finding): this device's
+    replies can lag far past a 50-100ms window for some commands
+    (especially *CHANNEL:CONFIGS? and anything touching EEPROM like
+    SAVE:PROFILE) -- confirmed live via responses arriving multiple calls
+    late. Always flushes any stale leftover bytes from a PRIOR call first,
+    so this call's drain can't be contaminated by (or mistaken for) a
+    response that was never actually ours.
+    """
+    _flush_stale(sock)
+
     payload = "".join(cmd if cmd.endswith(";") else cmd + ";" for cmd in commands)
     print(f"  >> {payload}")
     sock.sendall(payload.encode("ascii"))
@@ -93,16 +154,40 @@ def send_batch(sock: socket.socket, commands: list[str], drain_ms: float = 50) -
     resp = buf.decode("ascii", errors="replace").strip()
     if resp:
         print(f"  << {resp}")
+    else:
+        print(f"  << (no response within {drain_ms:.0f}ms)")
     return resp
 
 
-def send(sock: socket.socket, cmd: str, drain_ms: float = 50) -> str:
+def send(sock: socket.socket, cmd: str, drain_ms: float = 400) -> str:
     return send_batch(sock, [cmd], drain_ms=drain_ms)
+
+
+def wait_for_response(sock: socket.socket, contains: str, timeout_s: float = 5.0) -> str:
+    """
+    Keep draining (in short slices) until a response containing `contains`
+    shows up, or timeout_s elapses. For commands whose confirmation text is
+    known (2026-08-31 — per the real DCS-100E/103E manual, SAVE:PROFILE,n
+    should return exactly 'INFO: Profile "n" has been saved.') this catches
+    it even if it arrives well past a single fixed drain window, rather
+    than accepting whatever unrelated stale text a short window happened
+    to catch instead.
+    """
+    deadline = time.perf_counter() + timeout_s
+    collected = ""
+    while time.perf_counter() < deadline:
+        chunk = _flush_stale(sock)   # non-blocking-ish (20ms), reusable as a poll
+        if chunk:
+            collected += chunk
+            if contains.lower() in collected.lower():
+                return collected
+        time.sleep(0.1)
+    return collected
 
 
 def query(sock: socket.socket, cmd: str) -> str:
     """Send a query command and return the response (longer drain for XML replies)."""
-    return send_batch(sock, [cmd], drain_ms=200)
+    return send_batch(sock, [cmd], drain_ms=800)
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +217,20 @@ def cmd_setup(sock: socket.socket) -> None:
     """
     Save backlight-ON settings to profile slot 1 and OFF to slot 2.
     Run this once — settings survive power cycles.
+
+    2026-08-31, real-hardware finding: dropped the cosmetic
+    SET:PROFILE:NAME step entirely -- it was consistently the single
+    slowest command on this device (its response was seen arriving
+    multiple ENTIRE STEPS late, once even after DISCONNECT had already
+    been sent), and every command queued up behind it inherited that
+    delay. It isn't needed for LOAD:PROFILE,n to work -- selection is by
+    numeric slot, not name. Replaced blind "saved" print statements with
+    real verification: after saving, LOAD each profile back and read
+    *CHANNEL:CONFIGS? to confirm the actual channel mode/current values
+    match what was intended, instead of trusting the SAVE response alone
+    (which the previous run showed can claim success while the content
+    still doesn't stick -- LOAD:PROFILE,1 kept saying "not set" even
+    after "Profile 1 (BKLT_ON) saved." had printed).
     """
     print("=" * 60)
     print("STEP 1: Query current device state")
@@ -139,36 +238,53 @@ def cmd_setup(sock: socket.socket) -> None:
     query(sock, "*IDN?")
     query(sock, "*CHANNEL:CONFIGS?")
     query(sock, "*PROFILE:NUMBER?")
-    query(sock, "*PROFILE:NAMES?")
 
     print()
     print("=" * 60)
     print(f"STEP 2: Set all channels ON at {CURRENT_MA} mA → save as profile {PROFILE_ON}")
     print("=" * 60)
     set_all_on(sock)
-    time.sleep(0.1)
-    send(sock, f"SET:PROFILE:NAME,BKLT_ON")
+    time.sleep(1.0)   # let the device fully settle before saving
     send(sock, f"SAVE:PROFILE,{PROFILE_ON}")
-    time.sleep(0.2)   # EEPROM write needs a moment
-    print(f"  Profile {PROFILE_ON} (BKLT_ON) saved.")
+    # Per the real DCS-100E/103E manual, this should return exactly
+    # 'INFO: Profile "n" has been saved.' — wait specifically for that
+    # instead of trusting whatever the fixed drain window happened to
+    # catch (which last run was a stale, unrelated response).
+    resp = wait_for_response(sock, "has been saved")
+    print(f"  SAVE:PROFILE,{PROFILE_ON} confirmation: "
+          f"{'CONFIRMED' if 'has been saved' in resp.lower() else 'NOT SEEN — ' + repr(resp)}")
 
     print()
     print("=" * 60)
     print(f"STEP 3: Set all channels OFF → save as profile {PROFILE_OFF}")
     print("=" * 60)
     set_all_off(sock)
-    time.sleep(0.1)
-    send(sock, f"SET:PROFILE:NAME,BKLT_OFF")
+    time.sleep(1.0)
     send(sock, f"SAVE:PROFILE,{PROFILE_OFF}")
-    time.sleep(0.2)
-    print(f"  Profile {PROFILE_OFF} (BKLT_OFF) saved.")
+    resp = wait_for_response(sock, "has been saved")
+    print(f"  SAVE:PROFILE,{PROFILE_OFF} confirmation: "
+          f"{'CONFIRMED' if 'has been saved' in resp.lower() else 'NOT SEEN — ' + repr(resp)}")
 
     print()
     print("=" * 60)
-    print("STEP 4: Verify profiles saved")
+    print("STEP 4: Verify by loading each profile back and reading channel config")
     print("=" * 60)
-    query(sock, "*PROFILE:NAMES?")
-    query(sock, "*CHANNEL:CONFIGS?")
+    for slot, label in ((PROFILE_ON, "ON"), (PROFILE_OFF, "OFF")):
+        send(sock, f"LOAD:PROFILE,{slot}")
+        time.sleep(0.5)
+        resp = query(sock, "*CHANNEL:CONFIGS?")
+        if f'profile="{slot}"' not in resp:
+            # Query's own 800ms drain didn't catch it -- keep passively
+            # polling for a straggler rather than assuming it never came.
+            extra = wait_for_response(sock, f'profile="{slot}"', timeout_s=3.0)
+            if extra:
+                resp = extra
+        ok = f'profile="{slot}"' in resp and "not set" not in resp.lower()
+        print(f"  Profile {slot} ({label}): {'OK — content confirmed' if ok else 'FAILED — check output above'}")
+        print(f"    {resp}")
+    # Leave the light off when setup finishes.
+    send(sock, f"LOAD:PROFILE,{PROFILE_OFF}")
+
     print()
     print("Setup complete. Run 'probe' next to find the profile-select syntax.")
 
@@ -196,7 +312,8 @@ def _try_select(sock: socket.socket, template: str, slot: int) -> bool:
     """
     cmd = template % slot
     print(f"\n  Trying: {cmd!r}")
-    send(sock, cmd, drain_ms=100)
+    send(sock, cmd)   # default drain_ms=400, plus a pre-flush of any leftovers
+    time.sleep(0.15)  # let the device fully settle before asking it to confirm
     resp = query(sock, "*PROFILE:NUMBER?")
     # Look for the slot number in the response
     if str(slot) in resp:
@@ -266,7 +383,7 @@ def cmd_toggle(sock: socket.socket, select_template: str, cycles: int = 10) -> N
     for i in range(cycles):
         # --- ON ---
         t0 = time.perf_counter()
-        send_batch(sock, [select_template % PROFILE_ON, "LOAD:PROFILE"], drain_ms=30)
+        send_batch(sock, [select_template % PROFILE_ON], drain_ms=30)
         t1 = time.perf_counter()
         dt_on = (t1 - t0) * 1000
         times_on.append(dt_on)
@@ -275,7 +392,7 @@ def cmd_toggle(sock: socket.socket, select_template: str, cycles: int = 10) -> N
 
         # --- OFF ---
         t0 = time.perf_counter()
-        send_batch(sock, [select_template % PROFILE_OFF, "LOAD:PROFILE"], drain_ms=30)
+        send_batch(sock, [select_template % PROFILE_OFF], drain_ms=30)
         t1 = time.perf_counter()
         dt_off = (t1 - t0) * 1000
         times_off.append(dt_off)
@@ -308,12 +425,12 @@ def cmd_compare(sock: socket.socket, select_template: str, cycles: int = 10) -> 
     profile_off_times = []
     for _ in range(cycles):
         t0 = time.perf_counter()
-        send_batch(sock, [select_template % PROFILE_ON, "LOAD:PROFILE"], drain_ms=30)
+        send_batch(sock, [select_template % PROFILE_ON], drain_ms=30)
         profile_on_times.append((time.perf_counter() - t0) * 1000)
         time.sleep(0.3)
 
         t0 = time.perf_counter()
-        send_batch(sock, [select_template % PROFILE_OFF, "LOAD:PROFILE"], drain_ms=30)
+        send_batch(sock, [select_template % PROFILE_OFF], drain_ms=30)
         profile_off_times.append((time.perf_counter() - t0) * 1000)
         time.sleep(0.3)
 
@@ -354,18 +471,64 @@ def cmd_compare(sock: socket.socket, select_template: str, cycles: int = 10) -> 
 
 
 # ---------------------------------------------------------------------------
+# SINGLE — one slow transition per method, for slow-motion video comparison
+# ---------------------------------------------------------------------------
+
+def cmd_single(sock: socket.socket, select_template: str) -> None:
+    """
+    One ON transition via profile switch, one ON transition via batch
+    SET:MODE, each with a countdown and a long hold -- a rapid toggle
+    (compare/toggle) is too fast for the naked eye to judge simultaneity
+    on (2026-08-31, operator feedback). Point a phone's slow-motion video
+    mode (120-240fps on most phones -- more than enough to catch even a
+    tens-of-ms stagger) at the light and record through each transition;
+    watching it back frame by frame is the only reliable way to actually
+    see a channel-by-channel ripple this fast.
+    """
+    def countdown(label: str) -> None:
+        print(f"\n{'=' * 60}\n{label}\n{'=' * 60}")
+        print("Start your phone's SLOW-MOTION video recording now, aimed at the light.")
+        for n in (5, 4, 3, 2, 1):
+            print(f"  {n} ...")
+            time.sleep(1.0)
+        print("  >>> SWITCHING NOW <<<")
+
+    set_all_off(sock)
+    time.sleep(1.0)
+
+    countdown("METHOD A: Profile switch — about to turn ON")
+    send_batch(sock, [select_template % PROFILE_ON], drain_ms=200)
+    print("  (light should now be ON — stop recording, check the playback)")
+    time.sleep(4.0)
+
+    print("\nTurning off, resetting for Method B ...")
+    send_batch(sock, [select_template % PROFILE_OFF], drain_ms=200)
+    time.sleep(2.0)
+
+    countdown("METHOD B: Batch SET:MODE — about to turn ON")
+    send_batch(sock, [f"SET:MODE:CHANNEL{ch},1" for ch in CHANNELS], drain_ms=200)
+    print("  (light should now be ON — stop recording, check the playback)")
+    time.sleep(4.0)
+
+    set_all_off(sock)
+    print("\nDone. Review both recordings frame-by-frame: does Method A show all 3")
+    print("channels brightening in the same frame, while Method B shows them")
+    print("brightening across 2-3 separate frames?")
+
+
+# ---------------------------------------------------------------------------
 # Quick on/off via profile (after setup + probe)
 # ---------------------------------------------------------------------------
 
 def cmd_on(sock: socket.socket, select_template: str) -> None:
     print("Profile ON ...")
-    send_batch(sock, [select_template % PROFILE_ON, "LOAD:PROFILE"], drain_ms=50)
+    send_batch(sock, [select_template % PROFILE_ON], drain_ms=50)
     print("Done.")
 
 
 def cmd_off(sock: socket.socket, select_template: str) -> None:
     print("Profile OFF ...")
-    send_batch(sock, [select_template % PROFILE_OFF, "LOAD:PROFILE"], drain_ms=50)
+    send_batch(sock, [select_template % PROFILE_OFF], drain_ms=50)
     print("Done.")
 
 
@@ -396,44 +559,14 @@ if __name__ == "__main__":
             # Leave light off after probe
             set_all_off(sock)
 
-        elif cmd in ("toggle", "compare", "on", "off"):
-            # For these commands we need the select template.
-            # Try to auto-discover it first (quick probe, no printing).
-            print("Auto-probing for working profile-select syntax ...")
-            found = None
-            for template in _SELECT_CANDIDATES:
-                cmd_str = template % PROFILE_ON
-                sock.sendall((cmd_str + ";").encode("ascii"))
-                time.sleep(0.05)
-                sock.settimeout(0.2)
-                buf = b""
-                try:
-                    while True:
-                        chunk = sock.recv(4096)
-                        if not chunk:
-                            break
-                        buf += chunk
-                except socket.timeout:
-                    pass
-                finally:
-                    sock.settimeout(TIMEOUT)
-
-                resp_check = query(sock, "*PROFILE:NUMBER?")
-                if str(PROFILE_ON) in resp_check:
-                    found = template
-                    print(f"  Using: {template!r}")
-                    break
-
-            if found is None:
-                print("[WARN] Could not auto-discover profile-select syntax.")
-                print("       Run 'probe' first to identify the working command.")
-                print("       Falling back to batch SET:MODE for on/off commands.")
-                if cmd == "on":
-                    set_all_on(sock)
-                elif cmd == "off":
-                    set_all_off(sock)
-                send(sock, "DISCONNECT")
-                sys.exit(0)
+        elif cmd in ("toggle", "compare", "single", "on", "off"):
+            # Use the already-confirmed syntax directly (2026-08-31) rather
+            # than re-discovering it every run -- 'probe' already verified
+            # it twice, patiently, against both slot 1 and slot 2. A quick
+            # single-attempt re-check here was proving flaky on its own
+            # (this device's response timing is unpredictable run to run),
+            # which was blocking real tests of an already-confirmed fact.
+            found = CONFIRMED_SELECT_TEMPLATE
 
             if cmd == "toggle":
                 cmd_toggle(sock, found)
@@ -441,6 +574,8 @@ if __name__ == "__main__":
             elif cmd == "compare":
                 cmd_compare(sock, found)
                 set_all_off(sock)
+            elif cmd == "single":
+                cmd_single(sock, found)
             elif cmd == "on":
                 cmd_on(sock, found)
             elif cmd == "off":
@@ -448,7 +583,7 @@ if __name__ == "__main__":
 
         else:
             print(f"Unknown command: {cmd!r}")
-            print("Usage: setup | probe | toggle | compare | on | off")
+            print("Usage: setup | probe | toggle | compare | single | on | off")
             sys.exit(1)
 
         send(sock, "DISCONNECT")

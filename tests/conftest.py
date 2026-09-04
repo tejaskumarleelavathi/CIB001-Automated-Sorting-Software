@@ -10,6 +10,7 @@ import pytest
 from cib.core.state_machine import SystemStateMachine
 from cib.drivers.safety.mock import MockSafetyDriver
 from cib.drivers.robot.mock import MockRobotDriver
+from cib.drivers.robot_remote.mock import MockRemoteEthernetDriver
 from cib.drivers.plc.mock import MockPLCDriver
 from cib.drivers.pump.mock import MockPumpDriver
 from cib.drivers.camera.mock import MockCameraDriver
@@ -36,6 +37,7 @@ def mock_drivers() -> DriverSet:
     """Full set of mock drivers for orchestrator tests."""
     return DriverSet(
         robot=MockRobotDriver(),
+        robot_remote=MockRemoteEthernetDriver(),
         safety=MockSafetyDriver(),
         plc=MockPLCDriver(),
         pump=MockPumpDriver(),
