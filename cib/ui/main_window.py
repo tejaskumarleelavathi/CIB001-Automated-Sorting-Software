@@ -1,322 +1,112 @@
 """
-cib/ui/main_window.py — Minimal operator window (Phase 1 placeholder).
+cib/ui/main_window.py — top-level window shell (Phase 2, 2026-08-27).
 
-PURPOSE OF THIS FILE:
-    This is a minimal working UI built so we can test the overhead camera
-    and backlight pipeline while the full HMI UI is designed.
+Replaces the original Phase 1 placeholder (single flat window with every
+control on it) with a thin QStackedWidget host swapping between two real
+screens:
+  - PreRunScreen  (cib/ui/screens/pre_run.py)  -- shown while IDLE/INITIALIZING
+  - RunViewScreen (cib/ui/screens/run_view.py) -- shown in every other state
 
-    What this window does:
-      - START button → triggers one run (overhead captures loop continuously)
-      - STOP  button → graceful cycle stop (finishes current cycle then parks)
-      - State label  → shows current state from the state machine
-      - Capture counter → counts images saved to output/overhead_images/
+Screen switching is driven by the orchestrator's actual state (via
+UiBridge), not guessed client-side -- so it also correctly switches back
+to the pre-run screen after an ABORT returns the system to IDLE, not just
+forward when a run starts.
 
-WHAT CHANGES WHEN FULL UI IS BUILT:
-    This file will be replaced entirely. The real UI will have:
-      - Pre-run setup screen (field code entry, plate ID, starting well selection)
-      - Run view (live overhead camera feed, plate station map, per-well status)
-      - Safety banner (e-stop indicator, light curtain status, reset button)
-      - Camera feed widget (live image with annotated centroids)
-      - Config manager screen (select plate config file)
-    See architecture/overhead_camera.md and prd_updated.md for full spec.
-
-THREADING NOTE:
-    PyQt6 event loop must run in the main thread.
-    asyncio event loop (orchestrator) runs in a background daemon thread.
-    Communication: orchestrator.operator_*() methods use asyncio.Queue.put_nowait()
-    which is thread-safe. UI polls orchestrator.state via QTimer every 500ms.
+Orchestrator API this depends on is unchanged from Phase 1
+(architecture/ui.md): operator_start/stop/abort/acknowledge/shutdown,
+.state. New in Phase 2: operator_configure_pre_run(), and the
+on_state_change/on_event constructor hooks (see cib/ui/bridge.py) --
+already-existing, previously-unused hooks in Orchestrator.__init__, wired
+up for the first time here instead of the original 500ms poll.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QFrame, QApplication,
-    QCheckBox, QFileDialog,
-)
-from PyQt6.QtCore import QTimer, Qt
-from PyQt6.QtGui import QCloseEvent, QFont
+from PyQt6.QtWidgets import QMainWindow, QStackedWidget
+from PyQt6.QtGui import QCloseEvent
 
-from cib.config.loader import PlateConfig, load_all_stations
-from cib.config.validator import ConfigValidationError
+from cib.core.events import RunStatusEvent
 from cib.core.state_machine import State
+from cib.ui import theme
+from cib.ui.bridge import UiBridge
+from cib.ui.screens.pre_run import PreRunScreen
+from cib.ui.screens.run_view import RunViewScreen
 
-
-# Colours for state badge
-_STATE_COLOURS = {
-    State.INITIALIZING:    ("INITIALIZING",    "#7f8c8d", "white"),
-    State.IDLE:            ("IDLE — READY",    "#27ae60", "white"),
-    State.RUNNING:         ("RUNNING",          "#2980b9", "white"),
-    State.CYCLE_STOPPING:  ("STOPPING…",        "#e67e22", "white"),
-    State.E_STOP:          ("E-STOP",           "#c0392b", "white"),
-    State.PROTECTIVE_STOP: ("PROTECTIVE STOP",  "#e67e22", "white"),
-    State.FAULT:           ("FAULT",            "#8e44ad", "white"),
-}
+_IDLE_STATES = {State.INITIALIZING, State.IDLE}
+# A safety fault tripped before a run was ever started (2026-08-31, real-
+# hardware finding: light curtain trip while sitting on the pre-run screen,
+# START never pressed, jumped straight to the run view -- confusing, since
+# nothing had actually started) must stay on the pre-run screen too, now
+# that it has its own SafetyBanner (see pre_run.py). Once a run IS active
+# (_has_active_run), the run view's own banner still owns this correctly --
+# unaffected, since that check is still gated on `not self._has_active_run`.
+_PRE_RUN_ELIGIBLE_STATES = _IDLE_STATES | {State.E_STOP, State.PROTECTIVE_STOP}
 
 
 class MainWindow(QMainWindow):
     """
-    Minimal operator window.
+    Receives the orchestrator instance and the UiBridge already wired into
+    it (see main.py) so it can call orchestrator.operator_*() and react to
+    bridge.state_changed/event_received.
 
-    Receives the orchestrator instance so it can call operator_start/stop
-    and read orchestrator.state. Polls state every 500ms via QTimer.
+    Screen routing (2026-08-30) needs BOTH the state and whether a run is
+    currently open/resumable -- IDLE means two different things: "fresh or
+    fully aborted" (show the pre-run setup screen) vs. "paused mid-run
+    after a CYCLE STOP or a self-heal recovery" (stay on the run view with
+    CONTINUE available, per FR-UI-04 -- re-showing the whole setup form
+    there would force the operator to re-enter the field code and re-tap
+    every station just to resume a run that never actually ended). Track
+    RunStatusEvent.run_id (None = no open run) alongside State for this.
     """
 
-    def __init__(self, orchestrator) -> None:
+    def __init__(self, orchestrator, bridge: UiBridge, config_dir: Path | None = None) -> None:
         super().__init__()
         self._orchestrator = orchestrator
-        self._capture_count = 0
-        # Loaded from the plate-stations Excel upload (see _on_load_stations) --
-        # {station_number: PlateConfig}. Empty until the operator loads a file.
-        self._loaded_stations: dict[int, PlateConfig] = {}
-        self._station_checkboxes: dict[int, QCheckBox] = {}
+        self._bridge = bridge
+        self._current_state = State.INITIALIZING
+        self._has_active_run = False
 
         self.setWindowTitle("CIB Automated Sorting Cell")
-        self.setMinimumSize(480, 430)
+        self.setMinimumSize(900, 640)
+        self.setStyleSheet(theme.window_stylesheet())
 
-        self._build_ui()
+        self._stack = QStackedWidget()
+        self.setCentralWidget(self._stack)
 
-        # Poll orchestrator state every 500ms and refresh UI
-        self._poll_timer = QTimer(self)
-        self._poll_timer.timeout.connect(self._refresh)
-        self._poll_timer.start(500)
+        self._pre_run_screen = PreRunScreen(orchestrator, config_dir=config_dir)
+        self._pre_run_screen.start_requested.connect(self._show_run_view)
+        self._pre_run_screen.connect_bridge(bridge)
+        self._stack.addWidget(self._pre_run_screen)
 
-    # ------------------------------------------------------------------
-    # Build UI
-    # ------------------------------------------------------------------
+        self._run_view_screen = RunViewScreen(orchestrator)
+        self._run_view_screen.connect_bridge(bridge)
+        self._stack.addWidget(self._run_view_screen)
 
-    def _build_ui(self) -> None:
-        root = QWidget()
-        self.setCentralWidget(root)
-        outer = QVBoxLayout(root)
-        outer.setContentsMargins(32, 24, 32, 24)
-        outer.setSpacing(16)
-
-        # ── Title ─────────────────────────────────────────────────────
-        title = QLabel("CIB Automated Sorting Cell")
-        title_font = QFont()
-        title_font.setPointSize(14)
-        title_font.setBold(True)
-        title.setFont(title_font)
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        outer.addWidget(title)
-
-        outer.addWidget(_hline())
-
-        # ── State badge ───────────────────────────────────────────────
-        self._state_label = QLabel("INITIALIZING")
-        state_font = QFont()
-        state_font.setPointSize(20)
-        state_font.setBold(True)
-        self._state_label.setFont(state_font)
-        self._state_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._state_label.setFixedHeight(56)
-        self._state_label.setStyleSheet(
-            "border-radius: 6px; background-color: #7f8c8d; color: white; padding: 4px;"
-        )
-        outer.addWidget(self._state_label)
-
-        outer.addSpacing(8)
-
-        # ── Plate stations config ───────────────────────────────────────
-        # Excel upload (one "Station N" sheet per physical nest) + a
-        # checkbox per discovered station so the operator can select which
-        # ones to fill this run — only meaningful while IDLE, before START
-        # (see Orchestrator.configure_stations()).
-        stations_row = QHBoxLayout()
-        self._stations_path_label = QLabel("No plate stations file loaded")
-        self._stations_path_label.setWordWrap(True)
-        _apply_font(self._stations_path_label, size=9)
-        self._stations_path_label.setStyleSheet("color: #7f8c8d;")
-        stations_row.addWidget(self._stations_path_label, 1)
-
-        self._load_stations_btn = QPushButton("Load Plate Stations…")
-        self._load_stations_btn.clicked.connect(self._on_load_stations)
-        stations_row.addWidget(self._load_stations_btn)
-        outer.addLayout(stations_row)
-
-        self._stations_checkbox_row = QHBoxLayout()
-        outer.addLayout(self._stations_checkbox_row)
-
-        outer.addSpacing(8)
-
-        # ── START / STOP buttons ──────────────────────────────────────
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(16)
-
-        self._start_btn = QPushButton("START")
-        self._start_btn.setFixedHeight(72)
-        _apply_font(self._start_btn, size=18, bold=True)
-        self._start_btn.setStyleSheet(
-            "QPushButton { background-color: #27ae60; color: white; border-radius: 8px; }"
-            "QPushButton:hover { background-color: #2ecc71; }"
-            "QPushButton:disabled { background-color: #bdc3c7; color: #7f8c8d; }"
-        )
-        self._start_btn.clicked.connect(self._on_start)
-        self._start_btn.setEnabled(False)   # enabled once IDLE
-        btn_row.addWidget(self._start_btn)
-
-        self._stop_btn = QPushButton("STOP")
-        self._stop_btn.setFixedHeight(72)
-        _apply_font(self._stop_btn, size=18, bold=True)
-        self._stop_btn.setStyleSheet(
-            "QPushButton { background-color: #e67e22; color: white; border-radius: 8px; }"
-            "QPushButton:hover { background-color: #f39c12; }"
-            "QPushButton:disabled { background-color: #bdc3c7; color: #7f8c8d; }"
-        )
-        self._stop_btn.clicked.connect(self._on_stop)
-        self._stop_btn.setEnabled(False)
-        btn_row.addWidget(self._stop_btn)
-
-        outer.addLayout(btn_row)
-
-        # ── CONTINUE / ABORT buttons — needed to recover from e-stop and
-        # light curtain trips (no way to clear either state without these).
-        recovery_row = QHBoxLayout()
-        recovery_row.setSpacing(16)
-
-        self._continue_btn = QPushButton("CONTINUE")
-        self._continue_btn.setFixedHeight(56)
-        _apply_font(self._continue_btn, size=15, bold=True)
-        self._continue_btn.setStyleSheet(
-            "QPushButton { background-color: #2980b9; color: white; border-radius: 8px; }"
-            "QPushButton:hover { background-color: #3498db; }"
-            "QPushButton:disabled { background-color: #bdc3c7; color: #7f8c8d; }"
-        )
-        self._continue_btn.clicked.connect(self._on_continue)
-        self._continue_btn.setEnabled(False)
-        recovery_row.addWidget(self._continue_btn)
-
-        self._abort_btn = QPushButton("ABORT")
-        self._abort_btn.setFixedHeight(56)
-        _apply_font(self._abort_btn, size=15, bold=True)
-        self._abort_btn.setStyleSheet(
-            "QPushButton { background-color: #7f2d2d; color: white; border-radius: 8px; }"
-            "QPushButton:hover { background-color: #963939; }"
-            "QPushButton:disabled { background-color: #bdc3c7; color: #7f8c8d; }"
-        )
-        self._abort_btn.clicked.connect(self._on_abort)
-        self._abort_btn.setEnabled(False)
-        recovery_row.addWidget(self._abort_btn)
-
-        outer.addLayout(recovery_row)
-
-        # ── SHUTDOWN button ───────────────────────────────────────────
-        self._shutdown_btn = QPushButton("SHUTDOWN")
-        self._shutdown_btn.setFixedHeight(48)
-        _apply_font(self._shutdown_btn, size=13, bold=True)
-        self._shutdown_btn.setStyleSheet(
-            "QPushButton { background-color: #c0392b; color: white; border-radius: 6px; }"
-            "QPushButton:hover { background-color: #e74c3c; }"
-            "QPushButton:disabled { background-color: #bdc3c7; color: #7f8c8d; }"
-        )
-        self._shutdown_btn.clicked.connect(self._on_shutdown)
-        self._shutdown_btn.setEnabled(False)   # enabled once system is IDLE or FAULT
-        outer.addWidget(self._shutdown_btn)
-
-        outer.addWidget(_hline())
-
-        # ── Info labels ───────────────────────────────────────────────
-        self._capture_label = QLabel("Images captured this session: 0")
-        self._capture_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        _apply_font(self._capture_label, size=11)
-        outer.addWidget(self._capture_label)
-
-        self._save_label = QLabel("Save folder:  output/overhead_images/")
-        self._save_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        _apply_font(self._save_label, size=10)
-        self._save_label.setStyleSheet("color: #7f8c8d;")
-        outer.addWidget(self._save_label)
-
-        outer.addStretch()
-
-        # Status / hint label — updated by _refresh based on state
-        self._hint_label = QLabel("")
-        self._hint_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._hint_label.setWordWrap(True)
-        _apply_font(self._hint_label, size=9)
-        self._hint_label.setStyleSheet("color: #7f8c8d; font-style: italic;")
-        outer.addWidget(self._hint_label)
-
-        # Note about this being a placeholder
-        note = QLabel(
-            "Phase 1 placeholder — full HMI UI with camera feed and plate map coming next."
-        )
-        note.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        _apply_font(note, size=9)
-        note.setStyleSheet("color: #95a5a6; font-style: italic;")
-        outer.addWidget(note)
+        self._stack.setCurrentWidget(self._pre_run_screen)
+        bridge.state_changed.connect(self._on_state_changed)
+        bridge.event_received.connect(self._on_event)
 
     # ------------------------------------------------------------------
-    # Button handlers
-    # ------------------------------------------------------------------
 
-    def _on_start(self) -> None:
-        self._orchestrator.operator_start()
+    def _on_state_changed(self, state: State) -> None:
+        self._current_state = state
+        self._update_screen()
 
-    def _on_stop(self) -> None:
-        self._orchestrator.operator_stop()
+    def _on_event(self, event: object) -> None:
+        if isinstance(event, RunStatusEvent):
+            self._has_active_run = event.run_id is not None
+            self._update_screen()
 
-    def _on_continue(self) -> None:
-        self._orchestrator.operator_acknowledge()
+    def _update_screen(self) -> None:
+        if self._current_state in _PRE_RUN_ELIGIBLE_STATES and not self._has_active_run:
+            self._stack.setCurrentWidget(self._pre_run_screen)
+        else:
+            self._stack.setCurrentWidget(self._run_view_screen)
 
-    def _on_abort(self) -> None:
-        self._orchestrator.operator_abort()
-
-    def _on_load_stations(self) -> None:
-        path_str, _ = QFileDialog.getOpenFileName(
-            self, "Select plate stations workbook", "", "Excel Files (*.xlsx)"
-        )
-        if not path_str:
-            return
-        try:
-            stations = load_all_stations(Path(path_str))
-        except (FileNotFoundError, ConfigValidationError) as exc:
-            self._stations_path_label.setText(f"Failed to load: {exc}")
-            self._stations_path_label.setStyleSheet("color: #c0392b;")
-            return
-        self._loaded_stations = stations
-        self._stations_path_label.setText(
-            f"Loaded: {Path(path_str).name} ({len(stations)} station(s))"
-        )
-        self._stations_path_label.setStyleSheet("color: #7f8c8d;")
-        self._rebuild_station_checkboxes()
-
-    def _rebuild_station_checkboxes(self) -> None:
-        while self._stations_checkbox_row.count():
-            item = self._stations_checkbox_row.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-        self._station_checkboxes = {}
-        for num in sorted(self._loaded_stations.keys()):
-            cb = QCheckBox(f"Station {num}")
-            cb.setChecked(True)
-            cb.stateChanged.connect(self._on_station_selection_changed)
-            self._stations_checkbox_row.addWidget(cb)
-            self._station_checkboxes[num] = cb
-        self._on_station_selection_changed()
-
-    def _on_station_selection_changed(self, *_args) -> None:
-        selected = {
-            num: cfg for num, cfg in self._loaded_stations.items()
-            if self._station_checkboxes[num].isChecked()
-        }
-        self._orchestrator.operator_configure_stations(selected)
-
-    def _on_shutdown(self) -> None:
-        """
-        Clean shutdown: tell orchestrator to disconnect all hardware (sends
-        DISCONNECT to lighting controller), then close the application.
-        The asyncio loop exits naturally — no force-stop, no WinError 10054 next time.
-        """
-        self._shutdown_btn.setEnabled(False)
-        self._orchestrator.operator_shutdown()
-        # Give asyncio ~3s to process the shutdown event, then close Qt.
-        # main.py will join the asyncio thread; it exits cleanly without force-stop.
-        QTimer.singleShot(3000, QApplication.quit)
+    def _show_run_view(self) -> None:
+        self._stack.setCurrentWidget(self._run_view_screen)
 
     # ------------------------------------------------------------------
     # Window close — ensure clean shutdown even if user clicks X
@@ -329,101 +119,7 @@ class MainWindow(QMainWindow):
         camera disconnect — arena_api keeps the GVCP control channel open
         and the next startup fails with GC_ERR_TIMEOUT.
         """
-        self._poll_timer.stop()
         self._orchestrator.operator_shutdown()
         # Accept immediately — main.py's finally block will join the asyncio
         # thread and wait for shutdown to complete (up to 4+3+2 = 9s).
         event.accept()
-
-    # ------------------------------------------------------------------
-    # State polling
-    # ------------------------------------------------------------------
-
-    def _refresh(self) -> None:
-        state = self._orchestrator.state
-        label, bg, fg = _STATE_COLOURS.get(state, (str(state), "#7f8c8d", "white"))
-
-        self._state_label.setText(label)
-        self._state_label.setStyleSheet(
-            f"border-radius: 6px; background-color: {bg}; color: {fg}; padding: 4px;"
-        )
-
-        # Button enable logic
-        self._start_btn.setEnabled(state == State.IDLE)
-        # Station selection only takes effect while IDLE, before START (see
-        # Orchestrator.configure_stations()) -- disable the controls outside
-        # that window so it's clear a change wouldn't apply.
-        self._load_stations_btn.setEnabled(state == State.IDLE)
-        for cb in self._station_checkboxes.values():
-            cb.setEnabled(state == State.IDLE)
-        self._stop_btn.setEnabled(state in {State.RUNNING, State.CYCLE_STOPPING})
-        # CONTINUE: clears E_STOP only once the FULL hardware reset sequence
-        # has physically completed (button released AND blue reset button
-        # pressed. Corrected 2026-08-18 from live hardware testing: there is
-        # ONE physical blue reset button shared by both fault types — it
-        # must be pressed (once it starts blinking) for E_STOP AND for
-        # PROTECTIVE_STOP. The original design assumption (FR-SAF-08 — light
-        # curtain needs no button, only a clear beam) does not match this
-        # installation; do not revert this without re-confirming on hardware.
-        hardware_reset_done = not self._orchestrator.hardware_fault_active
-        curtain_clear = not self._orchestrator.light_curtain_tripped
-        self._continue_btn.setEnabled(
-            hardware_reset_done and (state == State.E_STOP or
-                                      (state == State.PROTECTIVE_STOP and curtain_clear))
-        )
-        # ABORT: matches the state machine's allowed abort sources exactly.
-        self._abort_btn.setEnabled(
-            state in {State.IDLE, State.CYCLE_STOPPING, State.E_STOP,
-                      State.PROTECTIVE_STOP, State.FAULT}
-        )
-        # SHUTDOWN: available in all states except INITIALIZING — operator must
-        # always be able to shut down cleanly (e.g. when stuck in CYCLE_STOPPING).
-        self._shutdown_btn.setEnabled(state != State.INITIALIZING)
-
-        # Hint text
-        _HINTS = {
-            State.FAULT: (
-                "FAULT: check logs.  If lighting failed to connect, click SHUTDOWN, "
-                "wait ~30 s for the DCS-100E to clear its session, then restart."
-            ),
-            State.INITIALIZING: "Connecting to hardware — please wait…",
-            State.IDLE: "Ready. Click START to begin sorting.",
-            State.CYCLE_STOPPING: "Finishing current cycle — will stop when done.",
-        }
-        self._hint_label.setText(_HINTS.get(state, ""))
-
-        # Count saved images
-        self._update_capture_count()
-
-    def _update_capture_count(self) -> None:
-        """Count PNG/TIFF files in the overhead images folder."""
-        try:
-            from pathlib import Path
-            folder = Path(__file__).parent.parent.parent / "output" / "overhead_images"
-            if folder.exists():
-                count = len(list(folder.glob("overhead_*")))
-                if count != self._capture_count:
-                    self._capture_count = count
-                    self._capture_label.setText(
-                        f"Images captured this session: {count}"
-                    )
-        except Exception:
-            pass
-
-
-# ------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------
-
-def _hline() -> QFrame:
-    line = QFrame()
-    line.setFrameShape(QFrame.Shape.HLine)
-    line.setFrameShadow(QFrame.Shadow.Sunken)
-    return line
-
-
-def _apply_font(widget, size: int = 12, bold: bool = False) -> None:
-    f = QFont()
-    f.setPointSize(size)
-    f.setBold(bold)
-    widget.setFont(f)
