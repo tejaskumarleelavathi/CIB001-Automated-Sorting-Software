@@ -9,6 +9,7 @@ Adding a new event = add a dataclass here.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum, auto
 from typing import Any
 import numpy as np
@@ -267,6 +268,69 @@ class AllDevicesReadyEvent:
     pass
 
 
+@dataclass(frozen=True)
+class SystemErrorEvent:
+    """
+    A human-readable description of an operational fault, for UI display.
+    Pushed alongside sm.fault() at every non-safety fault point (robot
+    unreachable after recovery, unrecovered cycle disconnect, etc.) --
+    safety faults (e-stop/light curtain) have their own dedicated banner
+    (SafetyStatusEvent) and don't need this. Distinct from the structured
+    log (which always gets every error regardless) -- this is specifically
+    for the one thing the terminal shows in red that the UI-only operator
+    otherwise never sees.
+    """
+    message: str
+
+
+@dataclass(frozen=True)
+class RecoveryStatusEvent:
+    """
+    A short, human-readable progress update pushed while _safe_recovery()
+    (post-safety-fault CONTINUE) is running (2026-08-31) -- e.g.
+    "Reconnecting to robot...", "Restarting robot program...", "Homing
+    robot...". The Remote Ethernet fallback restart this can now trigger
+    (Stop/Reset/MotorsOn/Start/reconnect/rehome) takes up to ~30s, and
+    without this the operator just watched the CONTINUE button do nothing
+    for that whole window with no indication anything was happening.
+    Distinct from SystemErrorEvent (styled red, implies something is
+    wrong) -- this is routine progress, shown in the safety banner's own
+    status line, not styled as an error.
+    """
+    message: str
+
+
+@dataclass(frozen=True)
+class EoaFrameCapturedEvent:
+    """
+    A fresh EoA (End-of-Arm) close-up frame, pushed every time one is
+    captured during a cycle -- for the run view's camera panel, which
+    shows "last EoA capture" rather than a continuous stream (see
+    cib/ui/widgets/camera_feed.py's module docstring for why). Carries the
+    no-backlight frame specifically (the one used for vision analysis,
+    always captured every attempt regardless of pick outcome), not the
+    ring-light archival frame.
+    """
+    frame: Any
+
+
+@dataclass(frozen=True)
+class RunStatusEvent:
+    """
+    Live run summary for the UI (FR-UI-09): current field code, pass/fail
+    counts, and when the run started -- pushed whenever a run opens/closes
+    (_ensure_run_open/_close_run) and after every pick finishes
+    (_db_finish_pick). run_id=None means no run is currently open/resumable
+    -- the UI uses this (not State alone) to decide whether IDLE means
+    "fresh/aborted, show pre-run setup" or "paused mid-run, show CONTINUE."
+    """
+    run_id: str | None
+    field_code: str
+    started_at: datetime | None
+    pass_count: int
+    fail_count: int
+
+
 # All event types in one union — used for type hints in the orchestrator
 SystemEvent = (
     OperatorStartEvent | OperatorStopEvent | OperatorAbortEvent | OperatorAcknowledgeEvent
@@ -279,4 +343,5 @@ SystemEvent = (
     | PumpActionCompleteEvent | PumpFaultEvent
     | PLCConnectedEvent | PLCEventLogEntry
     | ConnectionLostEvent | AllDevicesReadyEvent
+    | SystemErrorEvent | RecoveryStatusEvent | EoaFrameCapturedEvent | RunStatusEvent
 )

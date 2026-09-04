@@ -266,6 +266,23 @@ class Database:
         ).fetchall()
         return [self._row_to_pick(r) for r in rows]
 
+    def count_picks_by_result(self, run_id: str) -> dict:
+        """
+        Return {result: count} for every FINISHED pick in a run (excludes
+        'in_progress'). Used for the UI's live pass/fail counters
+        (FR-UI-09) -- a small aggregate query is cheap enough to run after
+        every pick, unlike fetching every row.
+        """
+        rows = self._conn().execute(
+            """
+            SELECT result, COUNT(*) as n FROM picks
+            WHERE run_id = ? AND result != 'in_progress'
+            GROUP BY result
+            """,
+            (run_id,),
+        ).fetchall()
+        return {r["result"]: r["n"] for r in rows}
+
     def get_interrupted_pick(self, run_id: str) -> Optional[Pick]:
         """
         Return the pick with result='in_progress' for a run, if any.

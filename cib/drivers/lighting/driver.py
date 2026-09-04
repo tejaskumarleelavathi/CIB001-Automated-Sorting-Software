@@ -13,6 +13,35 @@ Protocol confirmed from hardware_tests/test_lighting.py:
     SET:LEVEL:CHANNELx,{mA} → set channel x current in milliamps
     DISCONNECT               → clean close
 
+set_backlight() (2026-08-31, real-hardware finding): switched from 3
+sequential SET:MODE:CHANNELx commands to a single LOAD:PROFILE,n command.
+Even batched into one TCP write, the 3 SET:MODE commands were visibly
+staggering (each applied as the device finished parsing it, not all at
+once) -- confirmed against the real DCS-100E/103E manual (which documents
+no simultaneous-multi-channel command, only per-channel SET:MODE) and
+against hardware_tests/test_lighting_profiles.py's own timing data
+(profile switch: lower average AND much lower worst-case latency). A
+profile is a config record already saved on the device (both channels'
+mode+current together, slots 0-5); loading it is ONE command instead of
+three, so there's nothing left for the device to apply sequentially.
+Requires the one-time hardware_tests/test_lighting_profiles.py setup
+step to have saved slot BACKLIGHT_PROFILE_ON (all channels on) and slot
+BACKLIGHT_PROFILE_OFF (all channels off) on this physical unit.
+connect() calls _verify_backlight_profiles_sync() once, patiently, to
+confirm LOAD:PROFILE genuinely works before trusting it for the rest of
+the session (self._profiles_confirmed) -- found live 2026-08-31 that a
+per-call check trying to catch failure via response text was NOT enough:
+this device's responses can simply not arrive at all within a normal
+drain window, and treating silence as success left the backlight dark on
+the very first call of a session with no warning at all. If the one-time
+check finds the profile isn't configured (e.g. a replacement DCS-100E
+swapped in without setup having been re-run), every set_backlight() call
+this session falls back to the old, always-reliable per-channel
+commands instead. set_backlight_channels() (partial/subset control, used
+only for the reduced-brightness EoA frame) is unaffected by any of this
+-- it's inherently parameterized per call, which a small fixed set of
+saved profiles can't represent.
+
 Device:  172.16.9.20, port 777
 Current: 250 mA per channel
 """
@@ -27,8 +56,26 @@ import structlog
 log = structlog.get_logger(__name__)
 
 CHANNELS       = [1, 2, 3]    # DCS-100E has 3 channels — all used for backlight
-RECV_TIMEOUT_S = 0.01         # non-blocking drain — SET commands need no ack
+# 0.01 -> 0.05 (2026-08-31, real-hardware finding): the DCS-100E's 3
+# per-channel acks don't always land inside a 10ms window -- confirmed live
+# from a drained response containing 2 lines from one SET:MODE batch and 2
+# from the NEXT one, each missing one channel's confirmation (the straggler
+# arrived after the drain gave up and got swept into the following call's
+# drain instead, silently). hardware_tests/test_lighting_profiles.py had
+# already found 30-50ms necessary for this same class of batched command --
+# the production driver's 10ms predates that finding.
+RECV_TIMEOUT_S = 0.05
 RECV_BUF       = 4096
+SEND_RETRIES   = 2             # resend once if not all channels confirmed --
+                                # SET:MODE is idempotent, so a retry is safe
+
+# Profile slots used by set_backlight() (2026-08-31) -- must match what
+# hardware_tests/test_lighting_profiles.py setup saved on this physical
+# DCS-100E. Confirmed via *CHANNEL:CONFIGS? after setup: slot
+# BACKLIGHT_PROFILE_ON = all 3 channels mode=1 (continuous) at
+# current_ma; slot BACKLIGHT_PROFILE_OFF = all 3 channels mode=0.
+BACKLIGHT_PROFILE_ON  = 1
+BACKLIGHT_PROFILE_OFF = 2
 
 
 class LightingControllerDriver:
@@ -52,6 +99,15 @@ class LightingControllerDriver:
         # stays correct even after set_backlight_channels() calls have
         # changed individual channels independently (2026-08-21).
         self._channels_on: set[int] = set()
+        # Set once at connect() by _verify_backlight_profiles_sync() --
+        # whether LOAD:PROFILE genuinely works on THIS physical unit
+        # (2026-08-31, real-hardware finding: a per-call silent-failure
+        # check was not good enough -- the very first set_backlight(True)
+        # of a session got zero response within the drain window and was
+        # wrongly treated as success, leaving the backlight dark with no
+        # warning at all). False (the always-reliable per-channel path)
+        # until proven otherwise.
+        self._profiles_confirmed = False
 
     # ------------------------------------------------------------------
     # connect / disconnect
@@ -129,6 +185,50 @@ class LightingControllerDriver:
 
         log.info("lighting.connected", ip=self._ip, port=self._port,
                  current_ma=self._current_ma)
+        self._verify_backlight_profiles_sync()
+
+    def _verify_backlight_profiles_sync(self) -> None:
+        """
+        One-time, patient check (2026-08-31, real-hardware finding) that
+        BACKLIGHT_PROFILE_ON is actually configured on this physical unit,
+        before trusting LOAD:PROFILE for every backlight toggle this
+        session. Doing this once here, with a generous timeout, means
+        every actual runtime set_backlight() call can just fire the
+        command and move on -- either fast via profiles (once trust is
+        established) or via the always-reliable per-channel path, never a
+        per-call guess about whether a missing response means success or
+        failure. Leaves the light OFF when it's done either way.
+        """
+        self._profiles_confirmed = False
+        try:
+            resp = self._send_batch([f"LOAD:PROFILE,{BACKLIGHT_PROFILE_ON}"])
+            if not resp:
+                resp = self._poll_for_response(timeout_s=2.0)
+            if "not set" in resp.lower():
+                log.warning(
+                    "lighting.backlight_profiles_not_configured",
+                    note=f"Profile {BACKLIGHT_PROFILE_ON} is not set on this "
+                         "DCS-100E — run hardware_tests/test_lighting_profiles.py "
+                         "setup once. Using slower per-channel commands for "
+                         "backlight this session.",
+                )
+            elif "loaded" in resp.lower():
+                self._profiles_confirmed = True
+                log.info("lighting.backlight_profiles_confirmed")
+            else:
+                log.warning(
+                    "lighting.backlight_profile_check_inconclusive", resp=resp,
+                    note="No clear confirmation from LOAD:PROFILE even after "
+                         "waiting — using slower per-channel commands for "
+                         "backlight this session.",
+                )
+        except Exception as exc:
+            log.warning("lighting.backlight_profile_check_failed", error=str(exc))
+        finally:
+            for ch in CHANNELS:
+                self._send_command(f"SET:MODE:CHANNEL{ch},0")
+            self._backlight_on = False
+            self._channels_on = set()
 
     async def disconnect(self) -> None:
         loop = asyncio.get_running_loop()
@@ -164,17 +264,70 @@ class LightingControllerDriver:
         if on == self._backlight_on:
             return  # already in the right state — no send, no wait
 
-        mode = 1 if on else 0
-        # Send all 3 channel commands in one TCP write — one packet, one drain.
-        # Previously sent 3 separate _send_command() calls, each with its own
-        # 10ms drain timeout = 3× round trips and variable 0–30ms total latency.
-        # Batching eliminates that variability: all channels switch simultaneously,
-        # one drain handles any response the device sends.
-        self._send_batch([f"SET:MODE:CHANNEL{ch},{mode}" for ch in CHANNELS])
+        if self._profiles_confirmed:
+            # Single atomic command instead of 3 sequential
+            # SET:MODE:CHANNELx (2026-08-31 — see module docstring).
+            slot = BACKLIGHT_PROFILE_ON if on else BACKLIGHT_PROFILE_OFF
+            self._send_batch([f"LOAD:PROFILE,{slot}"])
+            if on:
+                # Verify for real on ON specifically (2026-08-31,
+                # real-hardware finding): TCP only guarantees the bytes
+                # reached the device -- it does NOT guarantee the device's
+                # own command parser actually executed them. Confirmed
+                # live: the connect-time check succeeding once does not
+                # mean every later send also lands -- a send can succeed
+                # at the socket level with zero error while the device
+                # silently never applies it, and without this check
+                # self._backlight_on would still get set True, permanently
+                # hiding the failure (the very next ON call would see
+                # "already on" and skip sending anything at all). OFF
+                # isn't verified -- a delayed/failed OFF just means
+                # slightly more stray light for one frame, not a missed
+                # detection, so it stays fast/fire-and-forget.
+                if not self._verify_backlight_on_sync():
+                    log.warning(
+                        "lighting.backlight_profile_on_not_confirmed",
+                        note="LOAD:PROFILE ON not confirmed via *CHANNEL:CONFIGS? -- "
+                             "falling back to per-channel commands for this call.",
+                    )
+                    confirmed = self._send_batch_verified(
+                        [f"SET:MODE:CHANNEL{ch},1" for ch in CHANNELS], expected=len(CHANNELS),
+                    )
+                    if not confirmed:
+                        log.warning(
+                            "lighting.backlight_not_fully_confirmed", on=on,
+                            note="Not all 3 channels confirmed even after a retry — "
+                                 "physical state may not match. Check backlight "
+                                 "visually if this repeats.",
+                        )
+        else:
+            mode = 1 if on else 0
+            confirmed = self._send_batch_verified(
+                [f"SET:MODE:CHANNEL{ch},{mode}" for ch in CHANNELS], expected=len(CHANNELS),
+            )
+            if not confirmed:
+                log.warning(
+                    "lighting.backlight_not_fully_confirmed", on=on,
+                    note="Not all 3 channels confirmed even after a retry — physical "
+                         "state may not match. Check backlight visually if this repeats.",
+                )
 
         self._backlight_on = on
         self._channels_on = set(CHANNELS) if on else set()
-        log.debug("lighting.backlight", on=on)
+        log.debug("lighting.backlight", on=on,
+                  method="profile" if self._profiles_confirmed else "per_channel")
+
+    def _verify_backlight_on_sync(self, timeout_s: float = 1.5) -> bool:
+        """
+        Read back *CHANNEL:CONFIGS? and confirm at least one channel
+        actually reports mode="1" -- real proof the device applied the
+        command, not just that we sent it. Polls up to timeout_s if the
+        response doesn't arrive immediately (this device's replies can lag).
+        """
+        resp = self._send_batch(["*CHANNEL:CONFIGS?"])
+        if 'mode="1"' not in resp:
+            resp = self._poll_for_response(timeout_s=timeout_s)
+        return 'mode="1"' in resp
 
     async def set_ring_light(self, on: bool) -> None:
         """Ring light is robot digital output 12 — not controlled by DCS-100E."""
@@ -194,7 +347,14 @@ class LightingControllerDriver:
         reason about correctly than just always sending.
         """
         mode = 1 if on else 0
-        self._send_batch([f"SET:MODE:CHANNEL{ch},{mode}" for ch in channels])
+        confirmed = self._send_batch_verified(
+            [f"SET:MODE:CHANNEL{ch},{mode}" for ch in channels], expected=len(channels),
+        )
+        if not confirmed:
+            log.warning(
+                "lighting.backlight_channels_not_fully_confirmed", channels=channels, on=on,
+                note="Not all requested channels confirmed even after a retry.",
+            )
         if on:
             self._channels_on.update(channels)
         else:
@@ -211,14 +371,93 @@ class LightingControllerDriver:
         """Send a single command and drain its response (fire-and-forget)."""
         self._send_batch([command])
 
-    def _send_batch(self, commands: list[str]) -> None:
+    def _send_batch_verified(self, commands: list[str], expected: int) -> bool:
+        """
+        Send `commands` and count how many "set to mode" confirmations come
+        back; if fewer than `expected`, resend once more before giving up
+        (2026-08-31, real-hardware finding — see RECV_TIMEOUT_S's comment).
+        SET:MODE is idempotent for a channel already in the requested state,
+        so a full resend is always safe, never a partial/targeted retry.
+        Returns True only once `expected` confirmations were actually seen.
+        """
+        for attempt in range(SEND_RETRIES):
+            resp = self._send_batch(commands)
+            if resp.count("set to mode") >= expected:
+                return True
+            if attempt < SEND_RETRIES - 1:
+                log.debug(
+                    "lighting.send_batch_retry", attempt=attempt + 1,
+                    confirmations=resp.count("set to mode"), expected=expected,
+                )
+        return False
+
+    def _flush_stale(self) -> None:
+        """
+        Drain and discard anything already sitting in the socket buffer
+        BEFORE sending a new command (2026-08-31, real-hardware finding —
+        see hardware_tests/test_lighting_profiles.py's identical fix).
+        Responses can straggle in well behind their own call's drain
+        window; without this, a later call's drain can silently consume a
+        prior call's leftover response instead of (or mixed in with) its
+        own, making _send_batch_verified's confirmation-counting and
+        _set_backlight_sync's "not set" profile check both unreliable.
+        """
+        if self._sock is None:
+            return
+        self._sock.settimeout(0.02)
+        try:
+            while True:
+                chunk = self._sock.recv(RECV_BUF)
+                if not chunk:
+                    break
+        except socket.timeout:
+            pass
+        except OSError:
+            pass
+        finally:
+            self._sock.settimeout(self._connect_timeout)
+
+    def _poll_for_response(self, timeout_s: float) -> str:
+        """
+        Passively drain (no send) until something arrives or timeout_s
+        elapses -- used only by _verify_backlight_profiles_sync()'s
+        one-time, patient check, for a command whose response didn't show
+        up within the normal short drain window. Not used on the
+        per-toggle hot path (see _set_backlight_sync).
+        """
+        if self._sock is None:
+            return ""
+        deadline = time.monotonic() + timeout_s
+        collected = b""
+        while time.monotonic() < deadline:
+            self._sock.settimeout(0.1)
+            try:
+                chunk = self._sock.recv(RECV_BUF)
+                if chunk:
+                    collected += chunk
+                    continue   # keep draining while data is still flowing
+            except socket.timeout:
+                pass
+            except OSError:
+                break
+            if collected:
+                break
+        self._sock.settimeout(self._connect_timeout)
+        text = collected.decode("ascii", errors="replace").strip()
+        if text:
+            log.debug("lighting.response", resp=text)
+        return text
+
+    def _send_batch(self, commands: list[str]) -> str:
         """
         Send multiple commands in one TCP write, each semicolon-terminated.
         Drain any response with a short timeout — response is not required.
+        Returns the decoded response text (empty string if nothing arrived).
         """
         if self._sock is None:
             raise RuntimeError("Lighting controller not connected")
 
+        self._flush_stale()
         payload = "".join(
             cmd if cmd.endswith(";") else cmd + ";"
             for cmd in commands
@@ -244,5 +483,8 @@ class LightingControllerDriver:
             pass
         finally:
             self._sock.settimeout(self._connect_timeout)
-        if buf:
-            log.debug("lighting.response", resp=buf.decode("ascii", errors="replace").strip())
+        if not buf:
+            return ""
+        text = buf.decode("ascii", errors="replace").strip()
+        log.debug("lighting.response", resp=text)
+        return text

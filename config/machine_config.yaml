@@ -24,6 +24,28 @@ robot:
   u_top_deg: 209.0             # wrist U angle (deg) for top-2 quadrants (TL/TR)
   u_bottom_deg: 251.0          # wrist U angle (deg) for bottom-2 quadrants (BL/BR)
 
+robot_remote:
+  # Epson RC+ 7.0 Remote Ethernet — controller-level lifecycle control
+  # (Login/GetStatus/Reset/SetMotorsOn/SetMotorsOff/Start/Stop). Separate
+  # port from `robot:` above — that one is sort_server.prg's own custom
+  # PICK/DROP protocol; this one is the controller's built-in supervisory
+  # channel, no license required (unlike the paid RC+ API option).
+  # Requires a one-time setup in RC+: [Setup] -> System Configuration ->
+  # Controller -> Configuration -> Control Device = Remote Ethernet, and
+  # [Setup] -> System Configuration -> Remote Control -> Ethernet -> port.
+  # Deliberately connected briefly (login, run a short command sequence,
+  # logout) rather than held open for the process lifetime — see
+  # cib/core/orchestrator.py's _remote_ethernet_restart_task().
+  enabled: true
+  ip: "172.16.9.15"          # same controller as robot: above
+  port: 5000                 # must match the Remote Control -> Ethernet page
+  password: ""                # blank password confirmed working on real hardware.
+                               # A blank password means anyone on this network
+                               # segment can control the robot via Remote
+                               # Ethernet -- worth revisiting.
+  connect_timeout_s: 5.0
+  command_timeout_s: 10.0
+
 plc:
   ip: "172.16.9.11"
   port: 502
@@ -137,10 +159,11 @@ vision:
   detection_max_area_px: 2000
   backlight_lead_time_ms: 50
   # Overhead image save settings
-  overhead_save_images: false         # set true to save overhead frames (annotate+
+  overhead_save_images: true          # set true to save overhead frames (annotate+
                                        # save every cycle — even backgrounded, still
-                                       # real disk/CPU cost; off since 2026-08-21
-                                       # optimize-speed pass per operator's own call)
+                                       # real disk/CPU cost; re-enabled 2026-08-28 to
+                                       # check overhead detection against a backlight
+                                       # setting changed directly on the DCS-100E)
   overhead_save_format: 'png'         # png (debug) or tiff (archival)
   # EoA image settings (save one TIFF per specimen — Austin requires these)
   eoa_save_format: 'tiff'

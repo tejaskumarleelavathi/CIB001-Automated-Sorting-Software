@@ -105,6 +105,26 @@ class RobotConfig:
 
 
 @dataclass
+class RobotRemoteConfig:
+    """
+    Epson RC+ Remote Ethernet — controller-level lifecycle control (Login,
+    GetStatus, Reset, SetMotorsOn/Off, Start, Stop), separate from the
+    robot's own PICK/DROP/MOVE_IMAGE protocol (see RobotConfig above).
+    Requires a one-time setup in RC+: Control Device = Remote Ethernet
+    (System Configuration -> Controller -> Configuration), plus a port and
+    password on the System Configuration -> Remote Control -> Ethernet page.
+    enabled=False disables the whole feature (no-op) so a controller without
+    that setup can still run normally.
+    """
+    ip:                str
+    port:              int
+    password:          str
+    connect_timeout_s: float
+    command_timeout_s: float
+    enabled:           bool = False
+
+
+@dataclass
 class PLCConfig:
     ip:              str
     port:            int
@@ -213,6 +233,7 @@ class PlateStationsConfig:
 @dataclass
 class MachineConfig:
     robot:           RobotConfig
+    robot_remote:    RobotRemoteConfig
     plc:             PLCConfig
     flexi:           FlexiConfig
     overhead_camera: CameraConfig
@@ -374,6 +395,10 @@ def _parse_well_row(row: dict) -> WellConfig:
 
 def _parse_machine_config(raw: dict) -> MachineConfig:
     r = raw["robot"]
+    # Optional section — Remote Ethernet requires a one-time RC+ setup that
+    # doesn't exist on every controller. .get() with defaults so older
+    # machine_config.yaml files without this section still load.
+    rr = raw.get("robot_remote", {})
     p = raw["plc"]
     fl = raw["flexi"]
     oc = raw["overhead_camera"]
@@ -401,6 +426,14 @@ def _parse_machine_config(raw: dict) -> MachineConfig:
             u_bottom_deg=(
                 float(r["u_bottom_deg"]) if r.get("u_bottom_deg") is not None else None
             ),
+        ),
+        robot_remote=RobotRemoteConfig(
+            ip=rr.get("ip", r["ip"]),   # same controller as robot: by default
+            port=int(rr.get("port", 5000)),
+            password=str(rr.get("password", "")),
+            connect_timeout_s=float(rr.get("connect_timeout_s", 5.0)),
+            command_timeout_s=float(rr.get("command_timeout_s", 10.0)),
+            enabled=bool(rr.get("enabled", False)),
         ),
         plc=PLCConfig(
             ip=p["ip"],
