@@ -36,6 +36,22 @@
     copy: it can create/update the files listed above, and nothing else,
     full stop.):
       C:\LabAutomation\config\*.npy, tool_offset.json  (camera calibration)
+      C:\LabAutomation\camera_calibration\output\eoa_pixel_scale*.json
+                                                         (per-quadrant EoA
+                                                         pixel-scale calibration,
+                                                         DEV-14 -- same
+                                                         "real data, not code"
+                                                         category as the .npy
+                                                         files above; missed in
+                                                         this comment on the
+                                                         first pass since it's
+                                                         the only runtime data
+                                                         living inside the
+                                                         otherwise-excluded
+                                                         camera_calibration/
+                                                         folder -- see
+                                                         orchestrator.py's
+                                                         _load_eoa_pixel_scale)
       C:\LabAutomation\data\                            (picks DB, run history)
       anything else already sitting in C:\LabAutomation not listed above
 
@@ -48,9 +64,16 @@
       1. Python installed, and a venv created at C:\LabAutomation\.venv
          with this project's dependencies (see pyproject.toml).
       2. Camera calibration + tool offset already captured for that
-         physical setup, at C:\LabAutomation\config\*.npy /
-         tool_offset.json (see camera_calibration/ scripts -- NOT copied
-         by this script, run once directly against the HMI's own cameras).
+         physical setup:
+           C:\LabAutomation\config\*.npy, tool_offset.json
+           C:\LabAutomation\camera_calibration\output\eoa_pixel_scale*.json
+         NOT copied by this script. If it's the SAME physical camera/robot
+         setup as another machine that's already calibrated (2026-09-04,
+         confirmed case: laptop -> HMI, identical cell), just copy these
+         files directly from that machine -- calibration is a property of
+         the physical hardware, not the controlling PC, so there's no need
+         to re-run the camera_calibration/ scripts in that case. Only
+         re-run them if the HMI has genuinely different/re-mounted cameras.
       3. A Windows file share reachable from this laptop -- either the
          built-in administrative share (\\<HMI-HOST>\C$), which needs a
          Windows account with admin rights on the HMI, or a plain shared
