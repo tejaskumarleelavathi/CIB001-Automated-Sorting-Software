@@ -28,6 +28,7 @@ USE_MOCKS = True       # True = laptop dev | False = HMI prod
 # Selective real-hardware flags (only apply when USE_MOCKS = True)
 # Set the device you physically have connected to True; leave others False.
 USE_REAL_ROBOT    = True    # real Epson T3-B (sort_server.prg must be running in RC+)
+USE_REAL_ROBOT_REMOTE = True    # real Epson RC+ Remote Ethernet (controller lifecycle control)
 USE_REAL_CAMERA_OVERHEAD = True    # real Lucid overhead camera (serial 253102168)
 USE_REAL_CAMERA_EOA      = True    # real Lucid EoA camera (serial 253102169)
 USE_REAL_LIGHTING = True    # real DCS-100E backlight
@@ -86,6 +87,7 @@ def build_drivers(
     use_real_lighting: bool,
     use_real_safety: bool = False,
     use_real_plc: bool = False,
+    use_real_robot_remote: bool = False,
 ):
     from cib.core.orchestrator import DriverSet
 
@@ -100,6 +102,16 @@ def build_drivers(
             _make_real_robot(cfg)
             if use_real_robot
             else __import__("cib.drivers.robot.mock", fromlist=["MockRobotDriver"]).MockRobotDriver()
+        )
+        # robot_remote (Remote Ethernet) — same real/mock split as robot
+        # above. Actually connecting it still requires cfg.robot_remote.enabled
+        # to be True (the one-time RC+ setup) -- the orchestrator gates every
+        # call on that flag regardless of which driver object is here, so
+        # building the real one before that setup exists is harmless (never used).
+        robot_remote = (
+            _make_real_robot_remote(cfg)
+            if use_real_robot_remote
+            else __import__("cib.drivers.robot_remote.mock", fromlist=["MockRemoteEthernetDriver"]).MockRemoteEthernetDriver()
         )
         camera_overhead = (
             _make_real_camera(cfg, "overhead")
@@ -120,6 +132,7 @@ def build_drivers(
         plc    = _make_real_plc(cfg)    if use_real_plc    else MockPLCDriver()
         return DriverSet(
             robot           = robot,
+            robot_remote    = robot_remote,
             safety          = safety,
             plc             = plc,
             pump            = MockPumpDriver(),
@@ -133,6 +146,7 @@ def build_drivers(
         from cib.drivers.pump.driver     import MDriveDriver
         return DriverSet(
             robot           = _make_real_robot(cfg),
+            robot_remote    = _make_real_robot_remote(cfg),
             safety          = _make_real_safety(cfg),
             plc             = _make_real_plc(cfg),
             pump            = MDriveDriver(),
@@ -150,6 +164,18 @@ def _make_real_robot(cfg):
         port=r.port,
         connect_timeout_s=r.connect_timeout_s,
         motion_timeout_s=getattr(r, "motion_timeout_s", 120.0),
+    )
+
+
+def _make_real_robot_remote(cfg):
+    from cib.drivers.robot_remote.driver import RemoteEthernetDriver
+    rr = cfg.robot_remote
+    return RemoteEthernetDriver(
+        ip=rr.ip,
+        port=rr.port,
+        password=rr.password,
+        connect_timeout_s=rr.connect_timeout_s,
+        command_timeout_s=rr.command_timeout_s,
     )
 
 
@@ -199,6 +225,7 @@ def main() -> None:
         use_real_lighting=USE_REAL_LIGHTING,
         use_real_safety=USE_REAL_SAFETY,
         use_real_plc=USE_REAL_PLC,
+        use_real_robot_remote=USE_REAL_ROBOT_REMOTE,
     )
 
     # Image save directories
@@ -215,6 +242,15 @@ def main() -> None:
         else Path(cfg.paths.runs_output)
     )
     eoa_save_dir.mkdir(parents=True, exist_ok=True)
+
+    # Plate config folder for the pre-run screen's dropdown (FR-UI-02) --
+    # same dev/prod split as the paths above.
+    plate_configs_dir = (
+        Path(__file__).parent / "config" / "plate_configs"
+        if USE_MOCKS
+        else Path(cfg.paths.plate_configs)
+    )
+    plate_configs_dir.mkdir(parents=True, exist_ok=True)
 
     # Data layer (SQLite + per-run CSV) — dev-local db on the laptop, real
     # path on the HMI. See cfg.paths.db / cib/data/database.py.
@@ -249,9 +285,21 @@ def main() -> None:
                 "main.plate_config_load_failed", path=str(TEST_PLATE_CONFIG), error=str(exc),
             )
 
+    # ── QApplication + UiBridge must exist before Orchestrator is
+    # constructed -- on_state_change/on_event are constructor-only hooks,
+    # and UiBridge is a QObject that must not be created before
+    # QApplication exists. See cib/ui/app.py's module docstring.
+    from PyQt6.QtWidgets import QApplication
+    from cib.ui.bridge import UiBridge
+    app = QApplication(sys.argv)
+    app.setApplicationName("CIB Automated Sorting Cell")
+    bridge = UiBridge()
+
     from cib.core.orchestrator import Orchestrator
     orchestrator = Orchestrator(
         drivers=drivers,
+        on_state_change=bridge.on_state_change,
+        on_event=bridge.on_event,
         overhead_save_dir=overhead_save_dir if cfg.vision.overhead_save_images else None,
         overhead_save_format=cfg.vision.overhead_save_format,
         overhead_save_images=cfg.vision.overhead_save_images,
@@ -271,6 +319,9 @@ def main() -> None:
         runs_base_dir=runs_base_dir,
         field_code=DEV_FIELD_CODE,
         default_plate_id=DEV_PLATE_ID,
+        robot_remote_enabled=cfg.robot_remote.enabled,
+        safety_poll_interval_s=cfg.flexi.poll_interval_ms / 1000.0,
+        plc_poll_interval_s=cfg.plc.poll_interval_ms / 1000.0,
     )
 
     # ── Start asyncio in a background daemon thread ───────────────────────────
@@ -295,6 +346,20 @@ def main() -> None:
                     traceback.print_exception(type(sub), sub, sub.__traceback__)
             else:
                 traceback.print_exception(type(exc), exc, exc.__traceback__)
+            # Best-effort, last line of defense (2026-08-31, operator
+            # request: "however the program closes... ensure the
+            # backlight is turned off no matter what"). If the
+            # orchestrator itself is what just crashed, its own
+            # OperatorShutdownEvent handler (which normally turns this
+            # off) never runs -- do it directly here instead, bypassing
+            # the crashed orchestrator entirely. `loop` is still open at
+            # this point (only the run() call inside it failed).
+            try:
+                loop.run_until_complete(
+                    asyncio.wait_for(drivers.lighting.set_backlight(False), timeout=3.0)
+                )
+            except Exception as backlight_exc:
+                log.warning("orchestrator.crash_backlight_off_failed", error=str(backlight_exc))
 
     asyncio_thread = threading.Thread(target=_run_asyncio, daemon=True, name="asyncio")
     asyncio_thread.start()
@@ -302,20 +367,30 @@ def main() -> None:
     # ── Run PyQt6 in main thread ──────────────────────────────────────────────
     from cib.ui.app import run_qt
     try:
-        exit_code = run_qt(orchestrator)
+        exit_code = run_qt(app, orchestrator, bridge, config_dir=plate_configs_dir)
     except KeyboardInterrupt:
         exit_code = 0
     finally:
         # Qt window has closed.
         # If the operator used the SHUTDOWN button, operator_shutdown() was called and
         # the asyncio loop is already exiting cleanly (sends DISCONNECT to lighting).
-        # Give it up to 4 seconds to finish; only force-stop if it didn't exit in time.
-        asyncio_thread.join(timeout=4.0)
+        # 4.0 -> 12.0 / 3.0 -> 15.0 (2026-08-31, real-hardware finding): a
+        # robot recovery can legitimately be in flight at shutdown time (the
+        # keepalive loop's own background self-heal) and one attempt's
+        # internal timeouts alone can total ~26s worst case
+        # (wait_until_error_cleared 8s + wait_until_ready 10s +
+        # wait_until_running 8s) -- the previous 4+3=7s budget force-stopped
+        # the loop mid-recovery and crashed with "Event loop stopped before
+        # Future completed." _recover_robot_connection() now also bails
+        # between retries once shutdown is requested (see its
+        # self._running check), so this margin only needs to cover one
+        # attempt already in flight, not the full multi-retry sequence.
+        asyncio_thread.join(timeout=12.0)
         if asyncio_thread.is_alive():
             # Window was closed without SHUTDOWN (e.g. X button or Ctrl+C).
             # Best-effort cleanup: request shutdown, wait a bit more, then force-stop.
             orchestrator.operator_shutdown()
-            asyncio_thread.join(timeout=3.0)
+            asyncio_thread.join(timeout=15.0)
             if asyncio_thread.is_alive():
                 loop.call_soon_threadsafe(loop.stop)
                 asyncio_thread.join(timeout=2.0)
