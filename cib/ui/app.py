@@ -36,6 +36,13 @@ def run_qt(app, orchestrator, bridge, config_dir: Path | None = None) -> int:
     Blocks until the window is closed. Returns the Qt exit code.
     """
     window = MainWindow(orchestrator, bridge, config_dir=config_dir)
+    # Launch at the HMI's actual panel size (2026-09-11) rather than
+    # Qt's computed sizeHint -- on a dev monitor sizeHint comes out bigger
+    # than 1024x600 and looked fine, which is exactly what hid this bug
+    # during development; matching the real target size here means a
+    # layout that's too tall shows the same way on a dev laptop as it did
+    # on the actual touchscreen.
+    window.resize(1024, 600)
     window.show()
 
     # Without this, Ctrl+C at the console does nothing while app.exec()

@@ -137,7 +137,7 @@ def input_stylesheet() -> str:
             background-color: {CARD_BACKGROUND};
             border: 1px solid {CARD_BORDER};
             border-radius: 6px;
-            padding: 8px 10px;
+            padding: 4px 8px;
             color: {TEXT_PRIMARY};
         }}
         QLineEdit:focus {{ border: 1px solid {ACCENT}; }}

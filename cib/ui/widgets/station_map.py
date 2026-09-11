@@ -33,21 +33,24 @@ class StationMap(QWidget):
         self._build_ui()
 
     def _build_ui(self) -> None:
+        # Compact for the 1024x600 HMI touchscreen (2026-09-11) -- see
+        # pre_run.py's _build_ui for the same note; this widget's 64px
+        # tiles + 8px spacing were part of what didn't fit.
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(4)
+        outer.setSpacing(2)
 
         title = QLabel("Plate stations — active once a Plate ID is entered")
-        theme.apply_font(title, size=11, bold=True)
+        theme.apply_font(title, size=9, bold=True)
         title.setStyleSheet(f"color: {theme.TEXT_SECONDARY};")
         outer.addWidget(title)
 
         self._grid = QGridLayout()
-        self._grid.setSpacing(8)
+        self._grid.setSpacing(4)
         outer.addLayout(self._grid)
 
         self._prompt_label = QLabel("")
-        theme.apply_font(self._prompt_label, size=9)
+        theme.apply_font(self._prompt_label, size=8)
         self._prompt_label.setStyleSheet(f"color: {theme.STATUS_AMBER};")
         outer.addWidget(self._prompt_label)
 
@@ -75,8 +78,8 @@ class StationMap(QWidget):
             tile = QPushButton(f"Station {num}")
             tile.setCheckable(True)
             tile.setChecked(num in self._active)
-            tile.setFixedHeight(64)
-            theme.apply_font(tile, size=12, bold=True)
+            tile.setFixedHeight(34)
+            theme.apply_font(tile, size=10, bold=True)
             tile.clicked.connect(lambda _checked, n=num: self._on_tile_clicked(n))
             self._grid.addWidget(tile, i // 2, i % 2)
             self._tiles[num] = tile

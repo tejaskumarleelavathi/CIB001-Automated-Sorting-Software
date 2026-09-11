@@ -69,7 +69,11 @@ class MainWindow(QMainWindow):
         self._has_active_run = False
 
         self.setWindowTitle("CIB Automated Sorting Cell")
-        self.setMinimumSize(900, 640)
+        # HMI touchscreen is 1024x600 (2026-09-11) -- both screens' layouts
+        # are sized to fit that exactly. Do NOT raise this height back up;
+        # a minimum taller than the physical panel is what caused every
+        # widget below to get squeezed/overlapped on the real hardware.
+        self.setMinimumSize(1024, 600)
         self.setStyleSheet(theme.window_stylesheet())
 
         self._stack = QStackedWidget()

@@ -76,13 +76,16 @@ class RunViewScreen(QWidget):
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
+        # Sizing compacted for the 1024x600 HMI touchscreen (2026-09-11) --
+        # see pre_run.py's _build_ui note for why (same desktop-scale
+        # numbers here didn't fit either).
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(32, 24, 32, 24)
-        outer.setSpacing(16)
+        outer.setContentsMargins(14, 8, 14, 8)
+        outer.setSpacing(6)
 
         self._state_label = QLabel("INITIALIZING")
-        theme.apply_font(self._state_label, size=18, bold=True)
-        self._state_label.setFixedHeight(52)
+        theme.apply_font(self._state_label, size=13, bold=True)
+        self._state_label.setFixedHeight(32)
         self._state_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         outer.addWidget(self._state_label)
 
@@ -95,7 +98,7 @@ class RunViewScreen(QWidget):
         stats_card = QWidget()
         stats_card.setStyleSheet(theme.card_stylesheet())
         stats_row = QHBoxLayout(stats_card)
-        stats_row.setContentsMargins(16, 12, 16, 12)
+        stats_row.setContentsMargins(10, 6, 10, 6)
         self._field_code_stat = self._make_stat(stats_row, "Field code", "—")
         self._picked_stat = self._make_stat(stats_row, "Picked", "0")
         self._pass_stat = self._make_stat(stats_row, "Pass", "0")
@@ -104,12 +107,12 @@ class RunViewScreen(QWidget):
         outer.addWidget(stats_card)
 
         content_row = QHBoxLayout()
-        content_row.setSpacing(16)
+        content_row.setSpacing(10)
 
         camera_card = QWidget()
         camera_card.setStyleSheet(theme.card_stylesheet())
         camera_layout = QVBoxLayout(camera_card)
-        camera_layout.setContentsMargins(16, 16, 16, 16)
+        camera_layout.setContentsMargins(8, 8, 8, 8)
         self._camera_feed = CameraFeed()
         camera_layout.addWidget(self._camera_feed)
         content_row.addWidget(camera_card, 2)
@@ -117,13 +120,14 @@ class RunViewScreen(QWidget):
         log_card = QWidget()
         log_card.setStyleSheet(theme.card_stylesheet())
         log_layout = QVBoxLayout(log_card)
-        log_layout.setContentsMargins(16, 16, 16, 16)
+        log_layout.setContentsMargins(8, 8, 8, 8)
         log_title = QLabel("Log")
-        theme.apply_font(log_title, size=11, bold=True)
+        theme.apply_font(log_title, size=9, bold=True)
         log_title.setStyleSheet(f"color: {theme.TEXT_SECONDARY};")
         log_layout.addWidget(log_title)
         self._log_list = QListWidget()
         self._log_list.setStyleSheet("border: none;")
+        theme.apply_font(self._log_list, size=8)
         log_layout.addWidget(self._log_list)
 
         # Error line (2026-08-30) — the one thing the terminal shows in red
@@ -132,7 +136,7 @@ class RunViewScreen(QWidget):
         # visible until the next state change clears it, not buried in
         # scrollback.
         self._error_label = QLabel("")
-        theme.apply_font(self._error_label, size=10, bold=True)
+        theme.apply_font(self._error_label, size=9, bold=True)
         self._error_label.setStyleSheet(f"color: {theme.STATUS_RED};")
         self._error_label.setWordWrap(True)
         self._error_label.setVisible(False)
@@ -143,38 +147,38 @@ class RunViewScreen(QWidget):
         outer.addLayout(content_row, stretch=1)
 
         self._hint_label = QLabel("")
-        theme.apply_font(self._hint_label, size=9)
+        theme.apply_font(self._hint_label, size=8)
         self._hint_label.setStyleSheet(f"color: {theme.TEXT_SECONDARY}; font-style: italic;")
         self._hint_label.setWordWrap(True)
         outer.addWidget(self._hint_label)
 
         btn_row = QHBoxLayout()
-        btn_row.setSpacing(12)
+        btn_row.setSpacing(8)
 
         self._stop_btn = QPushButton("CYCLE STOP")
-        self._stop_btn.setFixedHeight(56)
-        theme.apply_font(self._stop_btn, size=14, bold=True)
+        self._stop_btn.setFixedHeight(40)
+        theme.apply_font(self._stop_btn, size=11, bold=True)
         self._stop_btn.setStyleSheet(theme.status_button_stylesheet(theme.STATUS_AMBER, "#b45309"))
         self._stop_btn.clicked.connect(self._orchestrator.operator_stop)
         btn_row.addWidget(self._stop_btn)
 
         self._continue_btn = QPushButton("CONTINUE")
-        self._continue_btn.setFixedHeight(56)
-        theme.apply_font(self._continue_btn, size=14, bold=True)
+        self._continue_btn.setFixedHeight(40)
+        theme.apply_font(self._continue_btn, size=11, bold=True)
         self._continue_btn.setStyleSheet(theme.primary_button_stylesheet())
         self._continue_btn.clicked.connect(self._orchestrator.operator_start)
         btn_row.addWidget(self._continue_btn)
 
         self._abort_btn = QPushButton("ABORT")
-        self._abort_btn.setFixedHeight(56)
-        theme.apply_font(self._abort_btn, size=14, bold=True)
+        self._abort_btn.setFixedHeight(40)
+        theme.apply_font(self._abort_btn, size=11, bold=True)
         self._abort_btn.setStyleSheet(theme.status_button_stylesheet(theme.STATUS_RED, "#b91c1c"))
         self._abort_btn.clicked.connect(self._orchestrator.operator_abort)
         btn_row.addWidget(self._abort_btn)
 
         self._shutdown_btn = QPushButton("SHUTDOWN")
-        self._shutdown_btn.setFixedHeight(56)
-        theme.apply_font(self._shutdown_btn, size=14, bold=True)
+        self._shutdown_btn.setFixedHeight(40)
+        theme.apply_font(self._shutdown_btn, size=11, bold=True)
         self._shutdown_btn.setStyleSheet(theme.secondary_button_stylesheet())
         self._shutdown_btn.clicked.connect(self._on_shutdown)
         btn_row.addWidget(self._shutdown_btn)
@@ -183,12 +187,12 @@ class RunViewScreen(QWidget):
 
     def _make_stat(self, row: QHBoxLayout, label: str, initial: str) -> QLabel:
         col = QVBoxLayout()
-        col.setSpacing(2)
+        col.setSpacing(0)
         title = QLabel(label)
-        theme.apply_font(title, size=9)
+        theme.apply_font(title, size=8)
         title.setStyleSheet(f"color: {theme.TEXT_SECONDARY};")
         value = QLabel(initial)
-        theme.apply_font(value, size=15, bold=True)
+        theme.apply_font(value, size=12, bold=True)
         col.addWidget(title)
         col.addWidget(value)
         wrapper = QWidget()

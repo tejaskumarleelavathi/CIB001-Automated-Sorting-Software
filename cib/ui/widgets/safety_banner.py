@@ -63,20 +63,25 @@ class SafetyBanner(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
 
+        # Sizing compacted for the 1024x600 HMI touchscreen (2026-09-11) --
+        # see pre_run.py's _build_ui note. This banner is only visible
+        # during E_STOP/PROTECTIVE_STOP, but it still has to fit alongside
+        # everything else on screen at that moment.
         self._card = QWidget()
         self._card.setStyleSheet(
-            f"background-color: #fef2f2; border: 1px solid {theme.STATUS_RED}; border-radius: 10px;"
+            f"background-color: #fef2f2; border: 1px solid {theme.STATUS_RED}; border-radius: 8px;"
         )
         card_layout = QVBoxLayout(self._card)
-        card_layout.setContentsMargins(16, 12, 16, 12)
+        card_layout.setContentsMargins(10, 6, 10, 6)
+        card_layout.setSpacing(2)
 
         self._title_label = QLabel("")
-        theme.apply_font(self._title_label, size=13, bold=True)
+        theme.apply_font(self._title_label, size=11, bold=True)
         self._title_label.setStyleSheet(f"color: {theme.STATUS_RED};")
         card_layout.addWidget(self._title_label)
 
         self._detail_label = QLabel("")
-        theme.apply_font(self._detail_label, size=10)
+        theme.apply_font(self._detail_label, size=9)
         self._detail_label.setStyleSheet(f"color: {theme.TEXT_SECONDARY};")
         self._detail_label.setWordWrap(True)
         card_layout.addWidget(self._detail_label)
@@ -85,7 +90,7 @@ class SafetyBanner(QWidget):
         # (informational blue, not red) since this reports routine
         # progress ("Reconnecting to robot..."), not a new problem.
         self._status_label = QLabel("")
-        theme.apply_font(self._status_label, size=10, bold=True)
+        theme.apply_font(self._status_label, size=9, bold=True)
         self._status_label.setStyleSheet(f"color: {theme.STATUS_BLUE};")
         self._status_label.setWordWrap(True)
         self._status_label.setVisible(False)
@@ -93,16 +98,16 @@ class SafetyBanner(QWidget):
 
         btn_row = QHBoxLayout()
         self._continue_btn = QPushButton("CONTINUE")
-        self._continue_btn.setFixedHeight(40)
-        theme.apply_font(self._continue_btn, size=12, bold=True)
+        self._continue_btn.setFixedHeight(32)
+        theme.apply_font(self._continue_btn, size=10, bold=True)
         self._continue_btn.setStyleSheet(theme.primary_button_stylesheet())
         self._continue_btn.clicked.connect(self._on_continue_clicked)
         self._continue_btn.setEnabled(False)
         btn_row.addWidget(self._continue_btn)
 
         self._abort_btn = QPushButton("ABORT")
-        self._abort_btn.setFixedHeight(40)
-        theme.apply_font(self._abort_btn, size=12, bold=True)
+        self._abort_btn.setFixedHeight(32)
+        theme.apply_font(self._abort_btn, size=10, bold=True)
         self._abort_btn.setStyleSheet(
             theme.status_button_stylesheet(theme.STATUS_RED, "#b91c1c")
         )

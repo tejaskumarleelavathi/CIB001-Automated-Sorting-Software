@@ -68,12 +68,18 @@ class PreRunScreen(QWidget):
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
+        # Sizing throughout this screen (margins/spacing/fixed heights/font
+        # sizes) targets the real HMI touchscreen -- 1024x600, see
+        # main_window.py's setMinimumSize -- not a desktop monitor. The
+        # original desktop-scale numbers (32/24 margins, 16 spacing, 56-64px
+        # rows) needed ~850px of vertical space and visibly overlapped once
+        # actually shown at 600px tall (2026-09-11, operator screenshot).
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(32, 24, 32, 24)
-        outer.setSpacing(16)
+        outer.setContentsMargins(14, 8, 14, 8)
+        outer.setSpacing(6)
 
         title = QLabel("New Run — Setup")
-        theme.apply_font(title, size=18, bold=True)
+        theme.apply_font(title, size=13, bold=True)
         outer.addWidget(title)
 
         # A safety fault (e-stop/light curtain) tripped before START was
@@ -91,17 +97,18 @@ class PreRunScreen(QWidget):
         field_card = QWidget()
         field_card.setStyleSheet(theme.card_stylesheet())
         field_layout = QVBoxLayout(field_card)
-        field_layout.setContentsMargins(16, 16, 16, 16)
+        field_layout.setContentsMargins(10, 6, 10, 6)
+        field_layout.setSpacing(2)
 
         field_label = QLabel("Field code")
-        theme.apply_font(field_label, size=10, bold=True)
+        theme.apply_font(field_label, size=9, bold=True)
         field_label.setStyleSheet(f"color: {theme.TEXT_SECONDARY};")
         field_layout.addWidget(field_label)
 
         self._field_code_input = QLineEdit()
         self._field_code_input.setPlaceholderText("e.g. CIB-2026-001")
         self._field_code_input.setStyleSheet(theme.input_stylesheet())
-        theme.apply_font(self._field_code_input, size=13)
+        theme.apply_font(self._field_code_input, size=11)
         self._field_code_input.textChanged.connect(self._refresh_start_enabled)
         field_layout.addWidget(self._field_code_input)
         outer.addWidget(field_card)
@@ -110,30 +117,30 @@ class PreRunScreen(QWidget):
         config_card = QWidget()
         config_card.setStyleSheet(theme.card_stylesheet())
         config_layout = QVBoxLayout(config_card)
-        config_layout.setContentsMargins(16, 16, 16, 16)
-        config_layout.setSpacing(8)
+        config_layout.setContentsMargins(10, 6, 10, 6)
+        config_layout.setSpacing(4)
 
         config_label = QLabel("Plate config")
-        theme.apply_font(config_label, size=10, bold=True)
+        theme.apply_font(config_label, size=9, bold=True)
         config_label.setStyleSheet(f"color: {theme.TEXT_SECONDARY};")
         config_layout.addWidget(config_label)
 
         config_row = QHBoxLayout()
         self._config_combo = QComboBox()
-        theme.apply_font(self._config_combo, size=11)
+        theme.apply_font(self._config_combo, size=10)
         self._config_combo.currentIndexChanged.connect(self._on_config_selected)
         config_row.addWidget(self._config_combo, 1)
         config_layout.addLayout(config_row)
 
         self._config_status_label = QLabel("")
-        theme.apply_font(self._config_status_label, size=9)
+        theme.apply_font(self._config_status_label, size=8)
         self._config_status_label.setStyleSheet(f"color: {theme.TEXT_SECONDARY};")
         config_layout.addWidget(self._config_status_label)
 
         # Per-station Plate ID / starting-well fields, built once a
         # workbook is loaded (see _rebuild_station_fields).
         self._station_fields_grid = QGridLayout()
-        self._station_fields_grid.setSpacing(8)
+        self._station_fields_grid.setSpacing(3)
         config_layout.addLayout(self._station_fields_grid)
 
         self._station_map = StationMap()
@@ -153,23 +160,23 @@ class PreRunScreen(QWidget):
         # Why START is unavailable right now -- so a disabled button isn't a
         # mystery (touchscreen: no tooltips). Empty once START is pressable.
         self._start_hint = QLabel("")
-        theme.apply_font(self._start_hint, size=10)
+        theme.apply_font(self._start_hint, size=9)
         self._start_hint.setStyleSheet(f"color: {theme.TEXT_SECONDARY};")
         outer.addWidget(self._start_hint)
 
         btn_row = QHBoxLayout()
-        btn_row.setSpacing(12)
+        btn_row.setSpacing(10)
 
         self._shutdown_btn = QPushButton("SHUTDOWN")
-        self._shutdown_btn.setFixedHeight(56)
-        theme.apply_font(self._shutdown_btn, size=14, bold=True)
+        self._shutdown_btn.setFixedHeight(40)
+        theme.apply_font(self._shutdown_btn, size=11, bold=True)
         self._shutdown_btn.setStyleSheet(theme.secondary_button_stylesheet())
         self._shutdown_btn.clicked.connect(self._on_shutdown)
         btn_row.addWidget(self._shutdown_btn, 1)
 
         self._start_btn = QPushButton("START")
-        self._start_btn.setFixedHeight(56)
-        theme.apply_font(self._start_btn, size=16, bold=True)
+        self._start_btn.setFixedHeight(40)
+        theme.apply_font(self._start_btn, size=12, bold=True)
         self._start_btn.setStyleSheet(theme.primary_button_stylesheet())
         self._start_btn.setEnabled(False)
         self._start_btn.clicked.connect(self._on_start)
@@ -289,13 +296,13 @@ class PreRunScreen(QWidget):
 
         for row, num in enumerate(sorted(self._loaded_stations.keys())):
             label = QLabel(f"Station {num}")
-            theme.apply_font(label, size=11, bold=True)
+            theme.apply_font(label, size=10, bold=True)
             self._station_fields_grid.addWidget(label, row, 0)
 
             plate_id_field = QLineEdit()
             plate_id_field.setPlaceholderText("Plate ID")
             plate_id_field.setStyleSheet(theme.input_stylesheet())
-            theme.apply_font(plate_id_field, size=13)
+            theme.apply_font(plate_id_field, size=10)
             # Capped, not left to the grid's default even-stretch (2026-09-01
             # UI pass, operator feedback — "so expanded... characters look
             # small"): with nothing else constraining column width, a
@@ -304,7 +311,7 @@ class PreRunScreen(QWidget):
             # boxes stretched to hundreds of pixels for a 4-6 character
             # Plate ID. The unused column 3 stretch below (not any widget
             # here) now absorbs that leftover space instead.
-            plate_id_field.setMaximumWidth(200)
+            plate_id_field.setMaximumWidth(150)
             plate_id_field.textChanged.connect(
                 lambda text, n=num: self._on_plate_id_changed(n, text)
             )
@@ -314,8 +321,8 @@ class PreRunScreen(QWidget):
             starting_well_field = QLineEdit()
             starting_well_field.setPlaceholderText("Starting well (optional, e.g. C4)")
             starting_well_field.setStyleSheet(theme.input_stylesheet())
-            theme.apply_font(starting_well_field, size=13)
-            starting_well_field.setMaximumWidth(260)
+            theme.apply_font(starting_well_field, size=10)
+            starting_well_field.setMaximumWidth(200)
             self._station_fields_grid.addWidget(starting_well_field, row, 2)
             self._starting_well_fields[num] = starting_well_field
 
