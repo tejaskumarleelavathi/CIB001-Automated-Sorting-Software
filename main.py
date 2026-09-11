@@ -143,13 +143,24 @@ def build_drivers(
 
     else:
         from cib.drivers.robot.driver    import EpsonT3BDriver
-        from cib.drivers.pump.driver     import MDriveDriver
+        # pump stays mocked even in full-real mode, same as the use_mocks
+        # branch above (2026-09-04, first real HMI run -- USE_MOCKS=False
+        # had never actually been exercised before this): cib/drivers/
+        # pump/driver.py's MDriveDriver was never implemented (a stub) --
+        # the real pipette motor is controlled entirely by sort_server.prg
+        # talking directly to the Novanta actuator's own socket, never
+        # through this PumpDriver Protocol at all. d.pump.connect() is
+        # called at startup but aspirate()/dispense() are never called
+        # anywhere in the orchestrator, so this is genuinely dead/inert
+        # regardless of which pump driver is here -- confirmed, not a
+        # gap that needs a real implementation.
+        from cib.drivers.pump.mock       import MockPumpDriver
         return DriverSet(
             robot           = _make_real_robot(cfg),
             robot_remote    = _make_real_robot_remote(cfg),
             safety          = _make_real_safety(cfg),
             plc             = _make_real_plc(cfg),
-            pump            = MDriveDriver(),
+            pump            = MockPumpDriver(),
             camera_overhead = _make_real_camera(cfg, "overhead"),
             camera_eoa      = _make_real_camera(cfg, "eoa"),
             lighting        = _make_real_lighting(cfg),
