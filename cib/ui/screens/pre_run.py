@@ -2,10 +2,15 @@
 cib/ui/screens/pre_run.py — pre-run setup screen (FR-UI-01, FR-UI-02, FR-RUN-02/06).
 
 Fields: field code, a Plate ID + optional starting well per discovered
-station (from the selected multi-sheet workbook), and the tap-to-activate
-station map. START is gated exactly per FR-UI-01: "active only once all
+station (from the selected multi-sheet workbook), and the station map
+(a station activates as soon as its Plate ID is entered -- see
+station_map.py). START is gated per FR-UI-01: "active only once all
 required fields are filled and valid (field code entered, at least one
-station active with a Plate ID, config file selected)".
+station active with a Plate ID, config file selected)" -- AND (2026-09-10,
+operator request) only once the backend has finished starting up and
+reached IDLE, so pressing it never fires an illegal start into a
+still-INITIALIZING backend (which bounced the UI to the run view and
+straight back). _start_hint spells out whichever precondition is missing.
 
 Plate config selection (FR-UI-02, 2026-08-30): a dropdown auto-populated
 from the files present in the HMI config folder (cib.config.loader.
@@ -51,6 +56,11 @@ class PreRunScreen(QWidget):
         self._loaded_stations: dict[int, PlateConfig] = {}
         self._plate_id_fields: dict[int, QLineEdit] = {}
         self._starting_well_fields: dict[int, QLineEdit] = {}
+        # START stays disabled until the backend has finished connecting to
+        # every device and reached IDLE (2026-09-10, operator request).
+        # Assume not-ready until the first state_changed says otherwise --
+        # same starting assumption main_window.py makes.
+        self._backend_ready = False
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -140,6 +150,13 @@ class PreRunScreen(QWidget):
         # in-progress run, and there is never one to end here. The only
         # two real choices on this screen are "start a new cycle" or
         # "shut the whole system down."
+        # Why START is unavailable right now -- so a disabled button isn't a
+        # mystery (touchscreen: no tooltips). Empty once START is pressable.
+        self._start_hint = QLabel("")
+        theme.apply_font(self._start_hint, size=10)
+        self._start_hint.setStyleSheet(f"color: {theme.TEXT_SECONDARY};")
+        outer.addWidget(self._start_hint)
+
         btn_row = QHBoxLayout()
         btn_row.setSpacing(12)
 
@@ -161,13 +178,24 @@ class PreRunScreen(QWidget):
         outer.addLayout(btn_row)
 
     # ------------------------------------------------------------------
-    # Bridge wiring (safety banner only — this screen has no other
-    # state-dependent UI; run stats/log live on RunViewScreen)
+    # Bridge wiring: the safety banner, plus START's enable-gate which
+    # now also tracks backend state (run stats/log still live on
+    # RunViewScreen).
     # ------------------------------------------------------------------
 
     def connect_bridge(self, bridge: UiBridge) -> None:
         bridge.state_changed.connect(self._safety_banner.update_state)
+        bridge.state_changed.connect(self._on_state_changed)
         bridge.event_received.connect(self._on_event)
+
+    def _on_state_changed(self, state: State) -> None:
+        # IDLE is the only state START is actually valid from on this screen:
+        # INITIALIZING rejects it (illegal transition -- the UI would flip to
+        # the run view then bounce straight back here once IDLE arrives),
+        # E_STOP needs a hardware reset, PROTECTIVE_STOP goes through the
+        # safety banner's CONTINUE. So gate purely on == IDLE.
+        self._backend_ready = state == State.IDLE
+        self._refresh_start_enabled()
 
     def _on_event(self, event: object) -> None:
         if isinstance(event, SafetyStatusEvent):
@@ -310,9 +338,29 @@ class PreRunScreen(QWidget):
         has_field_code = bool(self._field_code_input.text().strip())
         has_active_station = len(self._station_map.active_stations()) > 0
         has_config = bool(self._loaded_stations)
-        self._start_btn.setEnabled(has_field_code and has_active_station and has_config)
+        ready = (
+            self._backend_ready and has_field_code and has_active_station and has_config
+        )
+        self._start_btn.setEnabled(ready)
+
+        if not self._backend_ready:
+            hint = "System still starting up... START will enable once it's ready."
+        elif not has_config:
+            hint = "Select a plate config."
+        elif not has_field_code:
+            hint = "Enter a field code."
+        elif not has_active_station:
+            hint = "Enter a Plate ID for at least one station."
+        else:
+            hint = ""
+        self._start_hint.setText(hint)
 
     def _on_start(self) -> None:
+        # Defensive: the button is disabled until _backend_ready, but never
+        # fire operator_start() into a not-yet-IDLE backend even if somehow
+        # reached -- that's the illegal transition that bounced the UI.
+        if not self._backend_ready:
+            return
         active = self._station_map.active_stations()
         field_code = self._field_code_input.text().strip()
         plate_ids = {
