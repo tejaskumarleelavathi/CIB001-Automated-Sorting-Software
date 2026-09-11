@@ -10,14 +10,23 @@ along a lead screw.  All positions are in raw steps — do NOT assume a
 real-world distance until lead screw pitch is confirmed and measured.
 
 Programs stored on motor flash:
-  G1  →  MR -800000  (drop / dispense — carriage moves forward)
-  G2  →  MR +800000  (aspire / draw — carriage moves backward)
+  G1  →  MA 0              (drop / dispense — absolute move TO HOME)
+  G2  →  MA ASPIRE_STEPS   (aspire / draw — absolute move to a fixed
+                            position measured FROM home)
   G3  →  home to the dispense-end hard stop (2026-09-01, see
           upload_programs()'s docstring for the full MCode body)
   G4  →  G3's internal success handler (not meant to be EX'd directly)
 
 Python just sends "EX G1" / "EX G2" / "EX G3" to trigger them.  The motor
 executes the move autonomously and signals completion via the ">" prompt.
+
+G1/G2 switched from relative (MR) to absolute (MA) moves 2026-09-07,
+once G3's hard-stop homing made P=0 a reliable, physically-verified
+reference point (see the ASPIRE_STEPS comment below for the full
+reasoning). MR/relative moves are still used for the `move <n>`
+diagnostic command below -- that's for ad-hoc testing of an arbitrary
+distance from wherever the carriage currently is, a different job from
+G1/G2's fixed, self-correcting production positions.
 
 Labels G1 / G2 / G3 / G4 chosen because:
   - G prefix is not a reserved MCode mnemonic in LMDAM/LMDAE firmware
@@ -26,8 +35,8 @@ Labels G1 / G2 / G3 / G4 chosen because:
 
 Usage:
   python hardware_tests/linear_control.py upload    # flash G1+G2+G3+G4 to motor (run once)
-  python hardware_tests/linear_control.py drop      # execute G1 (forward 800000 steps)
-  python hardware_tests/linear_control.py aspire    # execute G2 (reverse 800000 steps)
+  python hardware_tests/linear_control.py drop      # execute G1 (absolute move to home)
+  python hardware_tests/linear_control.py aspire    # execute G2 (absolute move to ASPIRE_STEPS)
   python hardware_tests/linear_control.py move <n>  # raw MR <n>, any step count, no re-flash
   python hardware_tests/linear_control.py pos       # print position, no motion
   python hardware_tests/linear_control.py home      # home, orchestrated from this script
@@ -61,15 +70,32 @@ LINEAR_PORT  = 503
 # (1,102,500 / 1,350,000 / 1,250,000 / 1,300,000 / 1,540,000 / 1,600,000 /
 # 1,000,000) swinging between "driving less" (not enough suction) and
 # overdriving, none landing cleanly — see git history on this file for the
-# blow-by-blow if it matters later. Currently testing 800,000, still
-# unconfirmed — above the last confirmed-safe hand-jogged baseline
-# (200,000, 4x). Lead screw pitch/travel limit is still unconfirmed.
-# Watch closely on the first real test.
-DROP_STEPS   = -800_000   # forward / dispense
-ASPIRE_STEPS =  800_000   # reverse / draw
+# blow-by-blow if it matters later. 800,000 confirmed working and used in
+# production through the DEV-11..DEV-16 tuning and the G3 homing work.
+#
+# 2026-09-07: G1 (drop) and G2 (aspire) switched from relative (MR) to
+# absolute (MA) moves, now that G3's hard-stop-plus-backoff homing makes
+# P=0 a reliable, physically-verified reference point rather than just
+# "wherever the motor's own step counter thinks it is." Under the old MR
+# scheme, DROP_STEPS/ASPIRE_STEPS were a MATCHED PAIR of relative
+# distances (aspirate pulls back N steps from wherever it is, drop pushes
+# forward the same N steps to return) -- any missed step or timing hiccup
+# silently accumulated drift forever, which is the whole reason homing
+# became necessary in the first place. Under MA, there is no more
+# "DROP_STEPS" as a separate tunable distance at all: G1 always targets
+# the single fixed absolute position MA 0 (home itself -- by construction
+# the correct, safe dispense position, already verified this session to
+# sit HOME_BACKOFF_STEPS clear of the true hard stop), and G2 targets a
+# single fixed absolute position, ASPIRE_STEPS, measured FROM home. Both
+# now self-correct every cycle instead of compounding error between
+# cycles -- there is nothing to "stay symmetric" with anymore.
+#
+# ASPIRE_STEPS raised 800,000 -> 1,000,000 same day (operator's own call,
+# "aspirate 1000000 not 800000") alongside this MA conversion.
+ASPIRE_STEPS = 1_200_000   # absolute target position, measured from home (P=0)
 
 # Velocity profile (steps/sec, steps/sec^2) — governs how FAST G1/G2 run,
-# completely separate from DROP_STEPS/ASPIRE_STEPS above (which only govern
+# completely separate from ASPIRE_STEPS above (which only governs
 # how FAR). Never set anywhere in this file before 2026-08-19 — motor was
 # running at factory/flash default the whole time (VM=768000, VI=1000,
 # A=D=1000000). Increased to VM=1,200,000/A=D=2,000,000 same day, then VM
@@ -434,14 +460,17 @@ def run_program(sock: socket.socket, label: str, description: str) -> bool:
 
 def run_manual_move(sock: socket.socket, steps: int) -> None:
     """
-    Immediate-mode MR <steps> — a raw relative move for an arbitrary step
+    Immediate-mode MR <steps> — a raw RELATIVE move for an arbitrary step
     count, bypassing G1/G2 entirely. No re-flash needed to try a distance
-    that isn't ASPIRE_STEPS/DROP_STEPS -- useful for dialing in a new step
-    count before committing to it (same idea as this file's own step-count
-    tuning history, see DROP_STEPS/ASPIRE_STEPS comments above).
+    from wherever the carriage currently is -- useful for dialing in a new
+    ASPIRE_STEPS value before committing to it (same idea as this file's
+    own step-count tuning history, see the ASPIRE_STEPS comment above).
+    Deliberately still relative even though G1/G2 themselves are absolute
+    (2026-09-07) -- this command's whole job is testing an arbitrary
+    distance from the current position, which only makes sense relative.
 
-    Sign convention matches ASPIRE_STEPS/DROP_STEPS: positive = aspire /
-    reverse, negative = drop / forward.
+    Sign convention matches ASPIRE_STEPS: positive = aspire / reverse,
+    negative = drop / forward.
 
     Explicitly sets VM/A/D to VELOCITY_MAX/ACCEL/DECEL first (the same
     values G1/G2's own onboard bodies use) rather than trusting whatever
@@ -495,10 +524,14 @@ def _pgm_or_die(sock: socket.socket, command: str) -> None:
 def upload_programs(sock: socket.socket) -> None:
     """
     Flash four programs to the motor's non-volatile flash memory:
-      G1  →  VM=/A=/D= + MR -800000   (drop / forward / dispense)
-      G2  →  VM=/A=/D= + MR +800000   (aspire / reverse / draw)
+      G1  →  VM=/A=/D= + MA 0              (drop / forward / dispense -- absolute move TO HOME)
+      G2  →  VM=/A=/D= + MA ASPIRE_STEPS   (aspire / reverse / draw -- absolute move FROM home)
       G3  →  home-to-hard-stop (2026-09-01, see below)
       G4  →  G3's internal success handler (not meant to be EX'd directly)
+
+    G1/G2 switched from relative (MR) to absolute (MA) 2026-09-07, once G3
+    made P=0 a reliable, physically-verified reference -- see the
+    ASPIRE_STEPS comment near the top of this file for the full reasoning.
 
     Full sequence:
       1.  Check motor is not moving (Error 73 if CP/PG run while moving)
@@ -514,9 +547,9 @@ def upload_programs(sock: socket.socket) -> None:
     even when only G3/G4 actually changed — this is why they're all written
     together in one pass rather than G3/G4 being addable independently.
 
-    G1/G2: sets VM/A/D (velocity profile), then MR (the move), then H (hold
-    — waits for move to finish), then E (end). H is CRITICAL: without it
-    the program exits before the carriage stops moving.
+    G1/G2: sets VM/A/D (velocity profile), then MA (the absolute move),
+    then H (hold — waits for move to finish), then E (end). H is CRITICAL:
+    without it the program exits before the carriage stops moving.
 
     G3 (home): the ONBOARD equivalent of this same file's home() function
     (see its docstring for the full story — hMT is off by default on this
@@ -536,13 +569,13 @@ def upload_programs(sock: socket.socket) -> None:
          WITHOUT touching P — never trust an un-stalled seek as home.
       7. G4 (the branch target): CF (clear the Locked Rotor fault, same as
          the manual's own recovery instruction — NOT plain Er=0), then
-         MR HOME_BACKOFF_STEPS + H (back off ~2mm toward aspiration,
+         MR HOME_BACKOFF_STEPS + H (back off 3mm toward aspiration,
          David's suggestion 2026-09-01 — see the HOME_BACKOFF_STEPS
          comment above home() for why: without this, every NORMAL drop
          cycle, not just homing, was landing right at the true hard stop,
-         since G1/G2 are a matched relative-move pair built on top of
-         wherever P=0 is), THEN P=0 (this backed-off position is home, not
-         the touch point), then restore the normal profile and end.
+         since G1 (drop) always targets P=0 directly), THEN P=0 (this
+         backed-off position is home, not the touch point), then restore
+         the normal profile and end.
     RC=25 / VM=2400000 / A=4000000 / D=4000000 / AS=0 / LT=2000 restored at
     the end of BOTH paths — these are this motor's confirmed-current
     production baseline (VM/A/D match VELOCITY_MAX/ACCEL/DECEL below; RC/
@@ -590,10 +623,14 @@ def upload_programs(sock: socket.socket) -> None:
     # VM/A/D set INSIDE each program body — separate onboard programs, so
     # each must set its own velocity profile explicitly rather than relying
     # on whatever an earlier immediate-mode command left behind.
+    # MA not MR (2026-09-07, see the ASPIRE_STEPS comment above) — G1 always
+    # returns to the single true home position; G2 always goes to the same
+    # fixed absolute position measured from home. Neither depends on
+    # wherever the carriage happened to be beforehand.
     simple_programs = [
         # (label,  move_cmd,                  description)
-        ("G1", f"MR {DROP_STEPS}",   f"drop / forward  ({DROP_STEPS} steps)"),
-        ("G2", f"MR {ASPIRE_STEPS}", f"aspire / reverse ({ASPIRE_STEPS} steps)"),
+        ("G1", "MA 0",                f"drop / forward  (absolute -> home, P=0)"),
+        ("G2", f"MA {ASPIRE_STEPS}",  f"aspire / reverse (absolute -> {ASPIRE_STEPS})"),
     ]
 
     for label, move_cmd, desc in simple_programs:
@@ -661,8 +698,8 @@ def upload_programs(sock: socket.socket) -> None:
         sys.exit(1)
 
     print("\n[UPLOAD] Done.")
-    print(f"         G1 = drop   (MR {DROP_STEPS} steps, forward)")
-    print(f"         G2 = aspire (MR {ASPIRE_STEPS} steps, reverse)")
+    print(f"         G1 = drop   (MA 0, absolute -> home)")
+    print(f"         G2 = aspire (MA {ASPIRE_STEPS}, absolute from home)")
     print(f"         G3 = home   (seek dispense-end hard stop, hMT Locked Rotor)")
     print(f"         VM={VELOCITY_MAX}  A={ACCEL}  D={DECEL}  (G1/G2, and G3's restored baseline)")
     print("         Programs survive power cycles.  Re-run 'upload' if step counts OR velocity change.\n")
@@ -931,11 +968,12 @@ _HELP = """
     home2   → same as 'home', but triggers the ONBOARD G3 program (EX G3)
               instead — run 'upload' first. Use this to confirm the
               flashed version matches before wiring it into sort_server.prg.
-    move <n> → raw MR <n> at the production velocity profile, bypassing
-              G1/G2 entirely -- no re-flash needed to try a step count
-              other than ASPIRE_STEPS/DROP_STEPS. Positive = aspire
-              (reverse), negative = drop (forward), same sign convention
-              as those constants. E.g. 'move 50000' or 'move -50000'.
+    move <n> → raw MR <n> (RELATIVE, from wherever the carriage currently
+              is) at the production velocity profile, bypassing G1/G2
+              entirely -- no re-flash needed to try a step count other
+              than ASPIRE_STEPS. Positive = aspire (reverse), negative =
+              drop (forward), same sign convention as that constant.
+              E.g. 'move 50000' or 'move -50000'.
     q       → quit
 """
 
