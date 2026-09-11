@@ -185,6 +185,10 @@ class PathsConfig:
     runs_output:     str
     logs:            str
     overhead_images: str = "output/overhead_images"
+    # Raw (pre-vision, pre-annotation) overhead captures -- separate from
+    # overhead_images above, which only ever holds the annotated copy.
+    # 2026-09-08, operator request.
+    unprocessed_overhead_images: str = "output/unprocessed_overhead"
 
 
 @dataclass
@@ -493,6 +497,9 @@ def _parse_machine_config(raw: dict) -> MachineConfig:
             runs_output=pa["runs_output"],
             logs=pa["logs"],
             overhead_images=pa.get("overhead_images", "output/overhead_images"),
+            unprocessed_overhead_images=pa.get(
+                "unprocessed_overhead_images", "output/unprocessed_overhead"
+            ),
         ),
         vision=VisionConfig(
             detection_min_area_px=int(vi.get("detection_min_area_px", 50)),

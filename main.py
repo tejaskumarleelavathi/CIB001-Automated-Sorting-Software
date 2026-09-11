@@ -236,6 +236,16 @@ def main() -> None:
     )
     overhead_save_dir.mkdir(parents=True, exist_ok=True)
 
+    # Raw (pre-vision, pre-annotation) overhead captures -- separate folder
+    # from overhead_save_dir above, which only ever holds the annotated
+    # copy. 2026-09-08, operator request.
+    unprocessed_overhead_save_dir = (
+        Path(__file__).parent / "cib" / "output" / "unprocessed_overhead"
+        if USE_MOCKS
+        else Path(cfg.paths.unprocessed_overhead_images)
+    )
+    unprocessed_overhead_save_dir.mkdir(parents=True, exist_ok=True)
+
     eoa_save_dir = (
         Path(__file__).parent / "cib" / "output" / "eoa_images"
         if USE_MOCKS
@@ -303,6 +313,12 @@ def main() -> None:
         overhead_save_dir=overhead_save_dir if cfg.vision.overhead_save_images else None,
         overhead_save_format=cfg.vision.overhead_save_format,
         overhead_save_images=cfg.vision.overhead_save_images,
+        # Same on/off switch as the annotated overhead save above --
+        # operator asked for this alongside it, not as a separately
+        # toggleable thing.
+        unprocessed_overhead_save_dir=(
+            unprocessed_overhead_save_dir if cfg.vision.overhead_save_images else None
+        ),
         eoa_save_dir=eoa_save_dir,
         force_sample_detection=FORCE_SAMPLE_DETECTION,
         view=VIEW,

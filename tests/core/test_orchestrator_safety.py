@@ -225,6 +225,7 @@ class TestSpecimenInTransitRecovery:
         orch._pending_well = (150.0, 200.0, 45.0, "B3", None, "R")
         await orch._drivers.robot.halt()
         orch._sm.safety_fault_estop()
+        orch._hardware_fault_active = False   # blue button already pressed
         assert orch.state == State.E_STOP
 
         await orch._handle_event(OperatorAcknowledgeEvent())
@@ -307,6 +308,7 @@ class TestSpecimenInTransitRecovery:
         await orch._drivers.robot.halt()
         assert await orch._drivers.robot.is_ready() is False
         orch._sm.safety_fault_estop()
+        orch._hardware_fault_active = False   # blue button already pressed
 
         await orch._handle_event(OperatorAcknowledgeEvent())
 
@@ -323,6 +325,7 @@ class TestSpecimenInTransitRecovery:
         orch._state_before_fault = State.RUNNING   # normally set by _evaluate_safety()
         orch._sm.safety_fault_protective()
         orch._light_curtain_tripped = False   # beam physically clear
+        orch._light_curtain_stably_clear = True   # ...and has been for a while (debounced)
         orch._hardware_fault_active = False   # blue reset button also pressed —
                                                # required for curtain too on this
                                                # installation (corrected 2026-08-18)
@@ -352,6 +355,7 @@ class TestSpecimenInTransitRecovery:
         orch._state_before_fault = State.IDLE   # normally set by _evaluate_safety()
         orch._sm.safety_fault_protective()
         orch._light_curtain_tripped = False
+        orch._light_curtain_stably_clear = True
         orch._hardware_fault_active = False
         assert orch.state == State.PROTECTIVE_STOP
 
@@ -376,6 +380,9 @@ class TestSpecimenInTransitRecovery:
         orch._pending_well = (5.0, 5.0, None, "D1", None, "R")
         await orch._drivers.robot.halt()
         orch._sm.safety_fault_estop()
+        orch._hardware_fault_active = False   # blue button already pressed —
+                                               # this test is about the robot
+                                               # reconnect failing, not this gate
 
         async def _broken_park() -> None:
             raise ConnectionError("Cannot connect to robot — target machine actively refused it")
@@ -394,6 +401,7 @@ class TestSpecimenInTransitRecovery:
         await _to_running(orch)
         await orch._drivers.robot.halt()
         orch._sm.safety_fault_estop()
+        orch._hardware_fault_active = False   # blue button already pressed
 
         await orch._handle_event(OperatorAcknowledgeEvent())
 
@@ -441,10 +449,102 @@ class TestRecoveryRestoresAncillaryState:
         await orch._drivers.lighting.set_backlight(False)   # simulate mid-EoA-capture state
         await orch._drivers.robot.halt()
         orch._sm.safety_fault_estop()
+        orch._hardware_fault_active = False   # blue button already pressed
 
         await orch._handle_event(OperatorAcknowledgeEvent())
 
         assert orch._drivers.lighting.backlight_on is True
+
+
+class TestEstopContinueSendsResetPulse:
+    """
+    2026-09-11, operator request (OQ-23 resolved, e-stop path): a single
+    physical blue-button press feeds BOTH the e-stop's own Reset V1 block
+    AND, via the same OR gate, the P-Stop side's Reset V1 -- but P-Stop's
+    Reset V1 only releases if the light curtain was ALSO clear at that
+    same instant (see the Safety Designer logic diagram). If it wasn't,
+    the e-stop side clears but the motor-power side (_hardware_fault_active)
+    stays latched. CONTINUE must now finish that itself, the same software
+    reset pulse the light-curtain path already sends, instead of silently
+    proceeding into _safe_recovery() (old behaviour) or requiring the
+    operator to notice and press the physical button a second time.
+    """
+
+    async def test_sends_pulse_and_proceeds_once_it_clears(
+        self, orch: Orchestrator,
+    ) -> None:
+        await _to_running(orch)
+        await orch._drivers.robot.halt()
+        orch._sm.safety_fault_estop()
+        orch._hardware_fault_active = True   # e-stop's own Reset V1 already
+                                              # satisfied by the physical button,
+                                              # but motor-power side still latched
+        orch._light_curtain_stably_clear = True   # curtain genuinely clear
+
+        calls: list[str] = []
+        real_reset_ack = orch._drivers.safety.send_reset_acknowledge
+
+        async def _reset_ack_and_clear() -> None:
+            calls.append("reset_ack")
+            await real_reset_ack()
+            # Simulate the next live poll (not running in this test)
+            # observing the pulse actually took effect.
+            orch._hardware_fault_active = False
+
+        orch._drivers.safety.send_reset_acknowledge = _reset_ack_and_clear
+
+        await orch._handle_event(OperatorAcknowledgeEvent())
+
+        assert calls == ["reset_ack"]
+        assert orch.state == State.IDLE   # recovery actually proceeded
+
+    async def test_blocked_if_pulse_does_not_clear_it(
+        self, orch: Orchestrator,
+    ) -> None:
+        await _to_running(orch)
+        await orch._drivers.robot.halt()
+        orch._sm.safety_fault_estop()
+        orch._hardware_fault_active = True   # stays latched even after the pulse
+                                              # (mock's default send_reset_acknowledge
+                                              # doesn't touch this flag)
+        orch._light_curtain_stably_clear = True   # curtain genuinely clear -- this
+                                                   # test is about the VERIFY step
+                                                   # failing, not the curtain gate
+
+        await orch._handle_event(OperatorAcknowledgeEvent())
+
+        # Never reached _safe_recovery() -- still E_STOP, nothing torn down.
+        assert orch.state == State.E_STOP
+
+    async def test_blocked_without_even_trying_the_pulse_if_curtain_tripped(
+        self, orch: Orchestrator,
+    ) -> None:
+        """
+        2026-09-11, found live: CONTINUE showed as enabled with a hand
+        physically inside the light curtain, because the UI gate didn't
+        check it for E_STOP. This is the matching orchestrator-side
+        defense-in-depth check -- don't even attempt the pulse (it's
+        guaranteed to fail; the P-Stop side it targets requires the
+        curtain clear to release), and don't let a stray/racing event
+        bypass this just because it didn't come through the UI's own gate.
+        """
+        await _to_running(orch)
+        await orch._drivers.robot.halt()
+        orch._sm.safety_fault_estop()
+        orch._hardware_fault_active = True
+        orch._light_curtain_tripped = True   # e.g. a hand still in the beam
+
+        calls: list[str] = []
+
+        async def _record_reset_ack() -> None:
+            calls.append("reset_ack")
+
+        orch._drivers.safety.send_reset_acknowledge = _record_reset_ack
+
+        await orch._handle_event(OperatorAcknowledgeEvent())
+
+        assert calls == []   # never even attempted -- guaranteed-futile pulse skipped
+        assert orch.state == State.E_STOP
 
 
 class TestContinueGating:
@@ -498,6 +598,7 @@ class TestInterruptedAttemptCleanup:
         pick, paths = self._make_interrupted_pick(orch, tmp_path)
         await orch._drivers.robot.halt()
         orch._sm.safety_fault_estop()
+        orch._hardware_fault_active = False   # blue button already pressed
 
         await orch._handle_event(OperatorAcknowledgeEvent())
 
@@ -543,6 +644,7 @@ class TestInterruptedAttemptCleanup:
         orch._pending_well = (5.0, 5.0, None, "C5", pick.pick_id, "R")   # now in transit
         await orch._drivers.robot.halt()
         orch._sm.safety_fault_estop()
+        orch._hardware_fault_active = False   # blue button already pressed
 
         await orch._handle_event(OperatorAcknowledgeEvent())
 

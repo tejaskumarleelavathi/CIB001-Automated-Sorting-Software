@@ -74,7 +74,7 @@ All bits use **normally-closed convention**: **1 = OK/safe, 0 = fault/open**.
 - `connect()` — TCP connect to 172.16.9.12:502, verifies device status = 0x0003 (Run mode)
 - `read_status()` — FC4 read of 25 input registers at address 256, returns decoded dict
 - `disconnect()` — closes TCP socket cleanly
-- `send_reset_acknowledge()` — **no-op until `RESET_ACK_REG` is confirmed (OQ-23)**
+- `send_reset_acknowledge()` — pulses holding register 256, bit 8 (value 256, then 0). **Confirmed live on real hardware 2026-09-11 — OQ-23 resolved**, see below.
 
 ### `read_status()` return dict
 
@@ -140,7 +140,7 @@ Operator clears light curtain beam
   → Operator presses CONTINUE on HMI
     → if _light_curtain_tripped: BLOCKED — warn, do nothing
     → else:
-        safety.send_reset_acknowledge()  ← releases latch (OQ-23 pending)
+        safety.send_reset_acknowledge()  ← releases latch (OQ-23 resolved 2026-09-11)
         _safe_recovery()  — home robot, stop streams
         sm.start()  → State.RUNNING
         plc.set_status_light(GREEN)

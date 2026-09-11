@@ -83,6 +83,19 @@ log = structlog.get_logger(__name__)
 
 SAFETY_POLL_INTERVAL       = 0.10   # 100ms
 PLC_POLL_INTERVAL          = 0.10   # 100ms
+
+# 2026-09-11, found live: this installation's light curtain read flickers
+# between clear/tripped even with nothing in the beam (confirmed on real
+# hardware -- the log showed it alternating for minutes at a stretch). A
+# single instantaneous "clear right now" poll is not trustworthy enough to
+# gate a reset-acknowledge attempt or the CONTINUE button on -- both need
+# the curtain to have read clear continuously for this long first. See
+# _safety_poll_loop()'s light-curtain debounce tracking. Starting value;
+# widen if real flicker turns out to be longer-period than this, but if
+# CONTINUE still won't stay enabled even with a generous window, that's a
+# sign of a genuine physical curtain problem (alignment, dust, a reflective
+# surface nearby) to go check, not something more software can paper over.
+LIGHT_CURTAIN_STABLE_CLEAR_S = 2.0
 ROBOT_POLL_INTERVAL        = 0.20   # 200ms
 ROBOT_KEEPALIVE_INTERVAL_S = 0.5    # seconds — Epson TCP idle timer fires at ~1 s; 0.5s keeps well under it
 
@@ -186,6 +199,7 @@ class Orchestrator:
         overhead_save_dir: Path | None = None,
         overhead_save_format: str = "png",
         overhead_save_images: bool = True,
+        unprocessed_overhead_save_dir: Path | None = None,
         eoa_save_dir: Path | None = None,
         force_sample_detection: bool = False,
         view: bool = False,
@@ -230,6 +244,12 @@ class Orchestrator:
         self._overhead_save_dir = overhead_save_dir
         self._overhead_save_format = overhead_save_format
         self._overhead_save_images = overhead_save_images
+        # Raw (pre-vision, pre-annotation) overhead frame save directory
+        # (None = don't save) -- 2026-09-08, operator request: overhead_save_dir
+        # above only ever holds the ANNOTATED frame (dish circle, detection
+        # circles, banner text); this is the untouched camera capture, saved
+        # separately so it's never mixed in with or overwritten by that one.
+        self._unprocessed_overhead_save_dir = unprocessed_overhead_save_dir
         # EoA annotated frame save directory (None = don't save)
         self._eoa_save_dir = eoa_save_dir
         # Dev flag: inject a fake centroid when vision finds nothing (empty dish).
@@ -249,6 +269,15 @@ class Orchestrator:
         # Live light curtain state — updated every 100ms by safety poll loop.
         # Used to gate the CONTINUE button: must be False before reset-ack is sent.
         self._light_curtain_tripped = False
+        # Debounced version of the above (2026-09-11) -- see
+        # LIGHT_CURTAIN_STABLE_CLEAR_S's comment for why the raw reading
+        # alone isn't trustworthy. _light_curtain_clear_since is the
+        # monotonic timestamp of the most recent False->True->False... run
+        # of continuously-clear polls starting (None while currently
+        # tripped); _light_curtain_stably_clear is the derived "has it been
+        # clear for long enough to trust" flag actually used for gating.
+        self._light_curtain_clear_since: float | None = None
+        self._light_curtain_stably_clear = False
         # Live "any Flexi fault latched" state — updated every 100ms. For
         # E_STOP specifically, this stays True through button-released and
         # awaiting-reset, and only clears once the FULL hardware reset
@@ -715,6 +744,19 @@ class Orchestrator:
                 status = await self._drivers.safety.read_status()
                 self._light_curtain_tripped = status["light_curtain_tripped"]
                 self._hardware_fault_active = status["any_fault_active"]
+                # Debounce: track how long it's been continuously clear, not
+                # just whether it's clear on this one poll -- see
+                # LIGHT_CURTAIN_STABLE_CLEAR_S's comment for why.
+                now = asyncio.get_event_loop().time()
+                if self._light_curtain_tripped:
+                    self._light_curtain_clear_since = None
+                elif self._light_curtain_clear_since is None:
+                    self._light_curtain_clear_since = now
+                self._light_curtain_stably_clear = (
+                    not self._light_curtain_tripped
+                    and self._light_curtain_clear_since is not None
+                    and (now - self._light_curtain_clear_since) >= LIGHT_CURTAIN_STABLE_CLEAR_S
+                )
                 event = SafetyStatusEvent(
                     any_fault_active=status["any_fault_active"],
                     light_curtain_tripped=status["light_curtain_tripped"],
@@ -722,6 +764,7 @@ class Orchestrator:
                     estop_button_index=status["estop_button_index"],
                     contactor_closed=status["contactor_closed"],
                     reset_available=status["reset_available"],
+                    light_curtain_stably_clear=self._light_curtain_stably_clear,
                 )
                 await self._queue.put(event)
             except Exception as exc:
@@ -1003,6 +1046,10 @@ class Orchestrator:
                     await self._cleanup_interrupted_attempt(reason="operator_abort")
                 sm.abort()
                 await self._home_right(d)
+                # Re-home the pipette motor as well (2026-09-10 operator
+                # request) -- after any pending specimen was delivered
+                # above and the arm is parked.
+                await self._reset_pipette_motor(d)
                 await d.plc.set_status_light(StatusLight.AMBER)
                 await d.plc.set_work_light(True)
                 await self._close_run(RunStatus.ABORTED)
@@ -1010,26 +1057,56 @@ class Orchestrator:
 
             case OperatorAcknowledgeEvent():
                 if sm.current in {State.PROTECTIVE_STOP}:
-                    if self._light_curtain_tripped or self._hardware_fault_active:
-                        # Light curtain still obstructed, OR the physical blue
-                        # reset button hasn't been pressed yet. Corrected
-                        # 2026-08-18 from live hardware testing: this
-                        # installation's Flexi requires the SAME blue button
-                        # for light curtain recovery as for e-stop — the
-                        # original FR-SAF-08 assumption ("no button needed")
-                        # doesn't hold here. Checked independently of the UI's
-                        # own button-enable logic — never trust that alone for
-                        # a safety gate.
+                    if not self._light_curtain_stably_clear:
+                        # Physically blocked -- clearing the beam is the one
+                        # precondition no software reset can work around
+                        # (FR-SAF-09: only send the reset when the curtain is
+                        # actually clear). This USED TO also require
+                        # _hardware_fault_active already False (2026-08-18,
+                        # back when send_reset_acknowledge() was a no-op and
+                        # only the physical blue button could ever clear it)
+                        # -- that's backwards now that the reset pulse itself
+                        # is what's supposed to clear _hardware_fault_active
+                        # (OQ-23 resolved 2026-09-11): requiring it to already
+                        # be False meant this branch could never actually
+                        # reach the call below. See the else branch.
+                        #
+                        # Checks the DEBOUNCED flag, not raw
+                        # _light_curtain_tripped (2026-09-11 fix, found live:
+                        # the raw reading flickers on this installation even
+                        # with nothing in the beam -- CONTINUE kept failing
+                        # minutes after the operator had genuinely stepped
+                        # clear). See LIGHT_CURTAIN_STABLE_CLEAR_S.
                         log.warning(
                             "orchestrator.continue_blocked",
-                            reason="light curtain still tripped, or blue reset button not yet pressed",
+                            reason="light curtain not stably clear",
                             curtain_tripped=self._light_curtain_tripped,
-                            hardware_fault_active=self._hardware_fault_active,
+                            stably_clear=self._light_curtain_stably_clear,
                         )
                     else:
-                        # Beam is clear — send reset-acknowledge to release latch,
-                        # then recover to home before restarting the cycle.
+                        # Beam is clear — pulse reset-acknowledge to release
+                        # the latch (holding register 256, bit 8 -- confirmed
+                        # live on real hardware 2026-09-11, see
+                        # cib/drivers/safety/driver.py), then VERIFY it
+                        # actually cleared before trusting it -- the pulse
+                        # could in principle fail to take (some other
+                        # condition still blocking reset), so don't just
+                        # assume success because the Modbus write itself
+                        # didn't error.
                         await d.safety.send_reset_acknowledge()
+                        cleared = await self._wait_for_hardware_fault_clear(timeout_s=2.0)
+                        if not cleared:
+                            log.warning(
+                                "orchestrator.continue_blocked",
+                                reason="reset-acknowledge sent but hardware fault did not clear",
+                                hardware_fault_active=self._hardware_fault_active,
+                            )
+                            await self._queue.put(SystemErrorEvent(
+                                message="Sent the reset signal but the safety controller "
+                                        "didn't clear. Press the physical blue reset "
+                                        "button on the Flexi panel, then CONTINUE again."
+                            ))
+                            return
                         robot_ok = await self._safe_recovery()
                         await self._clear_safety_event()
                         if not robot_ok:
@@ -1057,6 +1134,10 @@ class Orchestrator:
                             # Deliver whatever was already in the tip BEFORE any
                             # new pick is allowed to start.
                             await self._deliver_pending_specimen()
+                        # Re-home the pipette motor after recovery (and after
+                        # any pending specimen is out) -- 2026-09-10 operator
+                        # request, same motor home as startup / CYCLE STOP.
+                        await self._reset_pipette_motor(d)
                         if self._state_before_fault in (State.RUNNING, State.CYCLE_STOPPING):
                             # Was actually running — resume, per FR-SAF-08 (no
                             # separate START needed for this fault type).
@@ -1077,6 +1158,64 @@ class Orchestrator:
                 elif sm.current == State.E_STOP:
                     # E-stop is physically cleared (blue button pressed, contactor
                     # re-closed) — robot motor is back on. Safe to home now.
+                    #
+                    # 2026-09-11, operator request: the physical Reset Button also
+                    # feeds the P-Stop side's own Reset V1 block (same OR gate our
+                    # software "Reset Motor" pulse feeds, per the Safety Designer
+                    # logic diagram) -- but P-Stop's Reset V1 can only release once
+                    # the E-Stop's OWN Reset V1 has ALREADY enabled "Enable System",
+                    # which its own AND gate also requires the light curtain to be
+                    # clear AT THAT SAME INSTANT. One button press usually clears
+                    # both together, but if the curtain wasn't simultaneously clear
+                    # (or any other timing race), only the e-stop side clears and
+                    # the motor-power side (_hardware_fault_active) stays latched --
+                    # previously this branch never attempted the software pulse at
+                    # all, so the operator had to notice and press the physical
+                    # button a SECOND time just to re-latch the motor side. Try the
+                    # same pulse CONTINUE already sends for a pure light-curtain
+                    # trip first, so one physical action plus CONTINUE is enough.
+                    if self._hardware_fault_active:
+                        if not self._light_curtain_stably_clear:
+                            # Same physical precondition PROTECTIVE_STOP's
+                            # branch checks before ever attempting the pulse
+                            # (2026-09-11 fix, found live: the P-Stop side's
+                            # own Reset V1 that pulse targets requires the
+                            # curtain clear to release) -- don't even try a
+                            # pulse that's guaranteed to fail, and don't let
+                            # a stray/racing OperatorAcknowledgeEvent bypass
+                            # this check just because it didn't come through
+                            # the UI's own (now-fixed) button gate. Checks
+                            # the DEBOUNCED flag, not raw
+                            # _light_curtain_tripped -- see
+                            # LIGHT_CURTAIN_STABLE_CLEAR_S.
+                            log.warning(
+                                "orchestrator.continue_blocked",
+                                reason="e-stop cleared but light curtain not stably clear",
+                                curtain_tripped=self._light_curtain_tripped,
+                                stably_clear=self._light_curtain_stably_clear,
+                            )
+                            await self._queue.put(SystemErrorEvent(
+                                message="E-stop released, but the light curtain is "
+                                        "still obstructed. Clear the cell, then "
+                                        "CONTINUE again."
+                            ))
+                            return
+                        await d.safety.send_reset_acknowledge()
+                        cleared = await self._wait_for_hardware_fault_clear(timeout_s=2.0)
+                        if not cleared:
+                            log.warning(
+                                "orchestrator.continue_blocked",
+                                reason="e-stop reset-acknowledge sent but hardware fault "
+                                       "did not clear",
+                                hardware_fault_active=self._hardware_fault_active,
+                            )
+                            await self._queue.put(SystemErrorEvent(
+                                message="E-stop released, but the safety controller "
+                                        "still shows a fault. Confirm the physical blue "
+                                        "reset button was pressed and the light curtain "
+                                        "is clear, then CONTINUE again."
+                            ))
+                            return
                     robot_ok = await self._safe_recovery()
                     await self._clear_safety_event()
                     if not robot_ok:
@@ -1099,6 +1238,10 @@ class Orchestrator:
                         # IDLE afterward (below) — per FR-SAF-06, e-stop recovery
                         # never auto-resumes RUNNING; a separate START is required.
                         await self._deliver_pending_specimen()
+                    # Re-home the pipette motor after recovery (and after any
+                    # pending specimen is out) -- 2026-09-10 operator request,
+                    # same motor home as startup / CYCLE STOP.
+                    await self._reset_pipette_motor(d)
                     sm.hardware_reset_complete()
                     await d.plc.set_status_light(StatusLight.GREEN)
                     await d.plc.set_work_light(True)
@@ -1258,6 +1401,12 @@ class Orchestrator:
         self._sm.cycle_complete()
         await d.lighting.set_backlight(False)
         await self._home_right(d)
+        # Re-home the pipette plunger motor too (2026-09-10 operator
+        # request) -- after the arm is parked, same as at startup. A
+        # graceful CYCLE STOP already ran the last cycle's DROP, so the
+        # plunger is at/near the dispense stop; EX G3 handles that fine
+        # (it's why RESET_PIPETTE calls MotorHome, not MotorDrop).
+        await self._reset_pipette_motor(d)
         await d.plc.set_status_light(StatusLight.AMBER)
         await d.plc.set_work_light(True)
         log.info("orchestrator.stopped")
@@ -1265,6 +1414,29 @@ class Orchestrator:
             self._abort_after_cycle = False
             await self._close_run(RunStatus.ABORTED)
             log.info("orchestrator.abort_after_cycle_complete")
+
+    async def _wait_for_hardware_fault_clear(self, timeout_s: float = 2.0) -> bool:
+        """
+        Poll self._hardware_fault_active for up to timeout_s, returning True
+        as soon as it clears (or immediately if already clear), False on
+        timeout. That attribute is written directly by _safety_poll_loop()
+        every _safety_poll_interval_s (100-200ms) independent of whether the
+        matching SafetyStatusEvent has been processed yet, so polling it
+        here reflects the live Flexi state, not stale queue state.
+
+        2026-09-11 (OQ-23 resolved): called right after
+        send_reset_acknowledge() actually does something for the first time
+        (previously a no-op) -- the Modbus write not erroring doesn't
+        guarantee the Flexi's latch actually released (some other condition
+        could still be blocking reset), so this verifies the real effect
+        instead of assuming success.
+        """
+        deadline = asyncio.get_event_loop().time() + timeout_s
+        while asyncio.get_event_loop().time() < deadline:
+            if not self._hardware_fault_active:
+                return True
+            await asyncio.sleep(0.05)
+        return not self._hardware_fault_active
 
     async def _safe_recovery(self) -> bool:
         """
@@ -1667,6 +1839,33 @@ class Orchestrator:
             self._current_pick = None
             self._cycle_phase = CyclePhase.IDLE
 
+    async def _reset_pipette_motor(self, d: DriverSet) -> None:
+        """
+        Re-home the pipette plunger motor against its dispense hard stop --
+        sort_server.prg's RESET_PIPETTE -> MotorHome -> EX G3: low-power
+        seek into the stop, hMT Locked-Rotor detect, back off
+        HOME_BACKOFF_STEPS (~2mm), redefine that as P=0. Exactly the same
+        motor home done once at startup (see _startup()).
+
+        Called at every recovery finalization -- CYCLE STOP, ABORT, and
+        safety CONTINUE (e-stop / protective stop) -- so the plunger's zero
+        is re-established the drift-proof way after any interruption,
+        2026-09-10 operator request. Must run AFTER any pending specimen
+        has been delivered (_deliver_pending_specimen does its own DROP):
+        EX G3 drives the plunger forward into the hard stop, which would
+        expel anything still in the tip.
+
+        Best-effort: logged, never raised, never blocks the recovery it's
+        part of -- same contract as the startup call. Goes through
+        sort_server.prg, so callers should only reach it once the robot
+        program is confirmed alive (past _safe_recovery()'s robot_ok gate).
+        """
+        try:
+            await d.robot.reset_pipette()
+            log.info("orchestrator.pipette_reset_on_recovery")
+        except Exception as exc:
+            log.error("orchestrator.pipette_reset_on_recovery_failed", error=str(exc))
+
     # ------------------------------------------------------------------
     # Data layer helpers — all DB calls are sync SQLite, run in executor
     # ------------------------------------------------------------------
@@ -1910,6 +2109,16 @@ class Orchestrator:
             await d.camera_overhead.capture()  # drain stale frame 1
             await d.camera_overhead.capture()  # drain stale frame 2
             frame = await d.camera_overhead.capture()  # fresh stable frame
+
+            # Archival save of the RAW frame, exactly as the camera produced
+            # it — before vision touches it, before any annotation is drawn.
+            # Fired in the background (not awaited) same as the annotated
+            # save further down, so a slow disk write never holds up the
+            # robot's next move. 2026-09-08, operator request.
+            if self._unprocessed_overhead_save_dir is not None:
+                asyncio.create_task(
+                    self._save_unprocessed_overhead_frame_background(frame)
+                )
 
             # Stop overhead stream now — done capturing.
             # Frees ~392 Mbps on the adapter so robot TCP has full
@@ -2436,7 +2645,7 @@ class Orchestrator:
             # Test-scoped well sequencing (2026-08-11) — see
             # prd_updated.md Appendix D for the not-yet-finalized production
             # design (this is NOT that; see _get_next_well_coords() docstring).
-            well_x, well_y, well_label, well_u, well_side, side_switch = self._get_next_well_coords()
+            well_x, well_y, well_label, well_u, well_side, side_switch, station_num = self._get_next_well_coords()
             log.info("cycle.picking", refined_x=refined_x, refined_y=refined_y,
                      u=target_u, hand=hand, well=well_label,
                      well_xy=f"({well_x:.1f}, {well_y:.1f})", well_side=well_side)
@@ -2444,7 +2653,10 @@ class Orchestrator:
             # Log this pick attempt now — from here on, a safety fault means
             # a specimen may end up in the pipette, and recovery needs to
             # know exactly which well it was headed to.
-            station_num = self._current_station_number()
+            # station_num comes straight from _get_next_well_coords() above —
+            # NOT a fresh self._current_station_number() call (2026-09-07 fix,
+            # see that method's docstring: the sequencer may already have
+            # advanced past this well's station by the time we'd call it here).
             pick = Pick(
                 run_id=self._current_run.run_id if self._current_run else "NO_RUN",
                 field_code=self._field_code,
@@ -2580,7 +2792,14 @@ class Orchestrator:
                     # here; when continuing on the left side with no
                     # lookahead result, parking Righty would just force an
                     # unnecessary swing back left on the very next cycle.
-                    if stopping or self._current_station_side() == "right":
+                    # Uses well_side (captured above from THIS cycle's own
+                    # _get_next_well_coords() call), NOT a fresh
+                    # _current_station_side() call (2026-09-07 fix, same
+                    # issue as station_num above) -- on the last well of the
+                    # last selected station, the sequencer has already
+                    # advanced past the end of self._station_order, so
+                    # _current_station_side() would IndexError here too.
+                    if stopping or well_side == "right":
                         await self._home_right(d)
                     else:
                         await self._home_left(d)
@@ -2651,6 +2870,9 @@ class Orchestrator:
                         # Deliver whatever was already in the tip before any
                         # new pick is allowed to start.
                         await self._deliver_pending_specimen()
+                    # Re-home the pipette motor after the self-heal, same as
+                    # the operator-driven recovery paths (2026-09-10).
+                    await self._reset_pipette_motor(d)
                     # Deliberately does NOT auto-resume RUNNING — same
                     # philosophy as e-stop/light-curtain recovery: an
                     # unattended, unexplained fault landing back in IDLE
@@ -2751,6 +2973,37 @@ class Orchestrator:
             )
         return result
 
+    async def _save_unprocessed_overhead_frame_background(self, frame: Any) -> None:
+        """
+        Write the RAW overhead frame to disk (no vision/annotation applied
+        yet), off the thread pool. Fired via asyncio.create_task() right
+        after the frame is captured in _capture_and_select_target() and
+        deliberately NOT awaited there, same reasoning as
+        _save_overhead_frame_background() below (a slow disk write must
+        never hold up the robot's next move). Reuses _save_annotated_image()
+        purely as a "write this array to save_dir with a timestamped
+        filename" helper -- it doesn't require the image to actually be
+        annotated, and pointing it at self._unprocessed_overhead_save_dir
+        (a different folder from self._overhead_save_dir) keeps these
+        completely separate from the annotated copies. 2026-09-08, operator
+        request. Safe to run concurrently with the vision pass on the same
+        `frame` array -- run_overhead_detection() never mutates its input,
+        every stage (_to_gray, threshold, annotate, ...) produces a new
+        array, so this is a read-only race with another read-only reader.
+        """
+        from datetime import datetime
+        from cib.vision.pipeline import _save_annotated_image
+        loop = asyncio.get_running_loop()
+        try:
+            path = await loop.run_in_executor(
+                None, _save_annotated_image,
+                frame, self._unprocessed_overhead_save_dir,
+                self._overhead_save_format, datetime.now(),
+            )
+            log.debug("cycle.unprocessed_overhead_frame_saved_background", path=path)
+        except Exception as exc:
+            log.warning("cycle.unprocessed_overhead_frame_save_background_failed", error=str(exc))
+
     async def _save_overhead_frame_background(self, annotated_frame: Any) -> None:
         """
         Write the already-annotated overhead frame to disk, off the
@@ -2790,26 +3043,34 @@ class Orchestrator:
         eoa_result: VisionEoAResultEvent,
     ) -> tuple[str | None, str] | None:
         """
-        Save EoA frames with visual overlays on the with_backlight image:
+        Save EoA frames:
 
         backlight_off/  — raw no_backlight frame (ring light only — archival record
                           only; too dark for reliable classification on this hardware,
                           see the Step 5 capture comment in _run_cycle())
-        backlight_on/   — with_backlight frame (used by classifier) annotated with:
-            • Green +  at image centre  = robot tool tip (pick point)
-            • Cyan dot at body_center_px = body centre found by classifier
-            • Orange line connecting the two (shows offset before correction)
-
-        If the green + and cyan dot coincide after the correction move,
-        the robot is positioned correctly over the bug body.
+        backlight_on/   — with_backlight frame (used by classifier) saved RAW,
+                          no overlay — 2026-09-07, operator request: this is
+                          the same image the Halcon labeling dataset
+                          (eoa_labels.csv below) points its pixel_x/pixel_y
+                          coordinates into, and a baked-in crosshair/dot/
+                          line drawn right at image centre (where the bug
+                          usually is) contaminated exactly the pixels a
+                          dataset like that needs to stay clean. Previously
+                          this saved an annotated copy (green + = tool tip,
+                          cyan dot = body centre, orange line = offset) for
+                          visual QA -- that overlay is gone; use
+                          hardware_tests/verify_eoa_labels.py instead, which
+                          draws the same body-centre crosshair on demand
+                          from eoa_labels.csv without ever touching the
+                          saved file.
 
         The backlight_off/ archival frame is only written for a CONFIRMED
         pick (2026-08-22, operator's call: "we need the images of confirmed
         pics only for backlight off ... because that has been picked, or
         else why would we need it") — driven by eoa_result.proceed_with_pick,
-        not a separate flag. The with_backlight debug image is always saved
-        regardless — it's the visual record of WHY a candidate was accepted
-        or rejected.
+        not a separate flag. The with_backlight image is always saved
+        regardless — it's the record of WHY a candidate was accepted or
+        rejected, same as before.
 
         Also appends one row per with-backlight image to
         backlight_on/eoa_labels.csv (2026-09-01, operator request — building
@@ -2830,7 +3091,6 @@ class Orchestrator:
         """
         import csv
         import cv2
-        import numpy as np
         from datetime import datetime
 
         if self._eoa_save_dir is None:
@@ -2853,40 +3113,13 @@ class Orchestrator:
             path_no_bl = str(dir_no_bl / f"eoa_no_backlight_{ts}.jpg")
             cv2.imwrite(path_no_bl, frame_no_backlight)
 
-        # With-backlight: draw overlays for visual positioning verification
-        h, w = frame_with_backlight.shape[:2]
-        cx, cy = w // 2, h // 2
-        vis = frame_with_backlight.copy()
-        arm = max(200, w // 14)
-        lw  = max(4, w // 800)
-
-        # Green + — robot tool centre (EoA image centre = where tool tip is)
-        cv2.line(vis, (cx - arm, cy), (cx + arm, cy), (0, 255, 0), lw)
-        cv2.line(vis, (cx, cy - arm), (cx, cy + arm), (0, 255, 0), lw)
-        cv2.circle(vis, (cx, cy), arm // 4, (0, 255, 0), lw)
-        cv2.circle(vis, (cx, cy), lw * 2, (0, 255, 0), -1)
-
-        if body_center_px:
-            bcx = int(round(body_center_px[0]))
-            bcy = int(round(body_center_px[1]))
-            offset_px = int(np.sqrt((bcx - cx) ** 2 + (bcy - cy) ** 2))
-            # Orange line: tool centre → body centre (shows residual offset)
-            cv2.line(vis, (cx, cy), (bcx, bcy), (0, 165, 255), lw)
-            # Cyan dot: body centre found by classifier
-            cv2.circle(vis, (bcx, bcy), lw * 4, (255, 255, 0), lw)
-            cv2.circle(vis, (bcx, bcy), lw * 2, (0, 255, 255), -1)
-            cv2.putText(
-                vis,
-                f"body offset from tool: {offset_px}px",
-                (20, h - 60),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                max(1.0, w / 2600),
-                (0, 165, 255),
-                lw,
-            )
+        # With-backlight: save RAW, no overlay (2026-09-07 — see docstring:
+        # this is the same file eoa_labels.csv's pixel_x/pixel_y point into,
+        # and a baked-in crosshair/dot/line at image centre contaminated
+        # exactly the pixels a Halcon-comparison dataset needs clean).
 
         path_with_bl = dir_with_bl / f"eoa_with_backlight_{ts}.jpg"
-        cv2.imwrite(str(path_with_bl), vis)
+        cv2.imwrite(str(path_with_bl), frame_with_backlight)
 
         # Halcon test-dataset ledger — one row per with-backlight image,
         # every attempt (accepted or rejected). Kept as a flat CSV (not a
@@ -3041,8 +3274,18 @@ class Orchestrator:
         """
         The station number the sequencer is currently positioned at (peek
         only, does not advance anything), or None if multi-station mode
-        isn't configured. Used to look up this cycle's Plate ID in
-        self._plate_ids_by_station -- see configure_pre_run().
+        isn't configured.
+
+        CAUTION (2026-09-07): self._current_station_idx can legitimately
+        equal len(self._station_order) right after _get_next_well_coords()
+        returns the LAST well of the LAST selected station -- calling this
+        method in that window raises IndexError ("list index out of
+        range"), and calling it anywhere between two _get_next_well_coords()
+        calls that crossed a station boundary silently returns the NEXT
+        station, not the one the most recent well actually came from. This
+        is exactly the real-hardware crash fixed this same day -- see
+        _get_next_well_coords()'s docstring. Prefer using the station_num
+        it already returns instead of calling this method after the fact.
         """
         if not self._station_order:
             return None
@@ -3277,10 +3520,11 @@ class Orchestrator:
         """
         return bool(self._station_order) and self._current_station_idx >= len(self._station_order)
 
-    def _get_next_well_coords(self) -> tuple[float, float, str, float | None, str, bool]:
+    def _get_next_well_coords(self) -> tuple[float, float, str, float | None, str, bool, int | None]:
         """
-        Return (well_x, well_y, well_label, well_home_u, side, side_switch)
-        for the next well to drop into, advancing the internal sequencer.
+        Return (well_x, well_y, well_label, well_home_u, side, side_switch,
+        station_num) for the next well to drop into, advancing the internal
+        sequencer.
 
         well_home_u is ALWAYS the current side's HOME U (right_home_u/
         left_home_u from machine_config.yaml's plate_stations section) —
@@ -3292,6 +3536,21 @@ class Orchestrator:
         signals _run_cycle() that after finishing THIS drop, it must
         explicitly cross hands (go_home_left()) before the next overhead
         capture, instead of the normal same-side concurrent-lookahead trick.
+
+        station_num is the station THIS well actually came from (None in
+        the legacy fallback). 2026-09-07 bug fix: callers must use this
+        return value instead of separately calling _current_station_number()
+        afterward — whenever the well just returned was the LAST well of
+        its station, this call already advances self._current_station_idx
+        past it (needed so _stations_exhausted() sees the right thing next
+        time), so a later _current_station_number()/_current_station_side()
+        call in the same cycle would silently read the WRONG (next) station
+        for every station boundary, and outright IndexError -- "list index
+        out of range" -- crash the whole cycle at the very last well of the
+        very last selected station (self._current_station_idx left pointing
+        one past the end of self._station_order, nothing left to index).
+        Found live on real hardware: single station selected, crashed
+        exactly on well 96/96.
 
         Multi-station mode (configure_pre_run() called, self._station_order
         non-empty): fills the selected stations in the order built by
@@ -3331,10 +3590,10 @@ class Orchestrator:
                     next_station = self._station_order[self._current_station_idx]
                     next_side = self._plate_stations_cfg.side_of(next_station)
                     side_switch = next_side != side
-            return (well.x, well.y, well.well, home_u, side, side_switch)
+            return (well.x, well.y, well.well, home_u, side, side_switch, station_num)
 
         if self._plate_config is None or not self._plate_config.wells:
-            return (100.0, 100.0, "NONE", self._plate_u, "right", False)
+            return (100.0, 100.0, "NONE", self._plate_u, "right", False, None)
 
         wells = self._plate_config.wells
         well = wells[self._next_well_index % len(wells)]
@@ -3343,7 +3602,7 @@ class Orchestrator:
                         note="well index wrapped past the end of the plate — "
                              "test-scoped behavior, not correct for production")
         self._next_well_index += 1
-        return (well.x, well.y, well.well, self._plate_u, "right", False)
+        return (well.x, well.y, well.well, self._plate_u, "right", False, None)
 
     # ------------------------------------------------------------------
     # VIEW helpers — image display for testing (VIEW=True in main.py)

@@ -163,6 +163,18 @@ class SafetyStatusEvent:
     estop_button_index: int | None
     contactor_closed: bool
     reset_available: bool           # blue reset light flashing
+    # True only once light_curtain_tripped has read False continuously for
+    # LIGHT_CURTAIN_STABLE_CLEAR_S (see orchestrator.py) -- 2026-09-11,
+    # found live: the raw reading flickers between clear/tripped on this
+    # installation even with nothing in the beam, so a single instantaneous
+    # "clear right now" read is not trustworthy enough to gate CONTINUE or
+    # a reset-acknowledge attempt on. This is a DERIVED value tracked across
+    # polls by the orchestrator (see _safety_poll_loop()), not something a
+    # single read_status() call can compute -- defaults to False (assume
+    # not-yet-proven-stable) so callers that build this from a raw driver
+    # status dict (e.g. tests exercising _evaluate_safety() directly) don't
+    # need to know about it.
+    light_curtain_stably_clear: bool = False
 
 
 # ---------------------------------------------------------------------------

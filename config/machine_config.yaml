@@ -153,6 +153,11 @@ paths:
   # Overhead images are saved here (debug use — not required by Austin).
   # In dev mode (USE_MOCKS=True), main.py uses output/overhead_images/ instead.
   overhead_images: 'C:\LabAutomation\data\overhead_images'
+  # Raw (pre-vision, pre-annotation) overhead captures -- separate from
+  # overhead_images above, which only ever holds the annotated copy.
+  # 2026-09-08, operator request. Same dev-mode fallback pattern
+  # (output/unprocessed_overhead/ under USE_MOCKS=True).
+  unprocessed_overhead_images: 'C:\LabAutomation\data\unprocessed_overhead'
 
 vision:
   detection_min_area_px: 50
