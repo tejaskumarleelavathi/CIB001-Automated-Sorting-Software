@@ -421,7 +421,17 @@ def run_overhead_detection(
         centroids_robot_xy: list[tuple[float, float]]
         try:
             from cib.vision.calibration import load_calibration
-            calib = load_calibration(r"camera_calibration\output\calibration_overhead.npy")
+            # No path override -- use load_calibration's own default
+            # (C:\LabAutomation\config\calibration_overhead.npy, where the
+            # real deployed calibration file lives). A leftover dev-testing
+            # override here (a relative camera_calibration\output\ path,
+            # only ever present on a laptop that had locally run the
+            # calibration scripts) previously always failed on the HMI,
+            # silently falling back to raw, uncalibrated pixel coordinates
+            # -- confirmed root cause of a real robot fault (2026-09-13):
+            # centroids like x=3578, y=1504 (pixel values, not mm) were
+            # sent straight to the robot as move targets.
+            calib = load_calibration()
             centroids_robot_xy = calib.pixel_list_to_robot(centroids_px)
         except Exception as calib_exc:  # noqa: BLE001
             log.warning(
