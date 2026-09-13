@@ -984,23 +984,68 @@ class Orchestrator:
                         await self._finish_stop(d)
                     return
 
-                if sm.current in {State.E_STOP, State.PROTECTIVE_STOP} and (
-                    self._hardware_fault_active or self._light_curtain_tripped
-                ):
-                    # Motor power is cut while either of these is still
-                    # physically active (2026-08-30) — delivering a
-                    # pending specimen or homing below would just fail
-                    # against a robot that cannot move. Same physical gate
-                    # as CONTINUE (OperatorAcknowledgeEvent) — the blue
-                    # reset button must actually be pressed first.
-                    log.warning(
-                        "orchestrator.abort_blocked_hardware_not_reset",
-                        state=sm.current.value,
-                        hardware_fault_active=self._hardware_fault_active,
-                        light_curtain_tripped=self._light_curtain_tripped,
-                        note="Complete the physical hardware reset (blue button) before ABORT.",
-                    )
-                    return
+                if sm.current == State.PROTECTIVE_STOP:
+                    # ABORT now actively resolves a still-latched hardware
+                    # fault itself, the same way CONTINUE does (2026-09-14
+                    # fix, reported live: "why do we get only continue
+                    # enabled" -- ABORT used to require _hardware_fault_active
+                    # to ALREADY be False before doing anything, which
+                    # nothing except CONTINUE's own pulse ever cleared, so
+                    # ABORT could never actually become usable on its own).
+                    # Mirrors CONTINUE's own PROTECTIVE_STOP branch exactly:
+                    # curtain-clear is checked UNCONDITIONALLY (not gated
+                    # behind _hardware_fault_active) since that's the one
+                    # precondition no software reset can work around.
+                    if not self._light_curtain_stably_clear:
+                        log.warning(
+                            "orchestrator.abort_blocked_hardware_not_reset",
+                            state=sm.current.value,
+                            light_curtain_stably_clear=self._light_curtain_stably_clear,
+                            note="Clear the light curtain before ABORT.",
+                        )
+                        return
+                    if self._hardware_fault_active:
+                        await d.safety.send_reset_acknowledge()
+                        cleared = await self._wait_for_hardware_fault_clear(timeout_s=2.0)
+                        if not cleared:
+                            log.warning(
+                                "orchestrator.abort_blocked",
+                                reason="reset-acknowledge sent but hardware fault did not clear",
+                                hardware_fault_active=self._hardware_fault_active,
+                            )
+                            await self._queue.put(SystemErrorEvent(
+                                message="Sent the reset signal but the safety controller "
+                                        "didn't clear. Press the physical blue reset "
+                                        "button on the Flexi panel, then ABORT again."
+                            ))
+                            return
+                elif sm.current == State.E_STOP:
+                    # Mirrors CONTINUE's own E_STOP branch exactly: only
+                    # bother with the curtain check + pulse at all if motor
+                    # power is still actually cut.
+                    if self._hardware_fault_active:
+                        if not self._light_curtain_stably_clear:
+                            log.warning(
+                                "orchestrator.abort_blocked_hardware_not_reset",
+                                state=sm.current.value,
+                                light_curtain_stably_clear=self._light_curtain_stably_clear,
+                                note="Clear the light curtain before ABORT.",
+                            )
+                            return
+                        await d.safety.send_reset_acknowledge()
+                        cleared = await self._wait_for_hardware_fault_clear(timeout_s=2.0)
+                        if not cleared:
+                            log.warning(
+                                "orchestrator.abort_blocked",
+                                reason="reset-acknowledge sent but hardware fault did not clear",
+                                hardware_fault_active=self._hardware_fault_active,
+                            )
+                            await self._queue.put(SystemErrorEvent(
+                                message="Sent the reset signal but the safety controller "
+                                        "didn't clear. Press the physical blue reset "
+                                        "button on the Flexi panel, then ABORT again."
+                            ))
+                            return
 
                 if sm.current in {State.E_STOP, State.PROTECTIVE_STOP}:
                     # The robot was halt()ed when the fault hit — every

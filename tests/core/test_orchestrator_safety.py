@@ -972,11 +972,20 @@ class TestAbortSemantics:
     async def test_abort_blocked_during_protective_stop_until_curtain_clears(
         self, orch: Orchestrator,
     ) -> None:
+        """
+        2026-09-14: ABORT's PROTECTIVE_STOP gate now checks the DEBOUNCED
+        _light_curtain_stably_clear flag (same as CONTINUE), not the raw
+        _light_curtain_tripped flag -- the raw reading flickers on real
+        hardware, so gating on it directly would reintroduce the same
+        false-negative bug CONTINUE already had to fix (see
+        LIGHT_CURTAIN_STABLE_CLEAR_S).
+        """
         await _to_running(orch)
         await orch._drivers.robot.halt()
         orch._state_before_fault = State.RUNNING
         orch._sm.safety_fault_protective()
         orch._light_curtain_tripped = True    # still obstructed
+        orch._light_curtain_stably_clear = False
         orch._hardware_fault_active = False
         assert orch.state == State.PROTECTIVE_STOP
 
@@ -986,8 +995,85 @@ class TestAbortSemantics:
         assert orch._current_run is not None
 
         orch._light_curtain_tripped = False   # now clear
+        orch._light_curtain_stably_clear = True
         await orch._handle_event(OperatorAbortEvent())
 
+        assert orch.state == State.IDLE
+        assert orch._current_run is None
+
+
+class TestAbortSendsResetPulse:
+    """
+    2026-09-14, operator-reported: "why do we get only continue enabled" --
+    ABORT used to require _hardware_fault_active to ALREADY be False before
+    doing anything, but nothing except CONTINUE's own reset pulse ever
+    cleared that flag, so ABORT could never actually become usable on its
+    own. ABORT's handler now sends and verifies the same reset-acknowledge
+    pulse CONTINUE does. Mirrors TestEstopContinueSendsResetPulse above.
+    """
+
+    async def test_estop_sends_pulse_and_proceeds_once_it_clears(
+        self, orch: Orchestrator,
+    ) -> None:
+        await _to_running(orch)
+        await orch._drivers.robot.halt()
+        orch._sm.safety_fault_estop()
+        orch._hardware_fault_active = True
+        orch._light_curtain_stably_clear = True
+
+        calls: list[str] = []
+        real_reset_ack = orch._drivers.safety.send_reset_acknowledge
+
+        async def _reset_ack_and_clear() -> None:
+            calls.append("reset_ack")
+            await real_reset_ack()
+            orch._hardware_fault_active = False
+
+        orch._drivers.safety.send_reset_acknowledge = _reset_ack_and_clear
+
+        await orch._handle_event(OperatorAbortEvent())
+
+        assert calls == ["reset_ack"]
+        assert orch.state == State.IDLE
+        assert orch._current_run is None
+
+    async def test_estop_blocked_if_pulse_does_not_clear_it(
+        self, orch: Orchestrator,
+    ) -> None:
+        await _to_running(orch)
+        await orch._drivers.robot.halt()
+        orch._sm.safety_fault_estop()
+        orch._hardware_fault_active = True   # stays latched even after the pulse
+        orch._light_curtain_stably_clear = True
+
+        await orch._handle_event(OperatorAbortEvent())
+
+        assert orch.state == State.E_STOP
+        assert orch._current_run is not None
+
+    async def test_protective_stop_sends_pulse_and_proceeds_once_it_clears(
+        self, orch: Orchestrator,
+    ) -> None:
+        await _to_running(orch)
+        await orch._drivers.robot.halt()
+        orch._state_before_fault = State.RUNNING
+        orch._sm.safety_fault_protective()
+        orch._hardware_fault_active = True
+        orch._light_curtain_stably_clear = True
+
+        calls: list[str] = []
+        real_reset_ack = orch._drivers.safety.send_reset_acknowledge
+
+        async def _reset_ack_and_clear() -> None:
+            calls.append("reset_ack")
+            await real_reset_ack()
+            orch._hardware_fault_active = False
+
+        orch._drivers.safety.send_reset_acknowledge = _reset_ack_and_clear
+
+        await orch._handle_event(OperatorAbortEvent())
+
+        assert calls == ["reset_ack"]
         assert orch.state == State.IDLE
         assert orch._current_run is None
 

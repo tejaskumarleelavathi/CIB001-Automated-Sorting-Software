@@ -164,11 +164,16 @@ vision:
   detection_max_area_px: 2000
   backlight_lead_time_ms: 50
   # Overhead image save settings
-  overhead_save_images: true          # set true to save overhead frames (annotate+
+  overhead_save_images: false         # set true to save overhead frames (annotate+
                                        # save every cycle — even backgrounded, still
-                                       # real disk/CPU cost; re-enabled 2026-08-28 to
-                                       # check overhead detection against a backlight
-                                       # setting changed directly on the DCS-100E)
+                                       # real disk/CPU cost). Disabled 2026-09-14
+                                       # (operator request) to cut cycle time — this
+                                       # gates BOTH the annotated overhead save and
+                                       # the raw/unprocessed background save (see
+                                       # main.py's overhead_save_dir /
+                                       # unprocessed_overhead_save_dir wiring, same
+                                       # flag for both). EoA images are unaffected
+                                       # (separate eoa_save_format setting below).
   overhead_save_format: 'png'         # png (debug) or tiff (archival)
   # EoA image settings (save one TIFF per specimen — Austin requires these)
   eoa_save_format: 'tiff'

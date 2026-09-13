@@ -111,7 +111,7 @@ class SafetyBanner(QWidget):
         self._abort_btn.setStyleSheet(
             theme.status_button_stylesheet(theme.STATUS_RED, "#b91c1c")
         )
-        self._abort_btn.clicked.connect(self.abort_clicked.emit)
+        self._abort_btn.clicked.connect(self._on_abort_clicked)
         self._abort_btn.setEnabled(False)
         if self._show_abort:
             btn_row.addWidget(self._abort_btn)
@@ -145,6 +145,16 @@ class SafetyBanner(QWidget):
         self._status_label.setText("Recovering...")
         self._refresh()
         self.continue_clicked.emit()
+
+    def _on_abort_clicked(self) -> None:
+        # ABORT's handler can now also pulse-and-verify the hardware reset
+        # (2026-09-14) before delivering a pending specimen and closing the
+        # run -- same "don't let a second click race the first attempt"
+        # reasoning as CONTINUE.
+        self._recovering = True
+        self._status_label.setText("Recovering...")
+        self._refresh()
+        self.abort_clicked.emit()
 
     def update_safety_status(self, evt: SafetyStatusEvent) -> None:
         self._light_curtain_tripped = evt.light_curtain_tripped
@@ -194,55 +204,39 @@ class SafetyBanner(QWidget):
         self._refresh()
 
     def _refresh(self) -> None:
-        # CONTINUE and ABORT are gated DIFFERENTLY as of 2026-09-11 (OQ-23
-        # resolved) -- they used to share one "hardware_ready" condition
-        # (2026-08-30), back when neither button's own orchestrator handler
-        # could do anything about a still-latched hardware fault except
-        # wait for the physical blue button. Now CONTINUE's handler
-        # actively sends a software reset pulse and VERIFIES it worked
-        # before doing anything physical -- so CONTINUE only needs to gate
-        # on the one physical precondition no software reset can work
-        # around (curtain clear / e-stop button released+reset). ABORT's
-        # handler was NOT given that same pulse-and-verify treatment (still
-        # delivers a pending specimen with a plain robot move), so it stays
-        # on the stricter original rule: motor power must ALREADY be
-        # restored (_hardware_fault_active already False) before it's safe
-        # to enable at all.
+        # CONTINUE and ABORT share the SAME gate as of 2026-09-14 -- both
+        # orchestrator handlers now actively send the software reset pulse
+        # and VERIFY it worked before doing anything physical (previously
+        # only CONTINUE's did; ABORT required _hardware_fault_active to
+        # ALREADY be False, which nothing except CONTINUE's own pulse ever
+        # cleared, so ABORT could never actually become enabled on its own
+        # -- reported live 2026-09-14: "why do we get only continue
+        # enabled"). Both buttons now gate on the one physical precondition
+        # no software reset can work around (curtain clear / e-stop button
+        # released+reset) -- what happens after the button is pressed
+        # (resume picking vs. deliver-and-close) is the only difference.
         if self._state == State.E_STOP:
             self._title_label.setText("E-STOP ACTIVE")
             self.setVisible(True)
-            # Not gated on _hardware_fault_active -- pressing CONTINUE is
-            # now what can finish clearing that (orchestrator sends the
-            # same "Reset Motor" pulse the light-curtain path uses). Gated
-            # instead on the physical preconditions that pulse itself
-            # depends on: button not still pressed, blue reset button
-            # already pressed (_reset_available), AND the curtain clear --
             # 2026-09-11 fix, found live: the P-Stop side's own Reset V1
-            # (which that pulse targets) requires the curtain clear to
+            # (which the reset pulse targets) requires the curtain clear to
             # release too (same AND gate the PROTECTIVE_STOP branch below
             # depends on), so this was missing here and let CONTINUE show
             # as enabled with a hand physically inside the curtain.
-            continue_ready = (
+            physically_clear = (
                 not self._estop_active
                 and not self._reset_available
                 and self._light_curtain_stably_clear
-                and not self._recovering
             )
-            abort_ready = not self._hardware_fault_active and not self._recovering
+            continue_ready = physically_clear and not self._recovering
+            abort_ready = physically_clear and not self._recovering
             self._continue_btn.setEnabled(continue_ready)
             self._abort_btn.setEnabled(abort_ready)
         elif self._state == State.PROTECTIVE_STOP:
             self._title_label.setText("PROTECTIVE STOP — LIGHT CURTAIN")
             self.setVisible(True)
-            # Curtain-clear is the one thing no software reset can work
-            # around; _hardware_fault_active itself is what CONTINUE's own
-            # pulse is meant to clear, so it's not a precondition here.
             continue_ready = self._light_curtain_stably_clear and not self._recovering
-            abort_ready = (
-                not self._hardware_fault_active
-                and not self._light_curtain_tripped
-                and not self._recovering
-            )
+            abort_ready = self._light_curtain_stably_clear and not self._recovering
             self._continue_btn.setEnabled(continue_ready)
             self._abort_btn.setEnabled(abort_ready)
         else:
