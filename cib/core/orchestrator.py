@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -2814,6 +2815,11 @@ class Orchestrator:
 
         except Exception as exc:
             err_str = str(exc)
+            # Full traceback, not just str(exc) (2026-09-13 fix, found live:
+            # a "cycle.error" with a bare message like "invalid index to
+            # scalar variable." gives no way to tell which of dozens of
+            # numpy/cv2 calls in the vision pipeline actually raised it).
+            tb_str = traceback.format_exc()
             in_safety_stop = self._sm.current in {State.E_STOP, State.PROTECTIVE_STOP}
 
             # A pick was in flight when this failed. If a specimen was
@@ -2863,7 +2869,7 @@ class Orchestrator:
                 )
                 recovered = False
                 if looks_robot_related:
-                    log.error("cycle.error_attempting_remote_recovery", error=err_str[:200])
+                    log.error("cycle.error_attempting_remote_recovery", error=err_str[:200], traceback=tb_str)
                     recovered = await self._recover_robot_connection(d)
                 if recovered:
                     if self._pending_well is not None:
@@ -2897,7 +2903,7 @@ class Orchestrator:
                                 f"own via a Remote Ethernet restart. Press START to resume."
                     ))
                 else:
-                    log.error("cycle.error", error=str(exc))
+                    log.error("cycle.error", error=str(exc), traceback=tb_str)
                     self._sm.fault()
                     await self._queue.put(SystemErrorEvent(message=f"Cycle error: {err_str[:200]}"))
                     await d.plc.set_status_light(StatusLight.RED_CHASE)
