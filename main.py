@@ -225,7 +225,17 @@ def _make_real_lighting(cfg):
 
 
 def main() -> None:
-    configure_logging()
+    # Dev/prod split (2026-09-13 fix) -- configure_logging() previously
+    # always used its hardcoded C:\LabAutomation\data\logs default even on
+    # the dev laptop (which has no such drive layout); called before
+    # _load_config() so config-loading errors themselves still get logged,
+    # so this uses the USE_MOCKS module constant rather than cfg.paths.logs.
+    log_dir = (
+        Path(__file__).parent / "output" / "logs"
+        if USE_MOCKS
+        else Path("C:/LabAutomation/data/logs")
+    )
+    configure_logging(log_dir=log_dir)
 
     cfg = _load_config()
     drivers = build_drivers(
