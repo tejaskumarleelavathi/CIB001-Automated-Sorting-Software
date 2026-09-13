@@ -123,8 +123,16 @@ def _blob_features(contour: np.ndarray) -> dict:
             if hull_idx is not None and len(hull_idx) >= 3:
                 defects = cv2.convexityDefects(contour, hull_idx)
                 if defects is not None:
+                    # cv2.convexityDefects() returns shape (N, 1, 4) on
+                    # OpenCV 4.x but (N, 4) on OpenCV 5.0 -- confirmed live
+                    # 2026-09-13 (HMI runs 5.0, dev laptop runs 4.13, and
+                    # this exact code crashed with "invalid index to scalar
+                    # variable" only on the HMI: row[0] used to be the
+                    # 4-element defect record, but on 5.0 row IS already
+                    # that record, so row[0] is just its first scalar).
+                    # reshape(-1) normalizes either shape to flat (4,).
                     for row in defects:
-                        d = row[0][3] / 256.0
+                        d = np.asarray(row).reshape(-1)[3] / 256.0
                         max_depth = max(max_depth, d)
                         if d >= MIN_DEFECT_DEPTH_PX:
                             sig_defects += 1
