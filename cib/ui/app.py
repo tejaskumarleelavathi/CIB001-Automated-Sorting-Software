@@ -36,14 +36,15 @@ def run_qt(app, orchestrator, bridge, config_dir: Path | None = None) -> int:
     Blocks until the window is closed. Returns the Qt exit code.
     """
     window = MainWindow(orchestrator, bridge, config_dir=config_dir)
-    # Launch at the HMI's actual panel size (2026-09-11) rather than
-    # Qt's computed sizeHint -- on a dev monitor sizeHint comes out bigger
-    # than 1024x600 and looked fine, which is exactly what hid this bug
-    # during development; matching the real target size here means a
-    # layout that's too tall shows the same way on a dev laptop as it did
-    # on the actual touchscreen.
-    window.resize(1024, 600)
-    window.show()
+    # Maximize rather than resize(1024, 600) (2026-09-13 fix, found on the
+    # real HMI): the HMI's panel IS 1024x600, but that's the SCREEN size --
+    # a plain resize() to that same size makes a normal (non-maximized)
+    # window whose title bar and the taskbar both still have to fit inside
+    # those 600px too, pushing real content (the START/SHUTDOWN button row)
+    # off the bottom of the visible screen, behind the taskbar. showMaximized()
+    # fills whatever Windows actually reports as available (screen minus
+    # taskbar) instead of assuming the whole 600px is usable client area.
+    window.showMaximized()
 
     # Without this, Ctrl+C at the console does nothing while app.exec()
     # blocks (2026-08-31, operator request: Ctrl+C must trigger the same

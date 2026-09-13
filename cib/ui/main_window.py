@@ -70,10 +70,14 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("CIB Automated Sorting Cell")
         # HMI touchscreen is 1024x600 (2026-09-11) -- both screens' layouts
-        # are sized to fit that exactly. Do NOT raise this height back up;
-        # a minimum taller than the physical panel is what caused every
-        # widget below to get squeezed/overlapped on the real hardware.
-        self.setMinimumSize(1024, 600)
+        # are sized to fit that. Minimum height set BELOW the full screen
+        # size (2026-09-13 fix) -- app.py launches maximized, and the
+        # actually-usable area is the screen minus the taskbar (and, when
+        # not maximized, the title bar too), which is always less than the
+        # raw 600px panel height. A minimum of 600 here fought that and could
+        # force the window taller than the real usable area; the compacted
+        # layouts only need ~500px, so this stays a safety floor, not a target.
+        self.setMinimumSize(1024, 520)
         self.setStyleSheet(theme.window_stylesheet())
 
         self._stack = QStackedWidget()
