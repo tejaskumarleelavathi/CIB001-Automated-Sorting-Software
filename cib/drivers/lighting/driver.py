@@ -197,7 +197,21 @@ class LightingControllerDriver:
         command and move on -- either fast via profiles (once trust is
         established) or via the always-reliable per-channel path, never a
         per-call guess about whether a missing response means success or
-        failure. Leaves the light OFF when it's done either way.
+        failure.
+
+        On a CONFIRMED success, leaves the light ON and records that in
+        self._backlight_on/_channels_on (2026-09-14 fix -- this check
+        loads PROFILE_ON to test it, which genuinely turns the light on;
+        turning it back off here unconditionally, only for _startup() to
+        call set_backlight(True) a few lines later regardless, produced a
+        visible on-off-on blip at every launch with no purpose -- reported
+        live, "why can't we just turn it on once and let it stay." The
+        immediate set_backlight(True) call now sees _backlight_on already
+        True and no-ops (see its "already in that state" guard), so the
+        light only ever transitions once: off -> on. Only turned back off
+        in the not-confirmed paths below, where the physical state after a
+        failed/inconclusive LOAD:PROFILE genuinely is uncertain and the
+        conservative choice still applies.
         """
         self._profiles_confirmed = False
         try:
@@ -212,9 +226,17 @@ class LightingControllerDriver:
                          "setup once. Using slower per-channel commands for "
                          "backlight this session.",
                 )
+                for ch in CHANNELS:
+                    self._send_command(f"SET:MODE:CHANNEL{ch},0")
+                self._backlight_on = False
+                self._channels_on = set()
             elif "loaded" in resp.lower():
                 self._profiles_confirmed = True
                 log.info("lighting.backlight_profiles_confirmed")
+                # PROFILE_ON just genuinely loaded -- the light IS on right
+                # now. Record that instead of turning it back off.
+                self._backlight_on = True
+                self._channels_on = set(CHANNELS)
             else:
                 log.warning(
                     "lighting.backlight_profile_check_inconclusive", resp=resp,
@@ -222,9 +244,12 @@ class LightingControllerDriver:
                          "waiting — using slower per-channel commands for "
                          "backlight this session.",
                 )
+                for ch in CHANNELS:
+                    self._send_command(f"SET:MODE:CHANNEL{ch},0")
+                self._backlight_on = False
+                self._channels_on = set()
         except Exception as exc:
             log.warning("lighting.backlight_profile_check_failed", error=str(exc))
-        finally:
             for ch in CHANNELS:
                 self._send_command(f"SET:MODE:CHANNEL{ch},0")
             self._backlight_on = False
