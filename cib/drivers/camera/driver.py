@@ -49,8 +49,21 @@ CAMERA_DISCOVER_TIMEOUT_S = 15.0
 # immediately after start_stream with no settle time — different use case.)
 WARMUP_FRAMES = 0
 # arena_api buffer timeout in milliseconds.
-# USB-Ethernet adapters are slower than native NICs. 60s gives margin.
-BUFFER_TIMEOUT_MS = 60_000
+# Was 60_000 -- the "SUSPECT, not confirmed" 2026-08-22 stall theory below
+# (get_buffer() hanging until this timeout, freezing the cycle task while
+# background safety/PLC/keepalive loops kept running fine) was CONFIRMED
+# on real hardware 2026-09-14: eoa_capture_no_backlight logged a
+# 41.442s cycle.step_timing with nothing else in the log for that whole
+# window except the unrelated background loops -- consistent with
+# get_buffer() sitting most of the way to a 60s timeout with no frame
+# ever arriving. Dropped to 8s: still well above the documented normal
+# worst case (get_buffer() blocking 1-2s under USB-adapter bandwidth
+# contention, see the frame-rate-cap comment above), but turns a
+# near-minute silent freeze into a fast, visible fault that the existing
+# cycle exception handler (full traceback + fault recovery) already
+# handles correctly -- no new recovery path needed, just failing fast
+# enough to reach it.
+BUFFER_TIMEOUT_MS = 8_000
 # How many times to retry start_stream before giving up.
 # ASIX USB-Ethernet adapters need 6-8 attempts for TestPacketSize to
 # eventually pass. 15 retries gives solid margin.
