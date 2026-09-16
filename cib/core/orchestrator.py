@@ -1132,7 +1132,13 @@ class Orchestrator:
                 # request) -- after any pending specimen was delivered
                 # above and the arm is parked.
                 await self._reset_pipette_motor(d)
-                await d.plc.set_status_light(StatusLight.AMBER)
+                # GREEN, not AMBER (2026-09-16, operator request): this is
+                # the final resting state once ABORT has fully finished --
+                # same "clean, ready, no error" meaning as AllDevicesReadyEvent's
+                # own GREEN, just reached via a different path. AMBER now
+                # means only "currently stopping" (see the transient AMBER
+                # set right when cycle_stop() fires, above).
+                await d.plc.set_status_light(StatusLight.GREEN)
                 await d.plc.set_work_light(True)
                 await self._close_run(RunStatus.ABORTED)
                 log.info("orchestrator.backlight_off")
@@ -1344,6 +1350,15 @@ class Orchestrator:
                 # red_chase status light during a completely normal
                 # shutdown).
                 self._shutting_down = True
+                # Blinking white for the whole shutdown sequence (2026-09-16,
+                # operator request) -- visible, distinct "shutting down, not
+                # a fault" signal for however long the rest of this handler
+                # takes. Best-effort: a failed status light write must never
+                # block shutdown itself.
+                try:
+                    await d.plc.set_status_light(StatusLight.WHITE_FLASH)
+                except Exception as exc:
+                    log.warning("orchestrator.shutdown_status_light_error", error=str(exc))
                 # Backlight off FIRST, before anything else in this handler
                 # that could raise (2026-08-31, operator request: "however
                 # the program closes... ensure the backlight is turned off
@@ -1440,6 +1455,12 @@ class Orchestrator:
                             self._robot_remote_connected = False
                     except Exception as exc:
                         log.warning("orchestrator.shutdown_robot_remote_error", error=str(exc))
+                # Sequence done -- stop blinking white, all off. Best-effort,
+                # same as the WHITE_FLASH set at the top of this handler.
+                try:
+                    await d.plc.set_status_light(StatusLight.OFF)
+                except Exception as exc:
+                    log.warning("orchestrator.shutdown_status_light_error", error=str(exc))
                 # Stop all loops — _event_loop exits after _handle_event returns,
                 # poll loops exit on next iteration (within 100ms).
                 self._running = False
@@ -1514,7 +1535,12 @@ class Orchestrator:
         # plunger is at/near the dispense stop; EX G3 handles that fine
         # (it's why RESET_PIPETTE calls MotorHome, not MotorDrop).
         await self._reset_pipette_motor(d)
-        await d.plc.set_status_light(StatusLight.AMBER)
+        # GREEN, not AMBER (2026-09-16, operator request) -- see the same
+        # note in OperatorAbortEvent's handler. _finish_stop() is only ever
+        # reached via a deliberate operator STOP or a graceful RUNNING
+        # abort, never an error path, so "stopped cleanly, ready again" is
+        # always the right meaning here.
+        await d.plc.set_status_light(StatusLight.GREEN)
         await d.plc.set_work_light(True)
         log.info("orchestrator.stopped")
         if self._abort_after_cycle:
@@ -3003,7 +3029,11 @@ class Orchestrator:
                         await d.lighting.set_backlight(True)
                     except Exception:
                         pass
-                    await d.plc.set_status_light(StatusLight.AMBER)
+                    # GREEN, not AMBER (2026-09-16) -- same "clean, ready,
+                    # no error" resting state as _finish_stop()/ABORT's own
+                    # GREEN, reached here via a self-healed reconnect
+                    # instead of an operator action.
+                    await d.plc.set_status_light(StatusLight.GREEN)
                     await d.plc.set_work_light(True)
                     log.info(
                         "cycle.self_healed_after_remote_restart",

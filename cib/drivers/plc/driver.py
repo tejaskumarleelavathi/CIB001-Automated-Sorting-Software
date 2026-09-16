@@ -71,22 +71,24 @@ _MODE = {
 }
 
 # Status-light colour → (mode, primary_color, primary_intensity, secondary_color, anim_speed)
-# GREEN     = steady green   — idle/ready, or e-stop/curtain just cleared
-# RUNNING   = chasing green  — actively running
-# AMBER     = steady amber   — cycle stopped / aborted, awaiting operator
-# RED       = steady red     — e-stop active
-# RED_FLASH = flashing red   — light curtain tripped (protective stop)
-# RED_CHASE = chasing red    — connection lost / unrecoverable fault
-# OFF       = all off
+# GREEN       = steady green   — idle/ready, or e-stop/curtain just cleared
+# RUNNING     = chasing green  — actively running
+# AMBER       = steady amber   — cycle currently stopping (transient, mid-shutdown-of-cycle)
+# RED         = steady red     — e-stop active
+# RED_FLASH   = flashing red   — light curtain tripped (protective stop)
+# RED_CHASE   = chasing red    — connection lost / unrecoverable fault
+# WHITE_FLASH = flashing white — operator shutdown in progress
+# OFF         = all off
 _LIGHT_CONFIG: dict[str, tuple[int, int, int, int, int]] = {
-    #               mode              pri_col  pri_int  sec_col  speed
-    "green":     (_MODE["steady"], _COLOR["green"], 0, _COLOR["green"], 1),
-    "running":   (_MODE["chase"],  _COLOR["green"], 0, _COLOR["green"], 1),
-    "amber":     (_MODE["steady"], _COLOR["amber"], 0, _COLOR["amber"], 1),
-    "red":       (_MODE["steady"], _COLOR["red"],   0, _COLOR["red"],   1),
-    "red_flash": (_MODE["flash"],  _COLOR["red"],   0, _COLOR["red"],   1),
-    "red_chase": (_MODE["chase"],  _COLOR["red"],   0, _COLOR["red"],   1),
-    "off":       (_MODE["off"],    _COLOR["green"], 4, _COLOR["green"], 1),
+    #                mode              pri_col   pri_int  sec_col   speed
+    "green":       (_MODE["steady"], _COLOR["green"], 0, _COLOR["green"], 1),
+    "running":     (_MODE["chase"],  _COLOR["green"], 0, _COLOR["green"], 1),
+    "amber":       (_MODE["steady"], _COLOR["amber"], 0, _COLOR["amber"], 1),
+    "red":         (_MODE["steady"], _COLOR["red"],   0, _COLOR["red"],   1),
+    "red_flash":   (_MODE["flash"],  _COLOR["red"],   0, _COLOR["red"],   1),
+    "red_chase":   (_MODE["chase"],  _COLOR["red"],   0, _COLOR["red"],   1),
+    "white_flash": (_MODE["flash"],  _COLOR["white"], 0, _COLOR["white"], 1),
+    "off":         (_MODE["off"],    _COLOR["green"], 4, _COLOR["green"], 1),
 }
 
 

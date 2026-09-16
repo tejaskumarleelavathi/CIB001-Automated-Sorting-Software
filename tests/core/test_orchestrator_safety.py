@@ -721,7 +721,9 @@ class TestRemoteEthernetRecovery:
         # same philosophy as e-stop/light-curtain recovery: a fresh operator
         # START is still required before picking resumes.
         assert orch.state == State.IDLE
-        assert orch._drivers.plc.status_light == StatusLight.AMBER
+        # GREEN, not AMBER (2026-09-16) -- this is a clean "ready again, no
+        # error" resting state, same as _finish_stop()/ABORT's own GREEN.
+        assert orch._drivers.plc.status_light == StatusLight.GREEN
 
     async def test_cycle_error_without_remote_ethernet_goes_to_fault(
         self, orch: Orchestrator,

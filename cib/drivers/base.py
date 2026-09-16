@@ -191,13 +191,14 @@ class SafetyDriver(Protocol):
 # ---------------------------------------------------------------------------
 
 class StatusLight:
-    GREEN     = "green"       # steady green  — idle/ready, or e-stop/curtain just cleared
-    RUNNING   = "running"     # chasing green — actively running
-    AMBER     = "amber"       # steady amber  — cycle stopped / aborted, awaiting operator
-    RED       = "red"         # steady red    — e-stop active
-    RED_FLASH = "red_flash"   # flashing red  — light curtain tripped (protective stop)
-    RED_CHASE = "red_chase"   # chasing red   — connection lost / unrecoverable fault
-    OFF       = "off"
+    GREEN       = "green"       # steady green   — idle/ready, or e-stop/curtain just cleared
+    RUNNING     = "running"     # chasing green  — actively running
+    AMBER       = "amber"       # steady amber   — cycle currently stopping (transient, mid-shutdown-of-cycle)
+    RED         = "red"         # steady red     — e-stop active
+    RED_FLASH   = "red_flash"   # flashing red   — light curtain tripped (protective stop)
+    RED_CHASE   = "red_chase"   # chasing red    — connection lost / unrecoverable fault
+    WHITE_FLASH = "white_flash" # flashing white — operator shutdown in progress (2026-09-16)
+    OFF         = "off"
 
 
 @runtime_checkable
