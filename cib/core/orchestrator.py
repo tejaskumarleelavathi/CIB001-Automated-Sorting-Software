@@ -143,6 +143,18 @@ ROBOT_ERROR_MARKERS = (
 # past this, give up and home normally rather than stall the cycle.
 LOOKAHEAD_TIMEOUT_S = 3.0
 
+# A centroid gets this many real pick attempts (across separate overhead
+# captures) before being permanently excluded for the rest of the run
+# (2026-09-14, operator request: a blob that's still sitting there after
+# one attempt may just have been missed/rejected once, not genuinely
+# unpickable — give it one more try before giving up on it). Does NOT
+# apply within a single overhead capture's own EoA-reject retry loop
+# (_select_next_target() reusing the same all_centroids list) -- a
+# candidate just rejected in THIS capture must never be re-selected
+# again in the same capture regardless of this count, or the retry loop
+# would just pick the same rejected spot straight back.
+MAX_ATTEMPTS_PER_CENTROID = 2
+
 # Fine correction applied to the vision-computed PICK target only (2026-08-19,
 # see DEV-15 in prd_updated.md) — deliberately NOT in TLSet 2 (sort_server.prg)
 # and NOT in the plate config, after those approaches spent a full session
@@ -257,9 +269,16 @@ class Orchestrator:
         self._force_sample_detection = force_sample_detection
         # VIEW flag: show image popups for 3s during testing.
         self._view = view
-        # Visited centroids — cleared at start of each run.
-        # Prevents re-trying positions EoA already rejected in this run.
-        self._visited_centroids: set[tuple[float, float]] = set()
+        # Visited centroids — cleared at start of each run. Each entry is
+        # {"x", "y", "count", "generation"}: count = how many real pick
+        # attempts this spot has had (across separate overhead captures);
+        # generation = the _overhead_capture_generation value at its last
+        # attempt, used to keep a same-capture EoA-reject retry from ever
+        # re-selecting the candidate it just rejected while still allowing
+        # a genuinely later capture to give it a second try (see
+        # MAX_ATTEMPTS_PER_CENTROID above).
+        self._visited_entries: list[dict] = []
+        self._overhead_capture_generation: int = 0
         self._centroid_snap_mm = centroid_snap_mm
         # Set to True only after _startup() posts AllDevicesReadyEvent.
         # Prevents the keepalive loop from firing while sort_server.prg is
@@ -914,7 +933,8 @@ class Orchestrator:
             case OperatorStartEvent():
                 if sm.is_safe_to_start():
                     sm.start()
-                    self._visited_centroids.clear()   # fresh run — reset visited set
+                    self._visited_entries.clear()   # fresh run — reset visited set
+                    self._overhead_capture_generation = 0
                     await self._ensure_run_open()
                     await d.plc.set_status_light(StatusLight.RUNNING)
                     await d.plc.set_work_light(False)
@@ -2204,6 +2224,13 @@ class Orchestrator:
             )
 
         # ── Select target: bottom-left first ─────────────────────────
+        # New capture generation as of THIS overhead frame -- see
+        # _is_visited()/MAX_ATTEMPTS_PER_CENTROID: a candidate visited in an
+        # earlier generation becomes eligible again here (its one extra
+        # chance), while the EoA-reject retry loop below keeps reusing this
+        # same generation so it never re-selects a candidate it just
+        # rejected out of this exact all_centroids list.
+        self._overhead_capture_generation += 1
         all_centroids = overhead_result.centroids_robot_xy
         target = self._select_next_target(all_centroids)
         if target is None:
@@ -2975,23 +3002,44 @@ class Orchestrator:
     # Centroid selection helpers
     # ------------------------------------------------------------------
 
-    def _is_visited(self, centroid: tuple[float, float]) -> bool:
-        """
-        Return True if this centroid is within centroid_snap_mm of any
-        previously attempted centroid (Euclidean distance check).
-        """
+    def _find_visited_entry(self, centroid: tuple[float, float]) -> dict | None:
+        """Entry within centroid_snap_mm of `centroid`, or None (Euclidean distance check)."""
         cx, cy = centroid
         r2 = self._centroid_snap_mm ** 2
-        return any(
-            (cx - vx) ** 2 + (cy - vy) ** 2 <= r2
-            for vx, vy in self._visited_centroids
-        )
+        for entry in self._visited_entries:
+            if (cx - entry["x"]) ** 2 + (cy - entry["y"]) ** 2 <= r2:
+                return entry
+        return None
+
+    def _is_visited(self, centroid: tuple[float, float]) -> bool:
+        """
+        Return True if `centroid` must be skipped by _select_next_target():
+        either it's permanently excluded (MAX_ATTEMPTS_PER_CENTROID real
+        attempts already used across separate overhead captures), or it was
+        already selected during THIS SAME overhead capture (must never be
+        picked twice out of one all_centroids list, regardless of its
+        attempt count — that's what keeps the EoA-reject retry loop from
+        immediately re-selecting the candidate it just rejected).
+        """
+        entry = self._find_visited_entry(centroid)
+        if entry is None:
+            return False
+        if entry["count"] >= MAX_ATTEMPTS_PER_CENTROID:
+            return True
+        return entry["generation"] == self._overhead_capture_generation
 
     def _mark_visited(self, x: float, y: float) -> None:
-        """Record a centroid as visited for this run (stores actual coords, not snapped)."""
-        self._visited_centroids.add((float(x), float(y)))
+        """Record one real pick attempt at this centroid for this run."""
+        entry = self._find_visited_entry((x, y))
+        if entry is None:
+            entry = {"x": float(x), "y": float(y), "count": 0, "generation": -1}
+            self._visited_entries.append(entry)
+        entry["count"] += 1
+        entry["generation"] = self._overhead_capture_generation
         log.debug("cycle.centroid_marked_visited", x=x, y=y,
-                  total_visited=len(self._visited_centroids))
+                  attempts=entry["count"],
+                  permanently_excluded=entry["count"] >= MAX_ATTEMPTS_PER_CENTROID,
+                  total_tracked=len(self._visited_entries))
 
     def _run_vision_overhead(self, frame: Any) -> VisionOverheadResultEvent:
         """Runs in thread pool — import here to keep vision isolated.
