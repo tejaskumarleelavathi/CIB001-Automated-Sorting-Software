@@ -74,21 +74,31 @@ CHANNELS       = [1, 2, 3]    # DCS-100E has 3 channels — all used for backlig
 # set_backlight(False)'s own confirmation at shutdown -- reported live,
 # the light was still visibly on after "shutdown" completed.
 # 1.0 -> 2.5 (2026-09-16, same day, follow-up real-hardware finding):
-# 1.0 still wasn't enough margin. A full connect-time log was traced
-# command-by-command and showed EVERY response -- not just ones from a
-# genuine on->off state change, "already off" trivial acks too -- lands
-# ~1.2-1.3s after its own command, consistently. That's not occasional
-# jitter, it looks like a near-fixed round-trip characteristic of this
-# specific unit, and it chains: each read was actually capturing the
-# PREVIOUS command's response (one full cycle late), which then fed
-# straight into the NEXT command's own read being one cycle late too,
-# corrupting several commands in a row from a single initial near-miss.
-# recv() only blocks up to this timeout waiting for data that hasn't
-# arrived yet, so raising it has no cost for the common case, only for a
-# response that's actually this slow (or genuinely never coming) -- 2.5s
-# gives real margin above the ~1.2-1.3s observed worst case rather than
-# sitting right on top of it.
-RECV_TIMEOUT_S = 2.5
+# 1.0 still wasn't enough margin at connect time. A full connect-time
+# log was traced command-by-command and showed EVERY response -- not
+# just ones from a genuine on->off state change, "already off" trivial
+# acks too -- lands ~1.2-1.3s after its own command, consistently.
+#
+# 2.5 -> 1.5 (2026-09-16, same day, dialed back down): this constant
+# isn't only paid at connect (a one-time cost) -- _send_batch_verified()'s
+# retry loop uses it on every regular per-cycle set_backlight() call
+# too, and "raising it has no cost for the common case" turned out to
+# be wrong for THIS device specifically: since most of its responses
+# genuinely do land close to the ~1.2-1.3s mark rather than instantly,
+# a larger timeout means the retry path (whenever it's taken) waits
+# that much longer for real, expected data -- confirmed live, a mid-run
+# cycle's eoa_capture_no_backlight step went from ~5s to 11s+ the
+# moment its backlight-off call took the retry path (SEND_RETRIES=2 x
+# 2.5s), and the operator stopped the run watching it sit on the
+# following step. 1.5s keeps real margin above the observed ~1.2-1.3s
+# latency (so a genuinely-slow-but-real response still gets caught,
+# same reasoning as the 1.0->2.5 change above) while capping the
+# worst-case 2-retry cost at 3.0s instead of 5.0s -- connect-time
+# reliability now mostly comes from batching fewer round trips (see
+# _connect_sync()) and the explicit verify-off/verify-on checks, not
+# from this timeout alone, so it no longer needs to carry that whole
+# burden by itself.
+RECV_TIMEOUT_S = 1.5
 RECV_BUF       = 4096
 SEND_RETRIES   = 2             # resend once if not all channels confirmed --
                                 # SET:MODE is idempotent, so a retry is safe
