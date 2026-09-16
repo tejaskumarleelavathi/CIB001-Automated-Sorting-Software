@@ -22,6 +22,43 @@ from pathlib import Path
 
 from cib.logging_setup import configure as configure_logging
 
+
+def _wait_for_network_selfheal(timeout_s: float = 45.0) -> None:
+    """
+    HMI only (see main()'s USE_MOCKS gate below). Blocks until the boot-time
+    network self-heal task (network_selfheal_boot.ps1, installed 2026-09-14)
+    signals it has finished fixing NetworkCategory/DHCP/IPs after a fresh
+    boot, or until timeout_s elapses.
+
+    Confirmed root cause of a real 41s EoA camera stream stall on
+    2026-09-14: self-heal's Set-NetConnectionProfile call landed exactly
+    inside the camera's frame-capture window right after a reboot,
+    disrupting in-flight GVSP packets for the ~70MB EoA frame. Cameras must
+    not start streaming until that boot-time network reconfiguration is
+    done. Gives up and proceeds anyway after timeout_s (logging a warning)
+    rather than blocking startup forever if the scheduled task ever fails
+    to run or the flag file is missing for some other reason.
+    """
+    import time
+    import structlog
+    log = structlog.get_logger(__name__)
+    flag_path = Path("C:/LabAutomation/data/network_selfheal_boot_done.flag")
+    log.info("startup.waiting_for_network_selfheal", timeout_s=timeout_s,
+              note="waiting for the boot-time network fixup to finish before touching hardware")
+    deadline = time.monotonic() + timeout_s
+    last_progress = time.monotonic()
+    while time.monotonic() < deadline:
+        if flag_path.exists():
+            log.info("startup.network_selfheal_confirmed_done")
+            return
+        if time.monotonic() - last_progress >= 10.0:
+            log.info("startup.still_waiting_for_network_selfheal",
+                      seconds_remaining=round(deadline - time.monotonic()))
+            last_progress = time.monotonic()
+        time.sleep(1.0)
+    log.warning("startup.network_selfheal_wait_timed_out", timeout_s=timeout_s,
+                note="proceeding without confirmation -- self-heal task may not have run")
+
 # ── Mode flags ────────────────────────────────────────────────────────────────
 USE_MOCKS = True       # True = laptop dev | False = HMI prod
 
@@ -236,6 +273,9 @@ def main() -> None:
         else Path("C:/LabAutomation/data/logs")
     )
     configure_logging(log_dir=log_dir)
+
+    if not USE_MOCKS:
+        _wait_for_network_selfheal()
 
     cfg = _load_config()
     drivers = build_drivers(
