@@ -64,7 +64,20 @@ CHANNELS       = [1, 2, 3]    # DCS-100E has 3 channels — all used for backlig
 # drain instead, silently). hardware_tests/test_lighting_profiles.py had
 # already found 30-50ms necessary for this same class of batched command --
 # the production driver's 10ms predates that finding.
-RECV_TIMEOUT_S = 0.05
+# 0.05 -> 1.0 (2026-09-16, real-hardware finding): still not enough. A
+# real ack (genuinely turning a channel that was ON off) was confirmed
+# straggling in 700ms+ after its own command -- most visibly at connect
+# time (see _connect_sync()'s per-channel-off loop, whose straggler then
+# corrupted _verify_backlight_profiles_sync()'s LOAD:PROFILE read right
+# after it, permanently falling back to the slow per-channel path for
+# the whole session), but the same slow-ack pattern also starved
+# set_backlight(False)'s own confirmation at shutdown -- reported live,
+# the light was still visibly on after "shutdown" completed. recv() only
+# blocks up to this timeout waiting for data that hasn't arrived yet, so
+# a fast response is read immediately regardless -- raising this has no
+# cost for the common case, only for a response that's actually this
+# slow (or genuinely never coming).
+RECV_TIMEOUT_S = 1.0
 RECV_BUF       = 4096
 SEND_RETRIES   = 2             # resend once if not all channels confirmed --
                                 # SET:MODE is idempotent, so a retry is safe
@@ -152,24 +165,6 @@ class LightingControllerDriver:
                 for ch in CHANNELS:
                     self._send_command(f"SET:LEVEL:CHANNEL{ch},{self._current_ma}")
                     self._send_command(f"SET:MODE:CHANNEL{ch},0")
-                # Settle + extra flush before anything else touches this
-                # socket (2026-09-16, real-hardware finding: reported live,
-                # "this usually happens when the light was already turned
-                # on"). If a channel was genuinely ON, turning it off is
-                # real device-side work -- its acknowledgment can straggle
-                # in well past _flush_stale()'s normal 20ms drain window
-                # (see that method's own docstring for the general version
-                # of this race). Landing during _verify_backlight_profiles_
-                # sync()'s LOAD:PROFILE read right after this loop, it reads
-                # as neither "loaded" nor "not set" -- profiles get marked
-                # unconfirmed for the whole session, and every backlight
-                # toggle afterward falls back to the slow, visibly-
-                # staggering per-channel path this was meant to avoid.
-                # Already-off channels ack near-instantly and never hit
-                # this window, which is exactly why the bug was
-                # intermittent and state-dependent rather than constant.
-                time.sleep(0.3)
-                self._flush_stale()
                 self._backlight_on = False
                 self._channels_on = set()
                 break   # success
@@ -312,21 +307,17 @@ class LightingControllerDriver:
             # SET:MODE:CHANNELx (2026-08-31 — see module docstring).
             slot = BACKLIGHT_PROFILE_ON if on else BACKLIGHT_PROFILE_OFF
             self._send_batch([f"LOAD:PROFILE,{slot}"])
+            confirmed = True   # OFF isn't verified (see below) -- treated as trusted
             if on:
                 # Verify for real on ON specifically (2026-08-31,
                 # real-hardware finding): TCP only guarantees the bytes
                 # reached the device -- it does NOT guarantee the device's
-                # own command parser actually executed them. Confirmed
-                # live: the connect-time check succeeding once does not
-                # mean every later send also lands -- a send can succeed
-                # at the socket level with zero error while the device
-                # silently never applies it, and without this check
-                # self._backlight_on would still get set True, permanently
-                # hiding the failure (the very next ON call would see
-                # "already on" and skip sending anything at all). OFF
-                # isn't verified -- a delayed/failed OFF just means
-                # slightly more stray light for one frame, not a missed
-                # detection, so it stays fast/fire-and-forget.
+                # own command parser actually executed them. OFF isn't
+                # verified -- a delayed/failed OFF just means slightly more
+                # stray light for one frame, not a missed detection, so it
+                # stays fast/fire-and-forget (except at shutdown, which
+                # gives it a real settle window afterward instead -- see
+                # _disconnect_sync()).
                 if not self._verify_backlight_on_sync():
                     log.warning(
                         "lighting.backlight_profile_on_not_confirmed",
@@ -355,9 +346,21 @@ class LightingControllerDriver:
                          "state may not match. Check backlight visually if this repeats.",
                 )
 
-        self._backlight_on = on
-        self._channels_on = set(CHANNELS) if on else set()
-        log.debug("lighting.backlight", on=on,
+        # Only trust the target state once actually confirmed (2026-09-16,
+        # real-hardware finding: this used to update unconditionally --
+        # after a failed confirmation, self._backlight_on silently believed
+        # the command had succeeded, so the NEXT call for that same target
+        # state would see "already there" and skip sending anything at all,
+        # permanently masking the failure for the rest of the session).
+        # None (not a stale True/False) forces the next call to actually
+        # retry regardless of which target state it asks for, since
+        # `on == self._backlight_on` can never match None.
+        if confirmed:
+            self._backlight_on = on
+            self._channels_on = set(CHANNELS) if on else set()
+        else:
+            self._backlight_on = None
+        log.debug("lighting.backlight", on=on, confirmed=confirmed,
                   method="profile" if self._profiles_confirmed else "per_channel")
 
     def _verify_backlight_on_sync(self, timeout_s: float = 1.5) -> bool:
