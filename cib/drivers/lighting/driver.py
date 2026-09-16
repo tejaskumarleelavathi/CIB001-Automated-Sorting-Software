@@ -171,11 +171,25 @@ class LightingControllerDriver:
                 # TCP handshake succeeded — RST from here on is during data exchange
                 reset_stage = "init_commands"
                 self._sock = sock
-                # Set current and turn OFF each channel individually,
-                # draining each response so the buffer stays clean.
-                for ch in CHANNELS:
-                    self._send_command(f"SET:LEVEL:CHANNEL{ch},{self._current_ma}")
-                    self._send_command(f"SET:MODE:CHANNEL{ch},0")
+                # Set current and turn OFF each channel -- ONE batched send
+                # for all 6 commands, not 6 separate sequential round trips
+                # (2026-09-16, real-hardware finding: 6 sequential
+                # _send_command() calls, each waiting up to RECV_TIMEOUT_S
+                # on its own, made the whole lighting connect sequence take
+                # 70+ seconds with the larger timeout -- long enough that
+                # the operator, seeing neither light turn on with no
+                # progress feedback, assumed the system had hung and hit
+                # SHUTDOWN mid-startup, which then raced the still-running
+                # connect sequence into a real crash). One batched
+                # _send_batch() call drains all the responses together in
+                # a single wait instead of paying the timeout once per
+                # command -- correctness is unaffected, since
+                # _verify_backlight_off_sync() right after this is what
+                # actually confirms the result either way.
+                self._send_batch(
+                    [f"SET:LEVEL:CHANNEL{ch},{self._current_ma}" for ch in CHANNELS]
+                    + [f"SET:MODE:CHANNEL{ch},0" for ch in CHANNELS]
+                )
                 # Actively confirm truly off before anything else touches
                 # this socket (2026-09-16, operator request: "if it's
                 # already on, turn it off, flush/reset, THEN turn on -- if
@@ -183,15 +197,14 @@ class LightingControllerDriver:
                 # state the device was left in from a previous session
                 # (crash, or the operator's own prior on/off toggling),
                 # connect() now always starts from a verified-clean OFF
-                # instead of assuming the fire-and-forget loop above landed.
+                # instead of assuming the fire-and-forget batch above landed.
                 if not self._verify_backlight_off_sync():
                     log.warning(
                         "lighting.connect_off_not_confirmed",
                         note="Channel-off not confirmed via *CHANNEL:CONFIGS? after "
                              "connect -- retrying once before continuing.",
                     )
-                    for ch in CHANNELS:
-                        self._send_command(f"SET:MODE:CHANNEL{ch},0")
+                    self._send_batch([f"SET:MODE:CHANNEL{ch},0" for ch in CHANNELS])
                     if not self._verify_backlight_off_sync():
                         log.warning(
                             "lighting.connect_off_not_confirmed_after_retry",

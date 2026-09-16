@@ -1350,6 +1350,37 @@ class Orchestrator:
                 # red_chase status light during a completely normal
                 # shutdown).
                 self._shutting_down = True
+                # Wait for an in-progress startup to actually finish before
+                # touching any hardware (2026-09-16, real-hardware finding):
+                # _startup() and this event handler run as independent
+                # concurrent tasks in the same TaskGroup (see run()) -- a
+                # slow startup (lighting connect taking a long time) with no
+                # progress feedback led an operator to hit SHUTDOWN mid-
+                # sequence, and shutdown's own teardown then raced
+                # _startup()'s still-running one on the same driver
+                # instances (both touching the lighting connection at once),
+                # crashing the whole TaskGroup ("Event loop stopped before
+                # Future completed"). Startup normally finishes in well
+                # under this ceiling; it's just a safety bound so a
+                # genuinely stuck startup can't block shutdown forever.
+                if not self._startup_complete:
+                    log.warning(
+                        "orchestrator.shutdown_waiting_for_startup",
+                        note="Shutdown requested before startup finished -- "
+                             "waiting for it to complete first.",
+                    )
+                    deadline = asyncio.get_event_loop().time() + 60.0
+                    while (
+                        not self._startup_complete
+                        and asyncio.get_event_loop().time() < deadline
+                    ):
+                        await asyncio.sleep(0.2)
+                    if not self._startup_complete:
+                        log.warning(
+                            "orchestrator.shutdown_startup_wait_timed_out",
+                            note="Startup still not complete after 60s -- "
+                                 "proceeding with shutdown anyway.",
+                        )
                 # Blinking white for the whole shutdown sequence (2026-09-16,
                 # operator request) -- visible, distinct "shutting down, not
                 # a fault" signal for however long the rest of this handler
