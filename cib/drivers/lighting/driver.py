@@ -152,6 +152,24 @@ class LightingControllerDriver:
                 for ch in CHANNELS:
                     self._send_command(f"SET:LEVEL:CHANNEL{ch},{self._current_ma}")
                     self._send_command(f"SET:MODE:CHANNEL{ch},0")
+                # Settle + extra flush before anything else touches this
+                # socket (2026-09-16, real-hardware finding: reported live,
+                # "this usually happens when the light was already turned
+                # on"). If a channel was genuinely ON, turning it off is
+                # real device-side work -- its acknowledgment can straggle
+                # in well past _flush_stale()'s normal 20ms drain window
+                # (see that method's own docstring for the general version
+                # of this race). Landing during _verify_backlight_profiles_
+                # sync()'s LOAD:PROFILE read right after this loop, it reads
+                # as neither "loaded" nor "not set" -- profiles get marked
+                # unconfirmed for the whole session, and every backlight
+                # toggle afterward falls back to the slow, visibly-
+                # staggering per-channel path this was meant to avoid.
+                # Already-off channels ack near-instantly and never hit
+                # this window, which is exactly why the bug was
+                # intermittent and state-dependent rather than constant.
+                time.sleep(0.3)
+                self._flush_stale()
                 self._backlight_on = False
                 self._channels_on = set()
                 break   # success
