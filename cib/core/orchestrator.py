@@ -247,6 +247,20 @@ class Orchestrator:
         self._on_event = on_event     # hook for UI to observe raw events
         self._running = False
         self._cycle_active = False          # prevents concurrent _run_cycle() tasks
+        # Set the instant OperatorShutdownEvent's handler starts, before it
+        # does anything else (2026-09-16, real-hardware finding) -- lets
+        # _robot_keepalive_tick() recognize an intentional disconnect (the
+        # shutdown handler's own d.robot.disconnect()) and stand down
+        # immediately, rather than treating it as a real fault. Previously
+        # only _recover_robot_connection() itself checked for a mid-recovery
+        # shutdown (logging "...abandoned_shutdown"), but by the time that
+        # ran the keepalive tick had already started a recovery attempt
+        # that raced the shutdown handler's own robot_remote sequence --
+        # and win or lose, the caller (_robot_keepalive_tick) treated an
+        # abandoned attempt exactly like a genuinely failed one, faulting
+        # the state machine and setting the status light red_chase during
+        # what was actually a normal, successful shutdown.
+        self._shutting_down = False
         # _robot_keepalive_tick() state (2026-08-30 idle-disconnect recovery) —
         # initialized here, not just in _robot_keepalive_loop(), so the tick
         # method works standalone (e.g. driven directly by tests).
@@ -846,6 +860,8 @@ class Orchestrator:
         tests can drive it directly without waiting on real sleeps."""
         if not self._startup_complete:
             return   # don't touch robot until HOME + ring_light_on are done
+        if self._shutting_down:
+            return   # shutdown's own disconnect isn't a fault -- see __init__ note
         try:
             await self._drivers.robot.keepalive()
         except Exception as exc:
@@ -1316,6 +1332,18 @@ class Orchestrator:
             # ---- Shutdown ----
             case OperatorShutdownEvent():
                 log.info("orchestrator.shutdown_started")
+                # Set before anything else in this handler, including
+                # backlight-off below (2026-09-16, real-hardware finding):
+                # _robot_keepalive_tick() checks this to recognize this
+                # handler's own upcoming d.robot.disconnect() as intentional
+                # rather than a real fault -- see __init__'s note on
+                # _shutting_down for the exact race this closes (previously
+                # the independent keepalive loop would notice the disconnect,
+                # race this handler's own robot_remote sequence attempting
+                # its own "recovery," and fault the state machine with a
+                # red_chase status light during a completely normal
+                # shutdown).
+                self._shutting_down = True
                 # Backlight off FIRST, before anything else in this handler
                 # that could raise (2026-08-31, operator request: "however
                 # the program closes... ensure the backlight is turned off
@@ -1329,6 +1357,19 @@ class Orchestrator:
                     await d.lighting.set_backlight(False)
                 except Exception as exc:
                     log.warning("orchestrator.shutdown_backlight_error", error=str(exc))
+                # Work light off (2026-09-16, real-hardware finding: it was
+                # never turned off on shutdown at all -- every other place
+                # that touches it turns it ON (AllDevicesReadyEvent, IDLE/
+                # AMBER restore paths); OFF only ever happened when a RUN
+                # actually started. Shutting down while idle -- the normal
+                # case -- left the physical light on indefinitely, since
+                # it's a PLC-held output that doesn't reset itself just
+                # because this process exits). Same "no matter what else
+                # fails" placement as backlight above.
+                try:
+                    await d.plc.set_work_light(False)
+                except Exception as exc:
+                    log.warning("orchestrator.shutdown_work_light_error", error=str(exc))
                 try:
                     await self._close_run(RunStatus.ABORTED)
                 except Exception as exc:
