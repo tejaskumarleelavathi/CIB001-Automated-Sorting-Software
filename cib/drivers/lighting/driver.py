@@ -79,29 +79,31 @@ CHANNELS       = [1, 2, 3]    # DCS-100E has 3 channels — all used for backlig
 # just ones from a genuine on->off state change, "already off" trivial
 # acks too -- lands ~1.2-1.3s after its own command, consistently.
 #
-# 2.5 -> 1.5 (2026-09-16, same day, dialed back down): this constant
-# isn't only paid at connect (a one-time cost) -- _send_batch_verified()'s
-# retry loop uses it on every regular per-cycle set_backlight() call
-# too, and "raising it has no cost for the common case" turned out to
-# be wrong for THIS device specifically: since most of its responses
-# genuinely do land close to the ~1.2-1.3s mark rather than instantly,
-# a larger timeout means the retry path (whenever it's taken) waits
-# that much longer for real, expected data -- confirmed live, a mid-run
-# cycle's eoa_capture_no_backlight step went from ~5s to 11s+ the
-# moment its backlight-off call took the retry path (SEND_RETRIES=2 x
-# 2.5s), and the operator stopped the run watching it sit on the
-# following step. 1.5s keeps real margin above the observed ~1.2-1.3s
-# latency (so a genuinely-slow-but-real response still gets caught,
-# same reasoning as the 1.0->2.5 change above) while capping the
-# worst-case 2-retry cost at 3.0s instead of 5.0s -- connect-time
-# reliability now mostly comes from batching fewer round trips (see
-# _connect_sync()) and the explicit verify-off/verify-on checks, not
-# from this timeout alone, so it no longer needs to carry that whole
-# burden by itself.
+# 2.5 -> 1.5, same day: tried to split the difference, but the real
+# problem wasn't the exact number -- it was architectural. _send_batch()'s
+# drain loop always blocks for the FULL RECV_TIMEOUT_S on every call, even
+# when the response arrives instantly (it only exits via a read timeout,
+# never early), and the per-cycle backlight path was routing every single
+# toggle through it plus a read-back verify + retry. So every regular
+# set_backlight() call during a run was paying this constant at least
+# once, sometimes 2-4 times (LOAD:PROFILE + verify read + retry). No
+# single value of RECV_TIMEOUT_S fixes that -- confirmed live again, a
+# mid-run cycle's eoa_capture_no_backlight step still ballooned from ~5s
+# to 11s+ this same day.
+#
+# Fix (2026-09-16, operator instruction: "only when we start the system
+# does it need to check/flush -- I don't want it waiting every time"):
+# removed verification and retry from the hot path entirely.
+# _set_backlight_sync/_set_backlight_channels_sync now use
+# _send_fire_and_forget() -- one TCP write, no read-back, no wait -- for
+# every regular per-cycle call. RECV_TIMEOUT_S (and the old
+# _send_batch_verified retry loop it belonged to, now removed along with
+# SEND_RETRIES) is used ONLY by the one-time connect() sequence
+# (_verify_backlight_off_sync, _verify_backlight_profiles_sync) where a
+# multi-second check is a cost worth paying once per session, never per
+# cycle.
 RECV_TIMEOUT_S = 1.5
 RECV_BUF       = 4096
-SEND_RETRIES   = 2             # resend once if not all channels confirmed --
-                                # SET:MODE is idempotent, so a retry is safe
 
 # Profile slots used by set_backlight() (2026-08-31) -- must match what
 # hardware_tests/test_lighting_profiles.py setup saved on this physical
@@ -355,6 +357,18 @@ class LightingControllerDriver:
         await loop.run_in_executor(None, self._set_backlight_sync, on)
 
     def _set_backlight_sync(self, on: bool) -> None:
+        """
+        Per-cycle hot path (2026-09-16, operator instruction: "only when we
+        start the system does it need to check/flush -- I don't want it
+        waiting every time"). Fire-and-forget: send the command and trust
+        it, no read-back confirmation, no retry. Confirmation only happens
+        once, at connect() time (_verify_backlight_off_sync /
+        _verify_backlight_profiles_sync) -- everything after that is
+        assumed good until the next connect(). This trades per-call
+        certainty for speed on the path that runs every cycle; the
+        one-time connect check is what used to (and still does) catch a
+        genuinely misbehaving unit.
+        """
         if on == self._backlight_on:
             return  # already in the right state — no send, no wait
 
@@ -362,81 +376,22 @@ class LightingControllerDriver:
             # Single atomic command instead of 3 sequential
             # SET:MODE:CHANNELx (2026-08-31 — see module docstring).
             slot = BACKLIGHT_PROFILE_ON if on else BACKLIGHT_PROFILE_OFF
-            self._send_batch([f"LOAD:PROFILE,{slot}"])
-            confirmed = True   # OFF isn't verified (see below) -- treated as trusted
-            if on:
-                # Verify for real on ON specifically (2026-08-31,
-                # real-hardware finding): TCP only guarantees the bytes
-                # reached the device -- it does NOT guarantee the device's
-                # own command parser actually executed them. OFF isn't
-                # verified -- a delayed/failed OFF just means slightly more
-                # stray light for one frame, not a missed detection, so it
-                # stays fast/fire-and-forget (except at shutdown, which
-                # gives it a real settle window afterward instead -- see
-                # _disconnect_sync()).
-                if not self._verify_backlight_on_sync():
-                    log.warning(
-                        "lighting.backlight_profile_on_not_confirmed",
-                        note="LOAD:PROFILE ON not confirmed via *CHANNEL:CONFIGS? -- "
-                             "falling back to per-channel commands for this call.",
-                    )
-                    confirmed = self._send_batch_verified(
-                        [f"SET:MODE:CHANNEL{ch},1" for ch in CHANNELS], expected=len(CHANNELS),
-                    )
-                    if not confirmed:
-                        log.warning(
-                            "lighting.backlight_not_fully_confirmed", on=on,
-                            note="Not all 3 channels confirmed even after a retry — "
-                                 "physical state may not match. Check backlight "
-                                 "visually if this repeats.",
-                        )
+            self._send_fire_and_forget([f"LOAD:PROFILE,{slot}"])
         else:
             mode = 1 if on else 0
-            confirmed = self._send_batch_verified(
-                [f"SET:MODE:CHANNEL{ch},{mode}" for ch in CHANNELS], expected=len(CHANNELS),
+            self._send_fire_and_forget(
+                [f"SET:MODE:CHANNEL{ch},{mode}" for ch in CHANNELS]
             )
-            if not confirmed:
-                log.warning(
-                    "lighting.backlight_not_fully_confirmed", on=on,
-                    note="Not all 3 channels confirmed even after a retry — physical "
-                         "state may not match. Check backlight visually if this repeats.",
-                )
 
-        # Only trust the target state once actually confirmed (2026-09-16,
-        # real-hardware finding: this used to update unconditionally --
-        # after a failed confirmation, self._backlight_on silently believed
-        # the command had succeeded, so the NEXT call for that same target
-        # state would see "already there" and skip sending anything at all,
-        # permanently masking the failure for the rest of the session).
-        # None (not a stale True/False) forces the next call to actually
-        # retry regardless of which target state it asks for, since
-        # `on == self._backlight_on` can never match None.
-        if confirmed:
-            self._backlight_on = on
-            self._channels_on = set(CHANNELS) if on else set()
-        else:
-            self._backlight_on = None
-        log.debug("lighting.backlight", on=on, confirmed=confirmed,
+        self._backlight_on = on
+        self._channels_on = set(CHANNELS) if on else set()
+        log.debug("lighting.backlight", on=on,
                   method="profile" if self._profiles_confirmed else "per_channel")
-
-    def _verify_backlight_on_sync(self, timeout_s: float = 2.5) -> bool:
-        """
-        Read back *CHANNEL:CONFIGS? and confirm at least one channel
-        actually reports mode="1" -- real proof the device applied the
-        command, not just that we sent it. Polls up to timeout_s if the
-        response doesn't arrive immediately (this device's replies can lag
-        by ~1.2-1.3s even for trivial commands -- see RECV_TIMEOUT_S).
-        """
-        resp = self._send_batch(["*CHANNEL:CONFIGS?"])
-        if 'mode="1"' not in resp:
-            resp = self._poll_for_response(timeout_s=timeout_s)
-        return 'mode="1"' in resp
 
     def _verify_backlight_off_sync(self, timeout_s: float = 2.5) -> bool:
         """
         Read back *CHANNEL:CONFIGS? and confirm NO channel reports
-        mode="1" -- the OFF counterpart of _verify_backlight_on_sync(),
-        used at connect time (2026-09-16, operator request: always
+        mode="1". Connect-time only (2026-09-16, operator request: always
         verify a genuinely clean off before ever turning on, regardless
         of what state the device was left in) rather than assuming the
         fire-and-forget per-channel-off loop landed.
@@ -461,17 +416,14 @@ class LightingControllerDriver:
         _set_backlight_sync, always sends (no "already in that state, skip"
         check) — partial-channel calls are infrequent enough that the extra
         round trip doesn't matter, and skipping here would be harder to
-        reason about correctly than just always sending.
+        reason about correctly than just always sending. Fire-and-forget,
+        same reasoning as _set_backlight_sync (2026-09-16) — this also runs
+        every cycle (reduced-brightness EoA frame), not just at startup.
         """
         mode = 1 if on else 0
-        confirmed = self._send_batch_verified(
-            [f"SET:MODE:CHANNEL{ch},{mode}" for ch in channels], expected=len(channels),
+        self._send_fire_and_forget(
+            [f"SET:MODE:CHANNEL{ch},{mode}" for ch in channels]
         )
-        if not confirmed:
-            log.warning(
-                "lighting.backlight_channels_not_fully_confirmed", channels=channels, on=on,
-                note="Not all requested channels confirmed even after a retry.",
-            )
         if on:
             self._channels_on.update(channels)
         else:
@@ -488,25 +440,26 @@ class LightingControllerDriver:
         """Send a single command and drain its response (fire-and-forget)."""
         self._send_batch([command])
 
-    def _send_batch_verified(self, commands: list[str], expected: int) -> bool:
+    def _send_fire_and_forget(self, commands: list[str]) -> None:
         """
-        Send `commands` and count how many "set to mode" confirmations come
-        back; if fewer than `expected`, resend once more before giving up
-        (2026-08-31, real-hardware finding — see RECV_TIMEOUT_S's comment).
-        SET:MODE is idempotent for a channel already in the requested state,
-        so a full resend is always safe, never a partial/targeted retry.
-        Returns True only once `expected` confirmations were actually seen.
+        Send `commands` in one TCP write and return immediately -- no wait
+        for a response at all (2026-09-16, operator instruction: don't wait
+        during a running cycle, only at startup). Whatever the device
+        eventually replies with sits in the socket buffer until the next
+        call's _flush_stale() drains and discards it. This is the per-cycle
+        hot path (_set_backlight_sync, _set_backlight_channels_sync); it
+        relies on connect()'s one-time verified flush/check to have already
+        proven the device is responding correctly, so nothing here re-pays
+        that cost on every toggle.
         """
-        for attempt in range(SEND_RETRIES):
-            resp = self._send_batch(commands)
-            if resp.count("set to mode") >= expected:
-                return True
-            if attempt < SEND_RETRIES - 1:
-                log.debug(
-                    "lighting.send_batch_retry", attempt=attempt + 1,
-                    confirmations=resp.count("set to mode"), expected=expected,
-                )
-        return False
+        if self._sock is None:
+            raise RuntimeError("Lighting controller not connected")
+        self._flush_stale()
+        payload = "".join(
+            cmd if cmd.endswith(";") else cmd + ";"
+            for cmd in commands
+        )
+        self._sock.sendall(payload.encode("ascii"))
 
     def _flush_stale(self) -> None:
         """
@@ -516,8 +469,8 @@ class LightingControllerDriver:
         Responses can straggle in well behind their own call's drain
         window; without this, a later call's drain can silently consume a
         prior call's leftover response instead of (or mixed in with) its
-        own, making _send_batch_verified's confirmation-counting and
-        _set_backlight_sync's "not set" profile check both unreliable.
+        own, making connect-time response reads (e.g. the "not set"
+        profile check) unreliable.
         """
         if self._sock is None:
             return
