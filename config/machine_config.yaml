@@ -179,7 +179,19 @@ vision:
   eoa_save_format: 'tiff'
   # Visited centroid grid size (mm) — centroids within this distance are treated
   # as the same position and not re-targeted in the same run.
-  centroid_snap_mm: 0.5
+  # Raised from 0.5 to 0.8 (2026-09-16, operator request, real-hardware
+  # finding): a specimen nudged-but-not-picked by a failed suction attempt
+  # was observed drifting ~0.6-0.7mm per attempt, just past the old 0.5mm
+  # radius -- so it never matched its own previous position and the
+  # two-attempt limit (MAX_ATTEMPTS_PER_CENTROID, orchestrator.py) kept
+  # resetting instead of accumulating, letting the same blob get tried
+  # 13 times in one observed run. 0.8mm covers that drift. Tradeoff
+  # accepted deliberately: two genuinely distinct specimens closer than
+  # 0.8mm apart could get merged into one visited entry -- operator's
+  # call that this is fine, since EoA still inspects whatever is
+  # physically at that location and picks it if valid; a missed second
+  # specimen just gets caught on a later overhead pass instead.
+  centroid_snap_mm: 0.8
 
 logging:
   level: "INFO"

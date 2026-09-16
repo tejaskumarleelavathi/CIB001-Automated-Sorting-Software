@@ -38,7 +38,12 @@ from PyQt6.QtWidgets import (
 
 from cib.config.loader import PlateConfig, list_plate_configs, load_all_stations
 from cib.config.validator import ConfigValidationError
-from cib.core.events import RecoveryStatusEvent, SafetyStatusEvent
+from cib.core.events import (
+    ConnectionLostEvent,
+    RecoveryStatusEvent,
+    SafetyStatusEvent,
+    SystemErrorEvent,
+)
 from cib.core.state_machine import State
 from cib.ui import theme
 from cib.ui.bridge import UiBridge
@@ -92,6 +97,19 @@ class PreRunScreen(QWidget):
         self._safety_banner = SafetyBanner(show_abort=False)
         self._safety_banner.continue_clicked.connect(self._orchestrator.operator_acknowledge)
         outer.addWidget(self._safety_banner)
+
+        # A non-safety FAULT (startup connection failure, etc.) before START
+        # was ever pressed needs the exact same "stay here, don't jump to
+        # the run view" treatment as the safety banner above -- see
+        # main_window.py's _PRE_RUN_ELIGIBLE_STATES (2026-09-16, operator
+        # report: a startup error was jumping to the run view, which looked
+        # like a run was in progress when none had ever started).
+        self._error_label = QLabel("")
+        theme.apply_font(self._error_label, size=9, bold=True)
+        self._error_label.setStyleSheet(f"color: {theme.STATUS_RED};")
+        self._error_label.setWordWrap(True)
+        self._error_label.setVisible(False)
+        outer.addWidget(self._error_label)
 
         # ── Field code card ──────────────────────────────────────────
         field_card = QWidget()
@@ -203,12 +221,25 @@ class PreRunScreen(QWidget):
         # safety banner's CONTINUE. So gate purely on == IDLE.
         self._backend_ready = state == State.IDLE
         self._refresh_start_enabled()
+        # Clear a stale error once IDLE is reached (recovered, or a fresh
+        # start) -- don't let it linger once it's no longer relevant, same
+        # reasoning as run_view.py's own error_label clearing.
+        if state == State.IDLE:
+            self._error_label.setVisible(False)
 
     def _on_event(self, event: object) -> None:
         if isinstance(event, SafetyStatusEvent):
             self._safety_banner.update_safety_status(event)
         elif isinstance(event, RecoveryStatusEvent):
             self._safety_banner.update_recovery_status(event.message)
+        elif isinstance(event, SystemErrorEvent):
+            self._show_error(event.message)
+        elif isinstance(event, ConnectionLostEvent):
+            self._show_error(f"{event.device.value} connection lost: {event.detail}")
+
+    def _show_error(self, message: str) -> None:
+        self._error_label.setText(message)
+        self._error_label.setVisible(True)
 
     # ------------------------------------------------------------------
     # Plate config dropdown (FR-UI-02)

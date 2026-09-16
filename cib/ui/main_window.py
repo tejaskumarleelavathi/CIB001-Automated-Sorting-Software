@@ -42,7 +42,14 @@ _IDLE_STATES = {State.INITIALIZING, State.IDLE}
 # that it has its own SafetyBanner (see pre_run.py). Once a run IS active
 # (_has_active_run), the run view's own banner still owns this correctly --
 # unaffected, since that check is still gated on `not self._has_active_run`.
-_PRE_RUN_ELIGIBLE_STATES = _IDLE_STATES | {State.E_STOP, State.PROTECTIVE_STOP}
+#
+# State.FAULT added 2026-09-16 (same class of report, this time for a
+# non-safety fault -- a startup connection error) -- pre_run.py now has its
+# own _error_label for exactly this, mirroring run_view.py's. Same
+# `not self._has_active_run` guard means a FAULT during an actual run still
+# correctly goes to the run view -- this only changes the case where no
+# run was ever started.
+_PRE_RUN_ELIGIBLE_STATES = _IDLE_STATES | {State.E_STOP, State.PROTECTIVE_STOP, State.FAULT}
 
 
 class MainWindow(QMainWindow):
