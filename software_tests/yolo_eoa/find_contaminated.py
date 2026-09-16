@@ -30,7 +30,9 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-DEFAULT_DIR = Path(__file__).parent / "dataset" / "images"
+from _paths import DATASET_DIR
+
+DEFAULT_DIR = DATASET_DIR / "images"
 CENTER_WINDOW = 150   # pixels each side of image center to check
 GREEN_PIXEL_THRESHOLD = 30   # near-pure-green pixel count above which we call it contaminated
 

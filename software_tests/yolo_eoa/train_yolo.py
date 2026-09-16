@@ -27,10 +27,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent))
+from _paths import DATASET_DIR, RUNS_DIR  # noqa: E402
+
 HERE = Path(__file__).parent
-DATA_YAML = HERE / "dataset" / "data.yaml"
+DATA_YAML = DATASET_DIR / "data.yaml"
 
 
 def main() -> None:
@@ -57,7 +61,7 @@ def main() -> None:
         epochs=args.epochs,
         imgsz=args.imgsz,
         batch=args.batch,
-        project=str(HERE / "runs"),
+        project=str(RUNS_DIR),
         name="eoa_yolo",
     )
 

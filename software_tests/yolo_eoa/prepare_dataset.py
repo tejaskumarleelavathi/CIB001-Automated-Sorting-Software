@@ -35,10 +35,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from find_contaminated import is_contaminated  # noqa: E402
+from _paths import DATASET_DIR  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_DIR = REPO_ROOT / "cib" / "output" / "eoa_images" / "backlight_on"
-DEST_DIR = Path(__file__).parent / "dataset" / "images"
+DEST_DIR = DATASET_DIR / "images"
 
 
 def main() -> None:

@@ -43,10 +43,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).parent))
+from _paths import DATASET_DIR  # noqa: E402
+
 HERE = Path(__file__).parent
-IMAGES_DIR = HERE / "dataset" / "images"
+IMAGES_DIR = DATASET_DIR / "images"
 CLASSES_FILE = HERE / "classes.txt"
-STATE_FILE = HERE / "dataset" / ".annotate_state.txt"
+STATE_FILE = DATASET_DIR / ".annotate_state.txt"
 
 MAX_DISPLAY_DIM = 1100
 WINDOW_NAME = "EoA annotator  (drag=box, click=select, B/H/D=label, R=remove, N/P=save+move, Q=quit)"

@@ -47,9 +47,18 @@ dev = [
 # Training-time only -- never needed on the HMI, which only runs inference
 # (a trained .pt weights file + ultralytics' inference-side deps, added
 # separately later once the deployment plan for this covers it).
+#
+# NOT installable into this project's own .venv on this machine: its path
+# is long enough (deeply nested company/project folder names) that these
+# packages' own long file paths blow past Windows' 260-char MAX_PATH
+# limit during install (confirmed 2026-09-16, both labelImg and a numpy
+# reinstall failed this way). Use a separate short-path environment
+# instead -- see software_tests/yolo_eoa/_paths.py and the project chat
+# history for the conda env this was actually set up in. Kept here for
+# documentation of the exact versions used, not as an install target.
 ml = [
     "ultralytics>=8.2",       # YOLOv8 training + inference
-    "labelImg>=1.8",          # bounding-box annotation GUI, exports YOLO .txt directly
+    "opencv-python>=4.9",     # annotate.py / find_contaminated.py
 ]
 
 [tool.pytest.ini_options]
