@@ -216,7 +216,7 @@ class Orchestrator:
         eoa_save_dir: Path | None = None,
         force_sample_detection: bool = False,
         view: bool = False,
-        centroid_snap_mm: float = 0.5,
+        centroid_snap_mm: float = 0.8,
         eoa_normal_exposure_us: float | None = None,
         eoa_backlight_on_exposure_us: float | None = None,
         quadrant_split_y_mm: float | None = None,

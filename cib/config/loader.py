@@ -199,7 +199,7 @@ class VisionConfig:
     overhead_save_images:   bool  = True
     overhead_save_format:   str   = "png"
     eoa_save_format:        str   = "tiff"
-    centroid_snap_mm:       float = 0.5
+    centroid_snap_mm:       float = 0.8
 
 
 @dataclass
@@ -508,7 +508,7 @@ def _parse_machine_config(raw: dict) -> MachineConfig:
             overhead_save_images=bool(vi.get("overhead_save_images", True)),
             overhead_save_format=str(vi.get("overhead_save_format", "png")),
             eoa_save_format=str(vi.get("eoa_save_format", "tiff")),
-            centroid_snap_mm=float(vi.get("centroid_snap_mm", 0.5)),
+            centroid_snap_mm=float(vi.get("centroid_snap_mm", 0.8)),
         ),
         logging=LoggingConfig(
             level=lo.get("level", "INFO"),
