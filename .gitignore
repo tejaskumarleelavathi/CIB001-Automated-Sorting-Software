@@ -38,6 +38,11 @@ software_tests/overhead_detection/results/
 software_tests/eoa_classification/results/
 # Root-level test captures from hardware bring-up
 capture_*.png
+
+# ── YOLO EoA training data/artifacts — large binaries, not source ─────────────
+software_tests/yolo_eoa/dataset/
+software_tests/yolo_eoa/runs/
+*.pt
 capture_*.tiff
 # Hardware test one-shot captures
 hardware_tests/*.png

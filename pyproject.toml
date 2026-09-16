@@ -44,6 +44,14 @@ dev = [
     "ruff>=0.4",              # linter + formatter
 ]
 
+# Training-time only -- never needed on the HMI, which only runs inference
+# (a trained .pt weights file + ultralytics' inference-side deps, added
+# separately later once the deployment plan for this covers it).
+ml = [
+    "ultralytics>=8.2",       # YOLOv8 training + inference
+    "labelImg>=1.8",          # bounding-box annotation GUI, exports YOLO .txt directly
+]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
