@@ -72,12 +72,23 @@ CHANNELS       = [1, 2, 3]    # DCS-100E has 3 channels — all used for backlig
 # after it, permanently falling back to the slow per-channel path for
 # the whole session), but the same slow-ack pattern also starved
 # set_backlight(False)'s own confirmation at shutdown -- reported live,
-# the light was still visibly on after "shutdown" completed. recv() only
-# blocks up to this timeout waiting for data that hasn't arrived yet, so
-# a fast response is read immediately regardless -- raising this has no
-# cost for the common case, only for a response that's actually this
-# slow (or genuinely never coming).
-RECV_TIMEOUT_S = 1.0
+# the light was still visibly on after "shutdown" completed.
+# 1.0 -> 2.5 (2026-09-16, same day, follow-up real-hardware finding):
+# 1.0 still wasn't enough margin. A full connect-time log was traced
+# command-by-command and showed EVERY response -- not just ones from a
+# genuine on->off state change, "already off" trivial acks too -- lands
+# ~1.2-1.3s after its own command, consistently. That's not occasional
+# jitter, it looks like a near-fixed round-trip characteristic of this
+# specific unit, and it chains: each read was actually capturing the
+# PREVIOUS command's response (one full cycle late), which then fed
+# straight into the NEXT command's own read being one cycle late too,
+# corrupting several commands in a row from a single initial near-miss.
+# recv() only blocks up to this timeout waiting for data that hasn't
+# arrived yet, so raising it has no cost for the common case, only for a
+# response that's actually this slow (or genuinely never coming) -- 2.5s
+# gives real margin above the ~1.2-1.3s observed worst case rather than
+# sitting right on top of it.
+RECV_TIMEOUT_S = 2.5
 RECV_BUF       = 4096
 SEND_RETRIES   = 2             # resend once if not all channels confirmed --
                                 # SET:MODE is idempotent, so a retry is safe
@@ -165,6 +176,28 @@ class LightingControllerDriver:
                 for ch in CHANNELS:
                     self._send_command(f"SET:LEVEL:CHANNEL{ch},{self._current_ma}")
                     self._send_command(f"SET:MODE:CHANNEL{ch},0")
+                # Actively confirm truly off before anything else touches
+                # this socket (2026-09-16, operator request: "if it's
+                # already on, turn it off, flush/reset, THEN turn on -- if
+                # it's already off, just reset and turn on"). Whatever
+                # state the device was left in from a previous session
+                # (crash, or the operator's own prior on/off toggling),
+                # connect() now always starts from a verified-clean OFF
+                # instead of assuming the fire-and-forget loop above landed.
+                if not self._verify_backlight_off_sync():
+                    log.warning(
+                        "lighting.connect_off_not_confirmed",
+                        note="Channel-off not confirmed via *CHANNEL:CONFIGS? after "
+                             "connect -- retrying once before continuing.",
+                    )
+                    for ch in CHANNELS:
+                        self._send_command(f"SET:MODE:CHANNEL{ch},0")
+                    if not self._verify_backlight_off_sync():
+                        log.warning(
+                            "lighting.connect_off_not_confirmed_after_retry",
+                            note="Still not confirmed off -- proceeding anyway; "
+                                 "check backlight visually if this repeats.",
+                        )
                 self._backlight_on = False
                 self._channels_on = set()
                 break   # success
@@ -363,17 +396,32 @@ class LightingControllerDriver:
         log.debug("lighting.backlight", on=on, confirmed=confirmed,
                   method="profile" if self._profiles_confirmed else "per_channel")
 
-    def _verify_backlight_on_sync(self, timeout_s: float = 1.5) -> bool:
+    def _verify_backlight_on_sync(self, timeout_s: float = 2.5) -> bool:
         """
         Read back *CHANNEL:CONFIGS? and confirm at least one channel
         actually reports mode="1" -- real proof the device applied the
         command, not just that we sent it. Polls up to timeout_s if the
-        response doesn't arrive immediately (this device's replies can lag).
+        response doesn't arrive immediately (this device's replies can lag
+        by ~1.2-1.3s even for trivial commands -- see RECV_TIMEOUT_S).
         """
         resp = self._send_batch(["*CHANNEL:CONFIGS?"])
         if 'mode="1"' not in resp:
             resp = self._poll_for_response(timeout_s=timeout_s)
         return 'mode="1"' in resp
+
+    def _verify_backlight_off_sync(self, timeout_s: float = 2.5) -> bool:
+        """
+        Read back *CHANNEL:CONFIGS? and confirm NO channel reports
+        mode="1" -- the OFF counterpart of _verify_backlight_on_sync(),
+        used at connect time (2026-09-16, operator request: always
+        verify a genuinely clean off before ever turning on, regardless
+        of what state the device was left in) rather than assuming the
+        fire-and-forget per-channel-off loop landed.
+        """
+        resp = self._send_batch(["*CHANNEL:CONFIGS?"])
+        if not resp:
+            resp = self._poll_for_response(timeout_s=timeout_s)
+        return 'mode="1"' not in resp
 
     async def set_ring_light(self, on: bool) -> None:
         """Ring light is robot digital output 12 — not controlled by DCS-100E."""
