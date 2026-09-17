@@ -56,6 +56,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 from _paths import RUNS_DIR  # noqa: E402
 from select_closest_to_center import Detection, select_closest_to_center  # noqa: E402
+from crop_utils import crop_around_bbox, PAD_MULTIPLIER, MIN_CROP_PX  # noqa: E402
 from cib.vision.eoa import (  # noqa: E402
     _to_gray, _segment, _morph_close, _find_blobs,
     _rank_candidates, _intensity_features, _classify,
@@ -65,9 +66,6 @@ DEFAULT_SOURCE = _REPO_ROOT / "cib" / "output" / "eoa_images" / "backlight_on"
 DEFAULT_WEIGHTS = RUNS_DIR / "eoa_yolo" / "weights" / "best.pt"
 WINDOW_NAME = "Crop + YOLO vs classical"
 MAX_DISPLAY_DIM = 900
-
-PAD_MULTIPLIER = 3.0   # crop side = max(blob bbox dimension) * this ...
-MIN_CROP_PX = 600      # ... but never smaller than this, so tiny debris still gets context
 
 # NMS defaults tuned against real crops (2026-09-17, live finding): a
 # crop only ever has one intended specimen, so two overlapping boxes are
@@ -82,17 +80,13 @@ DEFAULT_IOU = 0.45
 
 
 def crop_around_blob(frame, blob: dict, pad_multiplier: float, min_crop_px: int):
-    """Padded, roughly-square crop of `frame` centered on `blob`'s bounding box."""
+    """Padded, roughly-square crop of `frame` centered on `blob`'s bounding box.
+    Thin wrapper over crop_utils.crop_around_bbox() -- see that module for why
+    this must stay the one place this padding rule is computed."""
     import cv2
-    h, w = frame.shape[:2]
     x, y, bw, bh = cv2.boundingRect(blob["contour"])
     cx, cy = x + bw / 2.0, y + bh / 2.0
-    side = max(max(bw, bh) * pad_multiplier, min_crop_px)
-    x0 = int(max(0, cx - side / 2))
-    y0 = int(max(0, cy - side / 2))
-    x1 = int(min(w, cx + side / 2))
-    y1 = int(min(h, cy + side / 2))
-    return frame[y0:y1, x0:x1]
+    return crop_around_bbox(frame, cx, cy, bw, bh, pad_multiplier, min_crop_px)
 
 
 def draw_picked(cv2, crop, dets: list, picked):
