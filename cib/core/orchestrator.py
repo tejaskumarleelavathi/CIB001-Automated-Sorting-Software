@@ -1177,6 +1177,15 @@ class Orchestrator:
                         # Discarding or leaving it hanging in the tip would be worse
                         # than finishing this one already-in-flight delivery.
                         await self._deliver_pending_specimen()
+                    # Unconditional Righty regardless of whichever side
+                    # _safe_recovery()/_deliver_pending_specimen() just
+                    # parked at (2026-09-17, operator request: both of those
+                    # are now hand-aware, matching whichever side was
+                    # already in use, for CONTINUE's benefit -- but ABORT
+                    # always means "done, back to the main home," never
+                    # "stay put to resume here"). Cheap no-op if already
+                    # there.
+                    await self._home_right(d)
                     sm.abort()
                     try:
                         # Re-home the pipette motor as well (2026-09-10 operator
@@ -1478,6 +1487,21 @@ class Orchestrator:
                     await self._close_run(RunStatus.ABORTED)
                 except Exception as exc:
                     log.warning("orchestrator.shutdown_close_run_error", error=str(exc))
+                # Always the main (Righty) home (2026-09-17, operator
+                # request), regardless of which side the run was on when
+                # shutdown was pressed -- unlike CONTINUE/STOP (hand-aware,
+                # since those are meant to resume), shutdown always means
+                # "done." This didn't exist before: shutdown previously
+                # never sent any home command at all, so it only ever
+                # happened to end up at Righty because the arm was usually
+                # already parked there from a prior stop/abort -- pressing
+                # SHUTDOWN mid-cycle on the Lefty side would have left the
+                # arm wherever it was. Best-effort, same as every other
+                # step here -- must never block shutdown itself.
+                try:
+                    await self._home_right(d)
+                except Exception as exc:
+                    log.warning("orchestrator.shutdown_home_error", error=str(exc))
                 try:
                     await d.robot.ring_light_off()
                 except Exception as exc:
@@ -1614,10 +1638,21 @@ class Orchestrator:
         part (letting the in-progress cycle finish, delivering any
         already-picked specimen) is already guaranteed by CYCLE_STOPPING
         itself -- this just decides what happens AFTER that finish.
+
+        Homing (2026-09-17, operator request): a plain STOP is meant to be
+        resumable, so it parks on whichever side was already in use --
+        forcing Righty here just to cross back to the same side on the very
+        next cycle was pure wasted motion the operator specifically flagged.
+        An ABORT-in-disguise (_abort_after_cycle) is different -- ABORT
+        always means "done, back to the main home," so that case still
+        forces Righty regardless of side.
         """
         self._sm.cycle_complete()
         await d.lighting.set_backlight(False)
-        await self._home_right(d)
+        if self._abort_after_cycle:
+            await self._home_right(d)
+        else:
+            await self._home_current_station_side(d)
         # Re-home the pipette plunger motor too (2026-09-10 operator
         # request) -- after the arm is parked, same as at startup. A
         # graceful CYCLE STOP already ran the last cycle's DROP, so the
@@ -1772,10 +1807,14 @@ class Orchestrator:
             except Exception:
                 pass
 
-        # Home the robot — Z retracts before XY, so always safe
+        # Home the robot — Z retracts before XY, so always safe. Matches
+        # whichever side the sequencer is already on (2026-09-17, operator
+        # request) rather than always Righty -- CONTINUE resuming on the
+        # left otherwise had to cross right here just to immediately cross
+        # back left again for the very next pick.
         homed = False
         try:
-            await self._home_right(d)
+            await self._home_current_station_side(d)
             homed = True
             log.info("orchestrator.safe_recovery_homed", from_phase=phase.name)
         except Exception as exc:
@@ -1972,6 +2011,12 @@ class Orchestrator:
         though port 2000 had genuinely been healthy for seconds by then.
         Skip straight to homing whenever it's already ready instead of
         insisting on redoing the entire Remote Ethernet dance regardless.
+
+        Homing here matches whichever side the sequencer is currently on
+        (2026-09-17, operator request) rather than always Righty -- see
+        _home_current_station_side(). Applies to all three callers equally:
+        an automatic reactive self-heal or idle-disconnect recovery has no
+        more reason to force an unnecessary side-crossing than CONTINUE does.
         """
         for cam in (d.camera_overhead, d.camera_eoa):
             try:
@@ -1987,7 +2032,7 @@ class Orchestrator:
                 log.info("orchestrator.recover_robot_connection_already_healthy")
                 try:
                     await self._queue.put(RecoveryStatusEvent(message="Homing robot..."))
-                    await self._home_right(d)
+                    await self._home_current_station_side(d)
                     return True
                 except Exception as exc:
                     log.error("orchestrator.recover_robot_connection_home_failed", error=str(exc))
@@ -1999,7 +2044,7 @@ class Orchestrator:
                     await self._queue.put(RecoveryStatusEvent(message="Reconnecting to robot..."))
                     await d.robot.connect()
                     await self._queue.put(RecoveryStatusEvent(message="Homing robot..."))
-                    await self._home_right(d)
+                    await self._home_current_station_side(d)
                     return True
                 except Exception as exc:
                     log.error("orchestrator.recover_robot_connection_home_failed", error=str(exc))
@@ -2043,7 +2088,13 @@ class Orchestrator:
                     self._current_pick.timestamp_end = datetime.now()
                     await self._csv_append(self._current_pick)
             self._cycle_phase = CyclePhase.ROBOT_PARKING
-            await self._home_right(d)
+            # Match whichever hand this specimen was actually delivered
+            # under (2026-09-17, operator request) rather than always
+            # Righty -- CONTINUE resuming on the left otherwise had to
+            # cross right here just to cross back left for the next pick.
+            # ABORT's own handler re-homes Righty afterward regardless, so
+            # this doesn't change ABORT's final resting side.
+            await self._home_matching_side(d, "left" if hand == "L" else "right")
         except Exception as exc:
             log.error(
                 "orchestrator.interrupted_specimen_delivery_failed",
@@ -3022,19 +3073,25 @@ class Orchestrator:
                 self._cycle_phase = CyclePhase.ROBOT_PARKING
                 with self._time_step("robot_park"):
                     # Park matching whichever side is currently active --
-                    # not always right. When stopping, _finish_stop() below
-                    # homes Righty regardless anyway, so it doesn't matter
-                    # here; when continuing on the left side with no
-                    # lookahead result, parking Righty would just force an
-                    # unnecessary swing back left on the very next cycle.
+                    # not always right. A plain STOP is resumable and
+                    # _finish_stop() below now ALSO parks on this same side
+                    # (2026-09-17, operator request) rather than forcing
+                    # Righty, so this park+that one agree instead of
+                    # right-then-left-again; only a real ABORT-in-disguise
+                    # (_abort_after_cycle) still needs Righty here, since
+                    # _finish_stop() will force Righty regardless once it
+                    # sees that flag. When continuing on the left side with
+                    # no lookahead result, parking Righty would just force
+                    # an unnecessary swing back left on the very next cycle.
                     # Uses well_side (captured above from THIS cycle's own
                     # _get_next_well_coords() call), NOT a fresh
                     # _current_station_side() call (2026-09-07 fix, same
                     # issue as station_num above) -- on the last well of the
                     # last selected station, the sequencer has already
-                    # advanced past the end of self._station_order, so
-                    # _current_station_side() would IndexError here too.
-                    if stopping or well_side == "right":
+                    # advanced past the end of self._station_order (that
+                    # method is now safe against this too, but well_side is
+                    # already the correct, cheaper answer here regardless).
+                    if well_side == "right" or (stopping and self._abort_after_cycle):
                         await self._home_right(d)
                     else:
                         await self._home_left(d)
@@ -3523,14 +3580,20 @@ class Orchestrator:
         pick+drop must use, derived fresh every call from the sequencer's
         own position rather than tracked as separate mutable state — it
         can never drift out of sync with what _get_next_well_coords() is
-        about to return (e.g. after a fault-recovery re-home, which always
-        parks Righty via move_to_safe_park() regardless of which side the
-        run's sequencer is mid-way through — see _deliver_pending_specimen).
+        about to return. Also used by recovery/stop paths (see
+        _home_current_station_side()) to park on whichever side was
+        already in use instead of always forcing Righty.
 
         Legacy fallback (multi-station not configured): always "right",
-        matching the original Righty-only cycle.
+        matching the original Righty-only cycle. Also "right" once every
+        selected station's wells are used up (self._current_station_idx
+        can legitimately equal len(self._station_order) right after
+        _get_next_well_coords() returns the last well of the last
+        station — see that method's own docstring) -- nothing left to
+        resume on either side at that point, so Righty is the correct
+        default, not an IndexError.
         """
-        if not self._station_order:
+        if not self._station_order or self._current_station_idx >= len(self._station_order):
             return "right"
         station_num = self._station_order[self._current_station_idx]
         return self._plate_stations_cfg.side_of(station_num)
@@ -3579,6 +3642,25 @@ class Orchestrator:
         """
         await d.robot.go_home_left()
         self._current_physical_side = "left"
+
+    async def _home_matching_side(self, d: DriverSet, side: str) -> None:
+        """
+        Home Lefty or Righty to match `side` ("left"/"right") -- shared by
+        every recovery path that should return to whichever side was
+        already in use, not always force Righty (2026-09-17, operator
+        request). Mirrors _ensure_physical_hand_for_next_pick()'s own
+        left/right choice, the existing pattern for normal in-cycle hand
+        crossings; this is the same idea applied to recovery/stop paths.
+        """
+        if side == "left":
+            await self._home_left(d)
+        else:
+            await self._home_right(d)
+
+    async def _home_current_station_side(self, d: DriverSet) -> None:
+        """_home_matching_side() using the sequencer's own current side --
+        see _current_station_side()."""
+        await self._home_matching_side(d, self._current_station_side())
 
     async def _ensure_physical_hand_for_next_pick(self, d: DriverSet) -> None:
         """

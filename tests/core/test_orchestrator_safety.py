@@ -20,12 +20,14 @@ from pathlib import Path
 
 import pytest
 
+from cib.config.loader import PlateConfig, PlateStationsConfig, WellConfig
 from cib.core.events import (
     AllDevicesReadyEvent,
     OperatorAbortEvent,
     OperatorAcknowledgeEvent,
     OperatorShutdownEvent,
     OperatorStartEvent,
+    OperatorStopEvent,
     SystemErrorEvent,
     VisionEoAResultEvent,
 )
@@ -122,6 +124,27 @@ async def _to_running_no_auto_cycle(orch: Orchestrator) -> None:
     await orch._handle_event(OperatorStartEvent())
     orch._cycle_active = False
     assert orch.state == State.RUNNING
+
+
+def _configure_single_left_station(orch: Orchestrator) -> None:
+    """
+    Configure one Lefty station (station 3, matching real machine_config.yaml)
+    as the only selected station, so _current_station_side() resolves to
+    "left" for the rest of the test -- exercises the hand-aware
+    recovery/stop homing added 2026-09-17.
+    """
+    orch._plate_stations_cfg = PlateStationsConfig(
+        right_home_u=170.065, left_home_u=200.023,
+        righty_top_u=209.0, righty_bottom_u=251.0,
+        lefty_top_u=177.718, lefty_bottom_u=86.053,
+        stations={3: "left"},
+    )
+    orch._selected_stations = {
+        3: PlateConfig(source_file="s3", wells=[WellConfig(well="A1", x=-292.526, y=155.16)]),
+    }
+    orch._station_order = [3]
+    orch._current_station_idx = 0
+    orch._current_well_idx = 0
 
 
 # ── Run lifecycle ────────────────────────────────────────────────────────────
@@ -1142,6 +1165,103 @@ class TestAbortRecoveryRace:
             await orch._robot_keepalive_tick()
 
         assert called is False
+
+
+class TestRecoveryHomesMatchingSide:
+    """
+    Regression tests for 2026-09-17, operator request: a fault or plain
+    STOP on the Lefty side (stations 3/4) used to always recover to Righty
+    (via CONTINUE or _finish_stop()), forcing an unnecessary cross back to
+    Lefty on the very next pick. Only ABORT (either button) is meant to
+    always return to the main (Righty) home, since it means "done," not
+    "resume here."
+    """
+
+    async def test_continue_from_estop_on_left_station_stays_left(
+        self, orch: Orchestrator,
+    ) -> None:
+        _configure_single_left_station(orch)
+        await _to_running(orch)
+        await orch._drivers.robot.halt()
+        orch._sm.safety_fault_estop()
+        orch._hardware_fault_active = False   # blue button already pressed
+
+        await orch._handle_event(OperatorAcknowledgeEvent())
+
+        assert orch._current_physical_side == "left"
+
+    async def test_continue_from_protective_stop_on_left_station_stays_left(
+        self, orch: Orchestrator,
+    ) -> None:
+        _configure_single_left_station(orch)
+        await _to_running(orch)
+        await orch._drivers.robot.halt()
+        orch._state_before_fault = State.RUNNING
+        orch._sm.safety_fault_protective()
+        orch._hardware_fault_active = False
+        orch._light_curtain_stably_clear = True
+
+        await orch._handle_event(OperatorAcknowledgeEvent())
+
+        assert orch._current_physical_side == "left"
+
+    async def test_plain_stop_on_left_station_stays_left(
+        self, orch: Orchestrator,
+    ) -> None:
+        _configure_single_left_station(orch)
+        await _to_running_no_auto_cycle(orch)
+
+        await orch._handle_event(OperatorStopEvent())
+
+        assert orch.state == State.IDLE
+        assert orch._current_physical_side == "left"
+
+    async def test_abort_button_after_estop_on_left_station_still_homes_right(
+        self, orch: Orchestrator,
+    ) -> None:
+        """The OTHER abort -- next to CONTINUE, after E_STOP/light-curtain
+        clears -- must still always end at the main (Righty) home, even
+        though the recovery it now shares with CONTINUE (_safe_recovery())
+        is hand-aware internally."""
+        _configure_single_left_station(orch)
+        await _to_running(orch)
+        await orch._drivers.robot.halt()
+        orch._sm.safety_fault_estop()
+        orch._hardware_fault_active = False
+
+        await orch._handle_event(OperatorAbortEvent())
+
+        assert orch.state == State.IDLE
+        assert orch._current_physical_side == "right"
+
+    async def test_abort_from_running_on_left_station_still_homes_right(
+        self, orch: Orchestrator,
+    ) -> None:
+        """The run_view ABORT (graceful, from RUNNING) must also always end
+        at the main (Righty) home, not wherever the last pick happened."""
+        _configure_single_left_station(orch)
+        await _to_running_no_auto_cycle(orch)
+
+        await orch._handle_event(OperatorAbortEvent())
+
+        assert orch.state == State.IDLE
+        assert orch._current_physical_side == "right"
+        assert orch._current_run is None
+
+    async def test_shutdown_on_left_station_still_homes_right(
+        self, orch: Orchestrator,
+    ) -> None:
+        """SHUTDOWN previously never sent any home command at all -- it only
+        happened to end up at Righty because the arm was usually already
+        parked there. Confirm it now explicitly homes Righty even when the
+        run was on the Lefty side when shutdown was pressed."""
+        _configure_single_left_station(orch)
+        await _to_running_no_auto_cycle(orch)
+        orch._current_physical_side = "left"   # simulate: last pick was on the left
+
+        await orch._handle_event(OperatorShutdownEvent())
+
+        assert orch._current_physical_side == "right"
 
 
 class TestSafetyFaultDoesNotBounceToFault:
