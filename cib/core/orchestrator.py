@@ -165,6 +165,21 @@ MAX_ATTEMPTS_PER_CENTROID = 2
 PICK_TARGET_CORRECTION_X_MM = -1.0
 PICK_TARGET_CORRECTION_Y_MM = 0.0
 
+# Additional PICK correction for Lefty hand only, ON TOP of
+# PICK_TARGET_CORRECTION_X_MM/_Y_MM above (2026-09-17, operator hardware
+# report: picking up the bug from the dish lands ~1mm off in -X/-Y
+# specifically when the cycle is using the Lefty hand -- i.e. whenever the
+# target well is on a "left"-side station (plate 3/4); Righty picks are
+# fine). PICK_TARGET_CORRECTION_X_MM/_Y_MM itself was tuned 2026-08-19,
+# a week before Lefty/multi-station sorting existed (2026-08-26) -- like
+# TLSet 2 (see the DROP-side investigation this same day), it was only
+# ever validated against Righty picks. This is a single hardware report,
+# not a full calibration -- re-tune after more real Lefty picks confirm
+# it. Lives here, added only for hand=="L", so Righty PICK and every DROP
+# stay exactly as they were.
+PICK_LEFT_EXTRA_CORRECTION_X_MM = 1.0
+PICK_LEFT_EXTRA_CORRECTION_Y_MM = 1.0
+
 
 @dataclass
 class DriverSet:
@@ -2762,6 +2777,12 @@ class Orchestrator:
                 # well-config approach kept doing.
                 corrected_x += PICK_TARGET_CORRECTION_X_MM
                 corrected_y += PICK_TARGET_CORRECTION_Y_MM
+                if hand == "L":
+                    # See PICK_LEFT_EXTRA_CORRECTION_X_MM/_Y_MM's module-level
+                    # comment -- Lefty-only, added on top of the correction
+                    # above, Righty untouched.
+                    corrected_x += PICK_LEFT_EXTRA_CORRECTION_X_MM
+                    corrected_y += PICK_LEFT_EXTRA_CORRECTION_Y_MM
                 if corrected_x != target_x or corrected_y != target_y:
                     log.info("cycle.eoa_correction_computed",
                              overhead_xy=f"({target_x:.3f}, {target_y:.3f})",
