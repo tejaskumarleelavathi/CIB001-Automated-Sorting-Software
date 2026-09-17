@@ -165,6 +165,22 @@ MAX_ATTEMPTS_PER_CENTROID = 2
 PICK_TARGET_CORRECTION_X_MM = -1.0
 PICK_TARGET_CORRECTION_Y_MM = 0.0
 
+# Fine correction applied to DROP only, only for Lefty stations (2026-09-17,
+# operator hardware report: plate 3/4 drops land ~1mm off in -X/-Y, plate 1/2
+# drops don't). Root cause: TLSet 2 (sort_server.prg, the pipette tool
+# offset used for both PICK and DROP) was measured 2026-08-06 -- three weeks
+# before Lefty/multi-station sorting existed (2026-08-26) -- so it was only
+# ever validated using Righty moves. DROP's wrist angle differs by hand
+# (right_home_u=170.065 vs left_home_u=200.023, ~30 degrees apart), so any
+# small real tool-mounting imprecision that's invisible at the Righty angle
+# it was measured at becomes a real, repeatable position error once applied
+# at Lefty's very different angle. Living here (not TLSet 2, not the plate
+# config) keeps it isolated to Lefty DROP only -- Righty DROP and every PICK
+# stay untouched. This is a single-report hardware guess, not a measured
+# calibration -- re-tune after more real Lefty drops confirm it.
+DROP_LEFT_CORRECTION_X_MM = 1.0
+DROP_LEFT_CORRECTION_Y_MM = 1.0
+
 
 @dataclass
 class DriverSet:
@@ -3732,6 +3748,11 @@ class Orchestrator:
         NEVER the quadrant-pick U used for this cycle's PICK. Confirmed
         operator safety rule: dropping at a quadrant-pick U is not safe.
 
+        well_x/well_y get DROP_LEFT_CORRECTION_X_MM/_Y_MM added on top of
+        the raw plate-config value when side == "left" -- see that
+        constant's module-level comment. Righty wells are returned
+        unmodified.
+
         side_switch is True only when the NEXT call to this method (the
         well after the one just returned) will be for a different side —
         signals _run_cycle() that after finishing THIS drop, it must
@@ -3791,7 +3812,14 @@ class Orchestrator:
                     next_station = self._station_order[self._current_station_idx]
                     next_side = self._plate_stations_cfg.side_of(next_station)
                     side_switch = next_side != side
-            return (well.x, well.y, well.well, home_u, side, side_switch, station_num)
+
+            well_x, well_y = well.x, well.y
+            if side == "left":
+                # See DROP_LEFT_CORRECTION_X_MM/_Y_MM's module-level comment --
+                # Lefty-only DROP correction, Righty untouched.
+                well_x += DROP_LEFT_CORRECTION_X_MM
+                well_y += DROP_LEFT_CORRECTION_Y_MM
+            return (well_x, well_y, well.well, home_u, side, side_switch, station_num)
 
         if self._plate_config is None or not self._plate_config.wells:
             return (100.0, 100.0, "NONE", self._plate_u, "right", False, None)
