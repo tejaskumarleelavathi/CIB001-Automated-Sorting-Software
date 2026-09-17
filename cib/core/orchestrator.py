@@ -262,6 +262,21 @@ class Orchestrator:
         self._on_event = on_event     # hook for UI to observe raw events
         self._running = False
         self._cycle_active = False          # prevents concurrent _run_cycle() tasks
+        # Set for the duration of OperatorAbortEvent's own E_STOP/PROTECTIVE_STOP
+        # recovery sequence (2026-09-17, real-hardware finding -- see that
+        # handler and _robot_keepalive_tick() for the full story). ABORT calls
+        # sm.abort() (-> IDLE) BEFORE its own delivery/home sequence finishes,
+        # unlike CONTINUE which stays in E_STOP/PROTECTIVE_STOP for its entire
+        # recovery and so is already covered by _robot_keepalive_tick()'s
+        # existing state check. That gap let the keepalive loop see "IDLE,
+        # robot not ready" and launch its OWN concurrent Remote Ethernet
+        # recovery attempt while ABORT's was still in flight -- confirmed live,
+        # both racing to reconnect the same robot crashed the whole
+        # asyncio.TaskGroup ("unhandled errors in a TaskGroup (1 sub-exception)"
+        # right after "orchestrator.robot_keepalive_attempting_remote_recovery"
+        # fired mid-ABORT). This flag closes that gap without touching the
+        # state machine's own transition timing.
+        self._robot_recovery_in_progress = False
         # Set the instant OperatorShutdownEvent's handler starts, before it
         # does anything else (2026-09-16, real-hardware finding) -- lets
         # _robot_keepalive_tick() recognize an intentional disconnect (the
@@ -888,13 +903,18 @@ class Orchestrator:
             self._keepalive_consecutive_disconnected = 0
             return
 
-        if self._cycle_active or self._sm.current in {
+        if self._cycle_active or self._robot_recovery_in_progress or self._sm.current in {
             State.E_STOP, State.PROTECTIVE_STOP, State.FAULT,
         }:
             # Not our disconnect to handle -- either _run_cycle()'s own
-            # exception handler already owns this, or the robot is
-            # halted by a real safety fault (is_ready() reads False
-            # for that too) awaiting the normal CONTINUE/ABORT path.
+            # exception handler already owns this, the robot is halted by
+            # a real safety fault (is_ready() reads False for that too)
+            # awaiting the normal CONTINUE/ABORT path, or ABORT's own
+            # recovery sequence is already in flight (see
+            # _robot_recovery_in_progress's __init__ comment -- ABORT can
+            # reach IDLE before that sequence finishes, so the state check
+            # alone isn't enough to keep this loop from piling on a second,
+            # racing reconnect attempt).
             return
 
         self._keepalive_consecutive_disconnected += 1
@@ -1098,65 +1118,99 @@ class Orchestrator:
                             ))
                             return
 
-                if sm.current in {State.E_STOP, State.PROTECTIVE_STOP}:
-                    # The robot was halt()ed when the fault hit — every
-                    # command raises ConnectionError until resume() clears
-                    # the driver's halted flag (see driver.py
-                    # _reconnect_sync). Found 2026-08-30 while adding the
-                    # hardware-clear gate above: this path never called
-                    # resume() at all, so _deliver_pending_specimen()/
-                    # _home_right() below would always fail on real
-                    # hardware (the mock driver doesn't enforce the same
-                    # guard, which is why existing tests never caught it).
-                    # Same call _safe_recovery() makes at its own start.
-                    try:
-                        d.robot.resume()
-                    except Exception as exc:
-                        log.error("orchestrator.abort_resume_failed", error=str(exc))
-                # Backlight off as early as possible in this handler
-                # (2026-08-31, operator request — see the same change in
-                # OperatorShutdownEvent's handler): previously this was
-                # after _deliver_pending_specimen()/_cleanup_interrupted_
-                # attempt(), both plain unguarded awaits — either failing
-                # would skip backlight-off entirely. Safe to do before
-                # delivering a pending specimen (that motion doesn't need
-                # backlight; it's for overhead vision, not the drop).
+                # Recovery sequence below (deliver/cleanup -> sm.abort() ->
+                # home -> reset pipette) races _robot_keepalive_tick()'s own
+                # reconnect attempts once sm.abort() reaches IDLE, since IDLE
+                # isn't in that loop's E_STOP/PROTECTIVE_STOP/FAULT exclusion
+                # set -- see _robot_recovery_in_progress's __init__ comment.
+                # Held for the whole sequence below, not just while sm.current
+                # is still nominally E_STOP/PROTECTIVE_STOP.
+                self._robot_recovery_in_progress = True
                 try:
-                    await d.lighting.set_backlight(False)
-                except Exception as exc:
-                    log.warning("orchestrator.abort_backlight_error", error=str(exc))
-                if self._pending_well is not None:
-                    # A specimen was aspirated when a safety fault interrupted the
-                    # cycle, and the operator chose ABORT instead of CONTINUE.
-                    # Deliver it to its intended well before closing the run —
-                    # exactly the same single motion CONTINUE would do. There is
-                    # no safety reason to treat this differently: the only thing
-                    # ABORT changes is that picking does NOT resume afterward.
-                    # Discarding or leaving it hanging in the tip would be worse
-                    # than finishing this one already-in-flight delivery.
-                    await self._deliver_pending_specimen()
-                else:
-                    # Nothing was aspirated — ABORT can be reached directly from
-                    # E_STOP/PROTECTIVE_STOP/FAULT without ever going through
-                    # CONTINUE (_safe_recovery()), so this cleanup has to happen
-                    # here too, not just there. See _cleanup_interrupted_attempt.
-                    await self._cleanup_interrupted_attempt(reason="operator_abort")
-                sm.abort()
-                await self._home_right(d)
-                # Re-home the pipette motor as well (2026-09-10 operator
-                # request) -- after any pending specimen was delivered
-                # above and the arm is parked.
-                await self._reset_pipette_motor(d)
-                # GREEN, not AMBER (2026-09-16, operator request): this is
-                # the final resting state once ABORT has fully finished --
-                # same "clean, ready, no error" meaning as AllDevicesReadyEvent's
-                # own GREEN, just reached via a different path. AMBER now
-                # means only "currently stopping" (see the transient AMBER
-                # set right when cycle_stop() fires, above).
-                await d.plc.set_status_light(StatusLight.GREEN)
-                await d.plc.set_work_light(True)
-                await self._close_run(RunStatus.ABORTED)
-                log.info("orchestrator.backlight_off")
+                    if sm.current in {State.E_STOP, State.PROTECTIVE_STOP}:
+                        # The robot was halt()ed when the fault hit — every
+                        # command raises ConnectionError until resume() clears
+                        # the driver's halted flag (see driver.py
+                        # _reconnect_sync). Found 2026-08-30 while adding the
+                        # hardware-clear gate above: this path never called
+                        # resume() at all, so _deliver_pending_specimen()/
+                        # _home_right() below would always fail on real
+                        # hardware (the mock driver doesn't enforce the same
+                        # guard, which is why existing tests never caught it).
+                        # Same call _safe_recovery() makes at its own start.
+                        try:
+                            d.robot.resume()
+                        except Exception as exc:
+                            log.error("orchestrator.abort_resume_failed", error=str(exc))
+                    # Backlight off as early as possible in this handler
+                    # (2026-08-31, operator request — see the same change in
+                    # OperatorShutdownEvent's handler): previously this was
+                    # after _deliver_pending_specimen()/_cleanup_interrupted_
+                    # attempt(), both plain unguarded awaits — either failing
+                    # would skip backlight-off entirely. Safe to do before
+                    # delivering a pending specimen (that motion doesn't need
+                    # backlight; it's for overhead vision, not the drop).
+                    try:
+                        await d.lighting.set_backlight(False)
+                    except Exception as exc:
+                        log.warning("orchestrator.abort_backlight_error", error=str(exc))
+                    if self._pending_well is not None:
+                        # A specimen was aspirated when a safety fault interrupted the
+                        # cycle, and the operator chose ABORT instead of CONTINUE.
+                        # Deliver it to its intended well before closing the run —
+                        # exactly the same single motion CONTINUE would do. There is
+                        # no safety reason to treat this differently: the only thing
+                        # ABORT changes is that picking does NOT resume afterward.
+                        # Discarding or leaving it hanging in the tip would be worse
+                        # than finishing this one already-in-flight delivery.
+                        await self._deliver_pending_specimen()
+                    else:
+                        # Nothing was aspirated — ABORT can be reached directly from
+                        # E_STOP/PROTECTIVE_STOP/FAULT without ever going through
+                        # CONTINUE (_safe_recovery()), so this cleanup has to happen
+                        # here too, not just there. See _cleanup_interrupted_attempt.
+                        await self._cleanup_interrupted_attempt(reason="operator_abort")
+                    sm.abort()
+                    try:
+                        await self._home_right(d)
+                        # Re-home the pipette motor as well (2026-09-10 operator
+                        # request) -- after any pending specimen was delivered
+                        # above and the arm is parked.
+                        await self._reset_pipette_motor(d)
+                    except Exception as exc:
+                        # 2026-09-17 real-hardware finding: this used to be a
+                        # bare await -- an Epson controller that isn't back to
+                        # "ready" yet right after an E-STOP (needs a few real
+                        # seconds even once the physical button is reset)
+                        # raised straight out of this handler, uncaught, and
+                        # crashed the whole asyncio.TaskGroup (every poll loop
+                        # died with it, confirmed live: "unhandled errors in a
+                        # TaskGroup" right after this exact call). Land in
+                        # FAULT instead -- the same "recovery failed, needs
+                        # attention" outcome _recover_robot_connection's own
+                        # callers already use, just reached from here too.
+                        log.error("orchestrator.abort_home_failed", error=str(exc))
+                        sm.fault()
+                        await d.plc.set_status_light(StatusLight.RED_CHASE)
+                        await self._queue.put(SystemErrorEvent(
+                            message="ABORT could not confirm the robot homed after "
+                                    "recovery. Check sort_server.prg is running in "
+                                    "RC+ (F5), then press ABORT again."
+                        ))
+                        await self._close_run(RunStatus.ABORTED)
+                        return
+                    # GREEN, not AMBER (2026-09-16, operator request): this is
+                    # the final resting state once ABORT has fully finished --
+                    # same "clean, ready, no error" meaning as AllDevicesReadyEvent's
+                    # own GREEN, just reached via a different path. AMBER now
+                    # means only "currently stopping" (see the transient AMBER
+                    # set right when cycle_stop() fires, above).
+                    await d.plc.set_status_light(StatusLight.GREEN)
+                    await d.plc.set_work_light(True)
+                    await self._close_run(RunStatus.ABORTED)
+                    log.info("orchestrator.backlight_off")
+                finally:
+                    self._robot_recovery_in_progress = False
 
             case OperatorAcknowledgeEvent():
                 if sm.current in {State.PROTECTIVE_STOP}:

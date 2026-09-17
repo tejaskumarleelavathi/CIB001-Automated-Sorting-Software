@@ -1080,6 +1080,70 @@ class TestAbortSendsResetPulse:
         assert orch._current_run is None
 
 
+class TestAbortRecoveryRace:
+    """
+    Regression tests for a real crash found live 2026-09-17: ABORT from
+    E_STOP calls sm.abort() (-> IDLE) BEFORE its own delivery/home sequence
+    finishes, unlike CONTINUE which stays in E_STOP/PROTECTIVE_STOP for its
+    entire recovery. That gap let _robot_keepalive_tick() see "IDLE, robot
+    not ready" and launch its own concurrent Remote Ethernet recovery
+    attempt while ABORT's was still in flight -- confirmed on real hardware
+    to crash the whole asyncio.TaskGroup right after
+    "orchestrator.robot_keepalive_attempting_remote_recovery" fired mid-ABORT
+    (the Epson controller reported "Start failed: error 20 (Controller is
+    not ready)" a few seconds after a real E-STOP, which is normal and
+    should never crash anything).
+    """
+
+    async def test_abort_home_failure_lands_in_fault_not_crash(
+        self, orch: Orchestrator,
+    ) -> None:
+        """The home-after-recovery call used to be a bare await -- any
+        failure (e.g. the controller not ready yet) propagated straight out
+        of _handle_event and crashed the app. Must land in FAULT instead."""
+        await _to_running(orch)
+        await orch._drivers.robot.halt()
+        orch._sm.safety_fault_estop()
+        orch._hardware_fault_active = False
+        assert orch.state == State.E_STOP
+
+        async def _broken_home() -> None:
+            raise ConnectionError("Start failed: error 20 (Controller is not ready)")
+        orch._drivers.robot.move_to_safe_park = _broken_home
+
+        await orch._handle_event(OperatorAbortEvent())   # must not raise
+
+        assert orch.state == State.FAULT
+        assert orch._drivers.plc.status_light == StatusLight.RED_CHASE
+        assert orch._robot_recovery_in_progress is False
+        assert orch._current_run is None   # run still closed despite the failure
+
+    async def test_keepalive_skips_recovery_while_abort_recovery_in_progress(
+        self, orch: Orchestrator,
+    ) -> None:
+        """The actual race: with the flag held (simulating ABORT's own
+        recovery still in flight, state already IDLE), the keepalive loop
+        must not launch a second, concurrent recovery attempt of its own."""
+        orch._robot_remote_enabled = True
+        await _to_idle(orch)
+        orch._startup_complete = True
+        orch._drivers.robot._connected = False
+        orch._robot_recovery_in_progress = True
+
+        called = False
+
+        async def _spy_recover(d):
+            nonlocal called
+            called = True
+            return True
+        orch._recover_robot_connection = _spy_recover
+
+        for _ in range(ROBOT_KEEPALIVE_DISCONNECT_THRESHOLD):
+            await orch._robot_keepalive_tick()
+
+        assert called is False
+
+
 class TestSafetyFaultDoesNotBounceToFault:
     """
     Regression test for a real race: _evaluate_safety() moves the state
